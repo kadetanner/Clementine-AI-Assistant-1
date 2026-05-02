@@ -9,7 +9,7 @@
     "lexi": "bin/lexi"
   },
   "scripts": {
-    "build:assets": "mkdir -p dist/agent/advisor-rules/builtin && (cp src/agent/advisor-rules/builtin/*.yaml dist/agent/advisor-rules/builtin/ 2>/dev/null || true) && mkdir -p dist/cli/static && (cp src/cli/static/* dist/cli/static/ 2>/dev/null || true)",
+    "build:assets": "mkdir -p dist/agent/advisor-rules/builtin && (cp src/agent/advisor-rules/builtin/*.yaml dist/agent/advisor-rules/builtin/ 2>/dev/null || true) && mkdir -p dist/cli/static && (cp src/cli/static/* dist/cli/static/ 2>/dev/null || true) && mkdir -p dist/lexi-dashboard/ui && cp -r src/lexi-dashboard/ui/* dist/lexi-dashboard/ui/ 2>/dev/null || true",
     "build": "rm -rf dist.tmp 2>/dev/null; tsc --outDir dist.tmp && rm -rf dist && mv dist.tmp dist && chmod +x dist/cli/index.js && npm run build:assets && npm run build:lexi",
     "build:lexi": "node scripts/esbuild-lexi.mjs",
     "prepublishOnly": "npm run build && find dist -name '*.map' -delete",
