@@ -27,4 +27,13 @@ describe('Lexi UI build', () => {
     expect(css).toContain('Inter.woff2');
     expect(css).toContain('JetBrainsMono.woff2');
   });
+
+  it('shell.css defines the four-region grid', async () => {
+    const { readFileSync } = await import('node:fs');
+    const css = readFileSync(path.join(repoRoot, 'dist/lexi-dashboard/ui/styles/shell.css'), 'utf8');
+    expect(css).toContain('grid-template-areas');
+    expect(css).toContain('"top-bar top-bar top-bar"');
+    expect(css).toContain('"nav-rail main right-rail"');
+    expect(css).toContain('"bottom-drawer bottom-drawer bottom-drawer"');
+  });
 });

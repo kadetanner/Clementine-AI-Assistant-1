@@ -1,0 +1,23 @@
+lexi-app {
+  display: grid;
+  grid-template-rows: 44px 1fr 32px;
+  grid-template-columns: 220px 1fr 280px;
+  grid-template-areas:
+    "top-bar top-bar top-bar"
+    "nav-rail main right-rail"
+    "bottom-drawer bottom-drawer bottom-drawer";
+  height: 100vh; width: 100vw;
+  background: var(--bg-canvas); color: var(--text-primary);
+}
+lexi-top-bar { grid-area: top-bar; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-canvas); }
+lexi-nav-rail { grid-area: nav-rail; display: flex; flex-direction: column; gap: 4px; padding: 12px 8px; border-right: 1px solid var(--border-subtle); background: var(--bg-canvas); }
+lexi-nav-rail .brand { font-weight: 700; padding: 4px 8px 12px; color: var(--accent); }
+lexi-nav-rail .nav-item { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 6px; color: var(--text-secondary); text-decoration: none; font-size: 13px; }
+lexi-nav-rail .nav-item:hover { background: var(--bg-elevated); color: var(--text-primary); }
+lexi-nav-rail .nav-item.active { background: var(--bg-elevated); color: var(--text-primary); }
+lexi-nav-rail .nav-item .icon { width: 16px; text-align: center; opacity: 0.7; }
+main.lexi-main { grid-area: main; overflow: auto; padding: 24px; background: var(--bg-canvas); }
+lexi-right-rail { grid-area: right-rail; display: flex; flex-direction: column; gap: 8px; padding: 12px; border-left: 1px solid var(--border-subtle); background: var(--bg-canvas); }
+lexi-right-rail .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-tertiary); font-weight: 600; }
+lexi-right-rail .placeholder { color: var(--text-tertiary); font-size: 12px; }
+lexi-bottom-drawer { grid-area: bottom-drawer; border-top: 1px solid var(--border-subtle); background: var(--bg-canvas); font-size: 12px; color: var(--text-secondary); padding: 6px 16px; display: flex; align-items: center; gap: 12px; }
