@@ -41,3 +41,4 @@ logs/
 # Python bytecode (browser-harness MCP wrapper)
 __pycache__/
 *.pyc
+.superpowers/
