@@ -40,6 +40,7 @@ import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
 import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, cmdBrowserConnect, maybePromptBrowserHarness } from './browser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
+import { registerLexiCommand } from '../lexi-dashboard/launch/lexi-cli.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -4760,5 +4761,7 @@ browserCmd
   .command('disable')
   .description('Remove the browser harness MCP entry (keeps installed files)')
   .action(cmdBrowserDisable);
+
+registerLexiCommand(program);
 
 program.parse();
