@@ -17,4 +17,14 @@ describe('Lexi UI build', () => {
     expect(size).toBeGreaterThan(1000);
     expect(size).toBeLessThan(150_000);
   });
+
+  it('base.css declares both font-face rules', async () => {
+    const { readFileSync } = await import('node:fs');
+    const css = readFileSync(path.join(repoRoot, 'dist/lexi-dashboard/ui/styles/base.css'), 'utf8');
+    expect(css).toContain('@font-face');
+    expect(css).toMatch(/font-family:\s*['"]Inter['"]/);
+    expect(css).toMatch(/font-family:\s*['"]JetBrains Mono['"]/);
+    expect(css).toContain('Inter.woff2');
+    expect(css).toContain('JetBrainsMono.woff2');
+  });
 });
