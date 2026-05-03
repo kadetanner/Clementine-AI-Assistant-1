@@ -1,6 +1,6 @@
 lexi-app {
   display: grid;
-  grid-template-rows: 44px 1fr 32px;
+  grid-template-rows: 44px 1fr auto;
   grid-template-columns: 220px 1fr 280px;
   grid-template-areas:
     "top-bar top-bar top-bar"
