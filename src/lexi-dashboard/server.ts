@@ -3,6 +3,7 @@ import type { Express } from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer, type Server } from 'node:http';
+import { registerLexiRoutes } from './routes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -15,6 +16,8 @@ export async function startLexiServer(opts: LexiServerOptions = {}): Promise<Lex
   const app = express();
   const uiDir = path.resolve(__dirname, 'ui');
   app.use('/assets', express.static(uiDir));
+
+  registerLexiRoutes(app);
 
   app.get('/health', (_req, res) => {
     res.json({
