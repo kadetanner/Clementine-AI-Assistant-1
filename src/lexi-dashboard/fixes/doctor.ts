@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from 'express';
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
@@ -7,17 +7,28 @@ import { createConnection } from 'node:net';
 type Status = 'green' | 'yellow' | 'red';
 interface Check { name: string; status: Status; message?: string; }
 
+// Paths reflect the ACTUAL clementine layout under ~/.clementine/ as of 2026-05.
+// Discovered by inspection — these differ from what the spec originally guessed.
 const CLEM_HOME = join(homedir(), '.clementine');
 const VAULT = join(CLEM_HOME, 'vault');
-const REDIS_SOCK = join(CLEM_HOME, 'falkordb.sock');
+const GRAPH_DB_DIR = join(CLEM_HOME, '.graph.db');           // FalkorDB embedded mode lives here; sockets are fdb-*.sock files inside
 const LOG_DIR = join(CLEM_HOME, 'logs');
-const AUTONOMY_LEDGER = join(CLEM_HOME, 'autonomy', 'ledger.jsonl');
-const CRON_HEARTBEAT = join(CLEM_HOME, 'cron', 'last-fire.json');
-const MCP_REGISTRY = join(CLEM_HOME, 'mcp', 'servers.json');
+const HEARTBEAT_STATE = join(CLEM_HOME, '.heartbeat_state.json'); // reflects autonomy/agent activity (proxy for "ledger")
+const CRON_RUNS_DIR = join(CLEM_HOME, 'cron', 'runs');       // dir mtime advances each tick
+const CLAUDE_INTEGRATIONS = join(CLEM_HOME, 'claude-integrations.json'); // canonical integration registry
 const LEXI_PORT = Number(process.env.LEXI_PORT ?? '3030');
 
 function ageMs(path: string): number | null {
   try { return Date.now() - statSync(path).mtimeMs; } catch { return null; }
+}
+
+function findFalkorSocket(): string | null {
+  if (!existsSync(GRAPH_DB_DIR)) return null;
+  try {
+    const entries = readdirSync(GRAPH_DB_DIR);
+    const sock = entries.find((f) => f.startsWith('fdb-') && f.endsWith('.sock'));
+    return sock ? join(GRAPH_DB_DIR, sock) : null;
+  } catch { return null; }
 }
 
 function checkProcess(): Check {
@@ -36,31 +47,40 @@ async function checkPort(): Promise<Check> {
 }
 
 function checkMcpServers(): Check {
-  if (!existsSync(MCP_REGISTRY)) return { name: 'mcp_servers', status: 'yellow', message: 'no registry file' };
+  if (!existsSync(CLAUDE_INTEGRATIONS)) {
+    return { name: 'mcp_servers', status: 'yellow', message: 'no claude-integrations.json' };
+  }
   try {
-    const raw = JSON.parse(readFileSync(MCP_REGISTRY, 'utf8')) as { servers?: Array<{ name: string; status?: string }> };
-    const servers = raw.servers ?? [];
-    if (servers.length === 0) return { name: 'mcp_servers', status: 'yellow', message: '0 registered' };
-    const down = servers.filter((s) => s.status && s.status !== 'connected');
-    if (down.length === 0) return { name: 'mcp_servers', status: 'green', message: `${servers.length} connected` };
-    if (down.length === servers.length) return { name: 'mcp_servers', status: 'red', message: `${down.length}/${servers.length} down` };
-    return { name: 'mcp_servers', status: 'yellow', message: `${down.length}/${servers.length} degraded` };
+    const raw = JSON.parse(readFileSync(CLAUDE_INTEGRATIONS, 'utf8')) as Record<string, unknown>;
+    // claude-integrations.json holds top-level toolkits + an optional `mcpServers` block.
+    const integrationKeys = Object.keys(raw).filter((k) => k !== 'mcpServers');
+    const mcpKeys = raw.mcpServers && typeof raw.mcpServers === 'object'
+      ? Object.keys(raw.mcpServers as object)
+      : [];
+    const total = integrationKeys.length + mcpKeys.length;
+    if (total === 0) return { name: 'mcp_servers', status: 'yellow', message: 'no integrations configured' };
+    return { name: 'mcp_servers', status: 'green', message: `${integrationKeys.length} integrations · ${mcpKeys.length} mcp servers` };
   } catch (e) {
     return { name: 'mcp_servers', status: 'red', message: (e as Error).message };
   }
 }
 
 function checkFalkorGraph(): Check {
-  if (!existsSync(REDIS_SOCK)) return { name: 'falkordb_graph', status: 'red', message: 'redis socket missing' };
-  return { name: 'falkordb_graph', status: 'green', message: 'graph reachable via socket' };
+  const sock = findFalkorSocket();
+  if (!sock) {
+    if (!existsSync(GRAPH_DB_DIR)) return { name: 'falkordb_graph', status: 'red', message: `${GRAPH_DB_DIR} missing` };
+    return { name: 'falkordb_graph', status: 'yellow', message: 'graph dir exists, no live socket (daemon may be down)' };
+  }
+  return { name: 'falkordb_graph', status: 'green', message: `socket ${sock.split('/').pop()}` };
 }
 
 function checkRedisSocket(): Check {
-  if (!existsSync(REDIS_SOCK)) return { name: 'redis_socket', status: 'red', message: `${REDIS_SOCK} missing` };
+  const sock = findFalkorSocket();
+  if (!sock) return { name: 'redis_socket', status: 'yellow', message: 'no fdb-*.sock under .graph.db (clementine daemon down?)' };
   try {
-    const s = statSync(REDIS_SOCK);
-    if (!s.isSocket()) return { name: 'redis_socket', status: 'red', message: 'exists but not a socket' };
-    return { name: 'redis_socket', status: 'green', message: REDIS_SOCK };
+    const s = statSync(sock);
+    if (!s.isSocket()) return { name: 'redis_socket', status: 'red', message: 'fdb-*.sock exists but not a socket' };
+    return { name: 'redis_socket', status: 'green', message: sock };
   } catch (e) {
     return { name: 'redis_socket', status: 'red', message: (e as Error).message };
   }
@@ -78,8 +98,9 @@ function checkVaultDirectory(): Check {
 }
 
 function checkCronLastFire(): Check {
-  const age = ageMs(CRON_HEARTBEAT);
-  if (age === null) return { name: 'cron_last_fire', status: 'yellow', message: 'no heartbeat file' };
+  // Use the cron/runs/ directory mtime — it advances every time a new run record is written.
+  const age = ageMs(CRON_RUNS_DIR);
+  if (age === null) return { name: 'cron_last_fire', status: 'yellow', message: `${CRON_RUNS_DIR} missing` };
   const minutes = age / 60000;
   if (minutes > 60) return { name: 'cron_last_fire', status: 'red', message: `${Math.round(minutes)}m since last fire` };
   if (minutes > 15) return { name: 'cron_last_fire', status: 'yellow', message: `${Math.round(minutes)}m since last fire` };
@@ -87,12 +108,14 @@ function checkCronLastFire(): Check {
 }
 
 function checkAutonomyLedger(): Check {
-  if (!existsSync(AUTONOMY_LEDGER)) return { name: 'autonomy_ledger', status: 'yellow', message: 'no ledger yet' };
+  // The closest equivalent to a continuous "ledger" in the actual clementine layout is
+  // .heartbeat_state.json — updated every heartbeat tick by the daemon.
+  if (!existsSync(HEARTBEAT_STATE)) return { name: 'autonomy_ledger', status: 'yellow', message: 'no .heartbeat_state.json yet' };
   try {
-    const s = statSync(AUTONOMY_LEDGER);
+    const s = statSync(HEARTBEAT_STATE);
     const ageH = (Date.now() - s.mtimeMs) / 3600000;
-    if (ageH > 48) return { name: 'autonomy_ledger', status: 'yellow', message: `last write ${Math.round(ageH)}h ago` };
-    return { name: 'autonomy_ledger', status: 'green', message: `${(s.size / 1024).toFixed(1)}KB · last write ${Math.round(ageH)}h ago` };
+    if (ageH > 24) return { name: 'autonomy_ledger', status: 'yellow', message: `heartbeat stale ${Math.round(ageH)}h` };
+    return { name: 'autonomy_ledger', status: 'green', message: `${(s.size / 1024).toFixed(1)}KB · last heartbeat ${Math.round(ageH * 60)}m ago` };
   } catch (e) {
     return { name: 'autonomy_ledger', status: 'red', message: (e as Error).message };
   }
