@@ -42,10 +42,12 @@ export async function discoverUpstreamSources(): Promise<UpstreamSources> {
   const out: UpstreamSources = {};
   // Each probe is in its own try so a single missing module does not nuke the others.
   try {
+    // @ts-expect-error upstream-optional module; absorbed by catch when absent
     const mod = (await import('../../agent/runtime.js')) as { getRuntimeEmitter?: () => EventEmitter };
     if (typeof mod.getRuntimeEmitter === 'function') out.agentRuntime = mod.getRuntimeEmitter();
   } catch { /* upstream surface absent — that's OK */ }
   try {
+    // @ts-expect-error upstream-optional module; absorbed by catch when absent
     const mod = (await import('../../tools/mcp-bridge.js')) as { getBridgeEmitter?: () => EventEmitter };
     if (typeof mod.getBridgeEmitter === 'function') out.mcpBridge = mod.getBridgeEmitter();
   } catch { /* OK */ }
