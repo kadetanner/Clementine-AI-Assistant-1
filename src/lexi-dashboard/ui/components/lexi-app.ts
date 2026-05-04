@@ -4,6 +4,7 @@ import './lexi-nav-rail.js';
 import './lexi-right-rail.js';
 import './lexi-bottom-drawer.js';
 import './lexi-home-view.js';
+import './lexi-agents-view.js';
 
 export class LexiApp extends LitElement {
   static properties = {
@@ -42,6 +43,7 @@ export class LexiApp extends LitElement {
 
   private renderRoute() {
     if (this.route === 'home') return html`<lexi-home-view></lexi-home-view>`;
+    if (this.route === 'agents') return html`<lexi-agents-view></lexi-agents-view>`;
     return html`
       <h1 style="margin:0 0 8px 0;font-size:28px;font-weight:600">${this.route}</h1>
       <p style="color:var(--text-secondary)">This section is wired in a later plan.</p>
