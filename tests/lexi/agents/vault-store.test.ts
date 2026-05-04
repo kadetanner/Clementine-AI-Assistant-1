@@ -44,4 +44,29 @@ describe('vault-store', () => {
   it('readAgent throws for unknown slug', async () => {
     await expect(readAgent('ghost', { vaultRoot })).rejects.toThrow(/not found/i);
   });
+  it('writeAgentPrompt overwrites prompt body via tmp+rename', async () => {
+    const { writeAgentPrompt } = await import('../../../src/lexi-dashboard/agents/vault-store.js');
+    await writeAgentPrompt('lexi', 'You are Lexi v2.', { vaultRoot });
+    const lexi = await readAgent('lexi', { vaultRoot });
+    expect(lexi.prompt).toBe('You are Lexi v2.');
+    expect(lexi.allowedTools).toEqual(['vault_read', 'memory_recall']); // frontmatter preserved
+  });
+  it('setToolEnabled adds to allowed and removes from disabled', async () => {
+    const { setToolEnabled } = await import('../../../src/lexi-dashboard/agents/vault-store.js');
+    const updated = await setToolEnabled('lexi', 'bash', true, { vaultRoot });
+    expect(updated.allowedTools).toContain('bash');
+    expect(updated.disabledTools).not.toContain('bash');
+  });
+  it('setToolEnabled false moves tool from allowed to disabled', async () => {
+    const { setToolEnabled } = await import('../../../src/lexi-dashboard/agents/vault-store.js');
+    const updated = await setToolEnabled('lexi', 'vault_read', false, { vaultRoot });
+    expect(updated.allowedTools).not.toContain('vault_read');
+    expect(updated.disabledTools).toContain('vault_read');
+  });
+  it('writeAgentPrompt does not leave a .tmp file behind', async () => {
+    const { writeAgentPrompt } = await import('../../../src/lexi-dashboard/agents/vault-store.js');
+    const { existsSync } = await import('node:fs');
+    await writeAgentPrompt('lexi', 'roundtrip', { vaultRoot });
+    expect(existsSync(path.join(vaultRoot, '00-System/agents/lexi/agent.md.tmp'))).toBe(false);
+  });
 });
