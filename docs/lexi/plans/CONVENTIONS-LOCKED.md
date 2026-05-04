@@ -121,6 +121,52 @@ export function registerLexiRoutes(app: Express): void {
 
 ---
 
+## 7. Express 5 `req.params.<name>` is `string | string[]` — coerce with `String()`
+
+**Why:** Discovered in Plan 4 Task 4. The Express 5 type definitions widened param values, so `req.params.slug` no longer narrows to `string` and tsc fails on direct use as a `string` argument. `npm run build` breaks even though vitest passes (vitest doesn't run tsc).
+
+**Pattern for new route handlers:**
+
+```ts
+router.get('/:slug', async (req: Request, res: Response) => {
+  const slug = String(req.params.slug);  // ← coerce at the top
+  // ... use `slug` everywhere below
+});
+```
+
+This applies to ALL routes added in Plans 4–9.
+
+---
+
+## 8. For two-way bound form inputs, use Lit's `live()` directive
+
+**Why:** Discovered in Plan 4 Task 5 (`lexi-prompt-editor`). Plain `.value=${this.draft}` doesn't update the DOM textarea when Lit's PropertyPart cache equals the new value (e.g., user types into a textarea, then a Cancel handler resets the draft to original — Lit's cache is still 'original' from the initial render because user input mutated the DOM property without going through Lit's commit, so the post-Cancel re-render is a no-op).
+
+**Pattern:**
+
+```ts
+import { live } from 'lit/directives/live.js';
+// ...
+<textarea .value=${live(this.draft)} @input=${this.onInput}></textarea>
+<input type="search" .value=${live(this.query)} ...>
+```
+
+`live()` forces the DOM property to be updated whenever it differs from the live DOM value. Standard Lit idiom for forms; not specific to decorator-free.
+
+---
+
+## 9. Avoid `?disabled=` Lit binding for buttons that synchronous-test-clicks rely on
+
+**Why:** Plan 4 Task 5. Tests that dispatch input events then immediately click Save without an `await requestAnimationFrame()` see the button still rendered as `disabled` — Lit's re-render is async. JSDOM `.click()` is a no-op on disabled buttons → handler never fires.
+
+**Options:**
+- (a) **Drop the `?disabled` binding** and rely on visual-only cues like `data-dirty` indicators. Buttons still work when "clean" — handlers should be idempotent (e.g., Save when not dirty just emits with current value).
+- (b) **Keep `?disabled`** and require all tests to `await new Promise((r) => requestAnimationFrame(r))` between input dispatch and click.
+
+Lexi prefers (a) for new components — visual indicators (dot, tag, colour) communicate state without making form-input testing fragile. If a real UX need surfaces, revisit.
+
+---
+
 ## When to update this doc
 
 - Any time an implementer discovers a plan deviation that affects subsequent tasks.
