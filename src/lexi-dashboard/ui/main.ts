@@ -1,6 +1,8 @@
 import { applyTheme, currentTheme, systemPrefers, type ThemeName } from './theme/themes.js';
 import './components/lexi-app.js';
 import './components/lexi-command-palette.js';
+import './components/workflows/lexi-workflows-view.js';
+import './components/workflows/lexi-workflow-detail.js';
 
 const stored = localStorage.getItem('lexi-theme') as ThemeName | null;
 applyTheme(stored ?? systemPrefers());
