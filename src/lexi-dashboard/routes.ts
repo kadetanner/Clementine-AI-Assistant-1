@@ -4,12 +4,14 @@ import { register as registerRestartSelf } from './fixes/restart-self.js';
 import { register as registerEvents } from './events/sse.js';
 import { register as registerUpstreamTaps } from './events/upstream-taps.js';
 import { register as registerAgents } from './routes/agents.js';
+import { register as registerConnections } from './routes/connections.js';
 
 /**
  * Single aggregator for all Lexi /api/* routes.
  * Plan 2 adds: doctor, restart-self.
  * Plan 3 adds: events (SSE stream + recent fallback), upstream taps.
  * Plan 4 adds: agents (list, detail, prompt, tools, restart).
+ * Plan 5 adds: connections (list, probe, credentials read+update).
  * Future plans add more imports + calls below — server.ts never changes again.
  */
 export function registerLexiRoutes(app: Express): void {
@@ -18,4 +20,5 @@ export function registerLexiRoutes(app: Express): void {
   registerEvents(app);
   registerUpstreamTaps(app);
   registerAgents(app);
+  registerConnections(app);
 }
