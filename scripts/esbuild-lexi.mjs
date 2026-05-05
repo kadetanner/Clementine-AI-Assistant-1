@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { mkdirSync, cpSync } from 'node:fs';
+import { mkdirSync, cpSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +14,17 @@ for (const sub of ['index.html', 'fonts', 'styles']) {
   try { cpSync(path.join(srcUi, sub), path.join(outUi, sub), { recursive: true }); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
 }
+
+// Vendor Drawflow — no external CDN per spec §9.11
+const drawflowDir = path.join(repoRoot, 'node_modules/drawflow/dist');
+const vendorOut = path.join(outUi, 'vendor');
+mkdirSync(vendorOut, { recursive: true });
+for (const file of ['drawflow.min.js', 'drawflow.min.css']) {
+  const src = path.join(drawflowDir, file);
+  if (!existsSync(src)) throw new Error(`Drawflow asset missing: ${src} — did you 'npm install drawflow'?`);
+  cpSync(src, path.join(vendorOut, file));
+}
+console.log('Vendored Drawflow into', vendorOut);
 
 await build({
   entryPoints: [path.join(srcUi, 'main.ts')],
