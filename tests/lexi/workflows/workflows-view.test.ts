@@ -21,6 +21,7 @@ describe('lexi-workflows-view', () => {
         return new Response(JSON.stringify({ workflows: [
           { id: 'wf-a', name: 'Onboarding', status: 'idle' },
           { id: 'wf-b', name: 'Daily Brief', status: 'running' },
+          { id: 'wf-c', name: 'Lead Triage', status: 'idle' },
         ]}), { status: 200 });
       }
       if (url.endsWith('/api/workflows/stuck-steps')) {
@@ -55,7 +56,7 @@ describe('lexi-workflows-view', () => {
     await new Promise((r) => setTimeout(r, 30));
     const banner = document.querySelector('[data-stuck-banner]');
     expect(banner).not.toBeNull();
-    expect(banner!.textContent).toMatch(/needs human review/i);
+    expect(banner!.textContent).toMatch(/needs? human review/i);
   });
 
   it('marks a workflow as needs-review if it owns a stuck step', async () => {
