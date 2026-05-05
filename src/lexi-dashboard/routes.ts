@@ -5,6 +5,7 @@ import { register as registerEvents } from './events/sse.js';
 import { register as registerUpstreamTaps } from './events/upstream-taps.js';
 import { register as registerAgents } from './routes/agents.js';
 import { register as registerConnections } from './routes/connections.js';
+import { register as registerWorkflows } from './routes/workflows.js';
 
 /**
  * Single aggregator for all Lexi /api/* routes.
@@ -12,6 +13,7 @@ import { register as registerConnections } from './routes/connections.js';
  * Plan 3 adds: events (SSE stream + recent fallback), upstream taps.
  * Plan 4 adds: agents (list, detail, prompt, tools, restart).
  * Plan 5 adds: connections (list, probe, credentials read+update).
+ * Plan 6 adds: workflows (diagnostics, stuck-steps).
  * Future plans add more imports + calls below — server.ts never changes again.
  */
 export function registerLexiRoutes(app: Express): void {
@@ -21,4 +23,5 @@ export function registerLexiRoutes(app: Express): void {
   registerUpstreamTaps(app);
   registerAgents(app);
   registerConnections(app);
+  registerWorkflows(app);
 }
