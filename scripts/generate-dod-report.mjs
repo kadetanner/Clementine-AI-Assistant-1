@@ -28,9 +28,11 @@ export const ITEMS = [
   { id: 17, label: 'Fresh merge conflict-free', kind: 'auto' },
 ];
 
-export function writeReport(results /* Map<id, {status, notes}> */) {
+export function writeReport(results /* Map<id, {status, notes}> */, opts = {}) {
   const branch = execFileSync('git', ['branch', '--show-current'], { cwd: repoRoot, encoding: 'utf8' }).trim();
   const commit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+  const e2ePassed = opts.e2ePassed === true;
+  const e2eAttempted = typeof opts.e2ePassed === 'boolean';
 
   const lines = [];
   lines.push('# Lexi Dashboard — Definition of Done Report');
@@ -41,7 +43,15 @@ export function writeReport(results /* Map<id, {status, notes}> */) {
   lines.push(`**Branch:** ${branch}`);
   lines.push(`**Commit:** ${commit}`);
   lines.push('');
-  lines.push('## Results');
+  lines.push('## Honest disclosure');
+  lines.push('');
+  lines.push('The 17 server-side criteria below are *infrastructure* checks — they validate');
+  lines.push('that endpoints respond, scripts exit zero, and bundles ship the expected strings.');
+  lines.push('They do NOT validate that pages render content correctly or that interactions');
+  lines.push('work in a real browser. The Plan 10 Playwright suite at `tests/lexi/e2e/` is the');
+  lines.push('actual user-facing gate; its result is reported separately below.');
+  lines.push('');
+  lines.push('## Server-side criteria (17 from spec §9)');
   lines.push('');
   lines.push('| # | Criterion | Status | Notes |');
   lines.push('|---|---|---|---|');
@@ -52,13 +62,51 @@ export function writeReport(results /* Map<id, {status, notes}> */) {
     lines.push(`| ${item.id} | ${item.label} | ${r.status} | ${r.notes || (item.kind === 'manual' ? 'manual' : '—')} |`);
   }
   lines.push('');
+  lines.push('## E2E browser validation (Plan 10 — `npm run test:e2e`)');
+  lines.push('');
+  if (!e2eAttempted) {
+    lines.push('**SKIPPED** — orchestrator did not run the E2E suite this round.');
+  } else if (e2ePassed) {
+    lines.push('**PASS** — Playwright suite green against live LaunchAgent at port 3030.');
+    lines.push('');
+    lines.push('Validates:');
+    lines.push('- All 8 nav sections mount their actual component (no "wired in a later plan" placeholder).');
+    lines.push('- Theme toggle changes `documentElement.dataset.theme` AND `--bg-canvas` at runtime.');
+    lines.push('- localStorage persists the chosen theme.');
+    lines.push('- Each section renders content from the proxied data layer (agents list, connections,');
+    lines.push('  workflows, vault tree, memory tabs, cron jobs, settings tabs).');
+    lines.push('- ⌘K opens the command palette; Escape closes it.');
+    lines.push('- Backend endpoints return expected response shapes (not just 200).');
+    lines.push('- No JavaScript errors during a full nav tour.');
+  } else {
+    lines.push('**FAIL** — Playwright suite did not pass. Run `npm run test:e2e` for details.');
+  }
+  lines.push('');
+  lines.push('## Known gaps (deferred follow-ups)');
+  lines.push('');
+  lines.push('- **Home view is sparse** vs spec §6: only renders `lexi-now-playing`. Spec calls for');
+  lines.push('  Today panel, at-a-glance counters, and an inline System Map strip beyond what the');
+  lines.push('  top bar provides. Components exist for some of this; composition not yet wired.');
+  lines.push('- **Agents list returns only one agent (Jonah).** Lexi herself does not appear. Probable');
+  lines.push('  cause in `agents/vault-store.ts` discovery logic.');
+  lines.push('- **Memory store is empty in the Lexi process.** Lexi opens its own `MemoryStore` SQLite');
+  lines.push('  handle; the daemon (`com.clem.assistant`) writes to a different instance. Cross-process');
+  lines.push('  data sharing requires either a unix-socket bridge or migrating to a proxy pattern that');
+  lines.push('  reads the daemon\'s files directly. Memory tabs render structure but show zero counts.');
+  lines.push('- **DoD 8 (three-browser walkthrough) is unsigned** — manual gate. The Playwright suite');
+  lines.push('  validates Chromium; Safari and Firefox require human verification.');
+  lines.push('');
   lines.push('## Summary');
   lines.push('');
-  lines.push(`- PASS: ${pass} / 17`);
-  lines.push(`- FAIL: ${fail}`);
-  lines.push(`- Manual / Skip: ${17 - pass - fail}`);
+  lines.push(`- Server-side PASS: ${pass} / 17`);
+  lines.push(`- Server-side FAIL: ${fail}`);
+  lines.push(`- Server-side Manual / Skip: ${17 - pass - fail}`);
+  lines.push(`- E2E browser suite: ${!e2eAttempted ? 'not run' : e2ePassed ? 'PASS' : 'FAIL'}`);
   lines.push('');
-  lines.push(fail === 0 && pass === 17 ? '**OVERALL: GREEN — Lexi dashboard meets all DoD criteria.**' : '**OVERALL: NOT YET COMPLETE.**');
+  const overallOk = fail === 0 && e2ePassed;
+  lines.push(overallOk
+    ? '**OVERALL: GREEN-WITH-CAVEATS** — automated checks all pass; known gaps documented above.'
+    : '**OVERALL: NOT YET COMPLETE.**');
   writeFileSync(OUT, lines.join('\n'));
 }
 

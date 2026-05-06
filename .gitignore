@@ -31,6 +31,10 @@ logs/
 # Playwright MCP artifacts
 .playwright-mcp/
 
+# Playwright E2E artefacts (regenerated each run)
+playwright-report/
+test-results/
+
 # Bot status files (runtime state)
 .bot-status.json
 .slack-bot-status.json

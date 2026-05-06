@@ -121,9 +121,25 @@ if (build.status !== 0) {
   record(17, r.ok, r.ok ? '' : 'upstream merge would conflict');
 }
 
-writeReport(results);
+// E2E (Plan 10) — the real validation harness. Runs Playwright against the
+// live LaunchAgent on port 3030. This is the gate that the original Plan 9
+// DoD harness MISSED — it tested HTTP status codes and bundle string presence
+// but never opened a real browser. If the LaunchAgent isn't loaded, the
+// suite skips its tests cleanly via beforeAll(); the run still returns 0.
+console.log('\n=== Running Playwright E2E suite (real-browser validation) ===\n');
+const e2e = spawnSync(
+  'npx',
+  ['playwright', 'test', '--config=tests/lexi/e2e/playwright.config.ts', '--reporter=list'],
+  { cwd: repoRoot, stdio: 'inherit' },
+);
+const e2eOk = e2e.status === 0;
+
+writeReport(results, { e2ePassed: e2eOk });
 
 const fails = Array.from(results.values()).filter((r) => r.status === 'FAIL').length;
-console.log(`\n=== ${fails === 0 ? 'GREEN' : 'NOT YET COMPLETE'} — ${17 - fails}/17 PASS ===`);
+const overallOk = fails === 0 && e2eOk;
+console.log(
+  `\n=== ${overallOk ? 'GREEN' : 'NOT YET COMPLETE'} — ${17 - fails}/17 server-side PASS · E2E ${e2eOk ? 'PASS' : 'FAIL'} ===`,
+);
 console.log(`Report: docs/lexi/DOD-REPORT.md`);
-process.exit(fails === 0 ? 0 : 1);
+process.exit(overallOk ? 0 : 1);

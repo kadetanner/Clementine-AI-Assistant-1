@@ -1,6 +1,6 @@
 # Upstream -> Lexi Feature Parity
 
-Generated: 2026-05-06T04:14:05.101Z
+Generated: 2026-05-06T04:38:33.129Z
 
 Compares upstream `src/cli/dashboard.ts` route + nav surface against
 Lexi's implementation under `src/lexi-dashboard/`. Documented omissions
@@ -10,8 +10,8 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 ## Summary
 
 - Upstream features audited: **265**
-- Implemented in Lexi: **3**
-- Documented omissions: **262**
+- Implemented in Lexi: **12**
+- Documented omissions: **253**
 - MISSING: **0**
 
 ## Comparison
@@ -78,7 +78,7 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `GET /api/build/operations` | documented omission |
 | route | `GET /api/build/usage` | documented omission |
 | route | `GET /api/builder/mcp-discovery` | documented omission |
-| route | `GET /api/builder/workflows` | documented omission |
+| route | `GET /api/builder/workflows` | implemented |
 | route | `GET /api/builder/workflows/:id` | documented omission |
 | route | `GET /api/channels/status` | documented omission |
 | route | `GET /api/claims` | documented omission |
@@ -86,11 +86,11 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `GET /api/cli-tools` | documented omission |
 | route | `GET /api/composio/status` | documented omission |
 | route | `GET /api/composio/toolkits` | documented omission |
-| route | `GET /api/cron` | documented omission |
+| route | `GET /api/cron` | implemented |
 | route | `GET /api/cron/:job/attachments` | documented omission |
 | route | `GET /api/cron/:job/attachments/:filename` | documented omission |
 | route | `GET /api/cron/:job/prompt-history` | documented omission |
-| route | `GET /api/cron/broken-jobs` | documented omission |
+| route | `GET /api/cron/broken-jobs` | implemented |
 | route | `GET /api/cron/traces/:job` | documented omission |
 | route | `GET /api/discord/channels` | documented omission |
 | route | `GET /api/events` | documented omission |
@@ -105,14 +105,14 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `GET /api/mcp-permissions` | documented omission |
 | route | `GET /api/mcp-servers` | documented omission |
 | route | `GET /api/mcp-status` | documented omission |
-| route | `GET /api/memory` | documented omission |
+| route | `GET /api/memory` | implemented |
 | route | `GET /api/memory/chunks/:id` | documented omission |
 | route | `GET /api/memory/chunks/:id/history` | documented omission |
 | route | `GET /api/memory/commitments` | documented omission |
 | route | `GET /api/memory/coverage` | documented omission |
 | route | `GET /api/memory/episodes` | documented omission |
-| route | `GET /api/memory/graph-stats` | documented omission |
-| route | `GET /api/memory/health` | documented omission |
+| route | `GET /api/memory/graph-stats` | implemented |
+| route | `GET /api/memory/health` | implemented |
 | route | `GET /api/memory/learnings` | documented omission |
 | route | `GET /api/memory/search` | documented omission |
 | route | `GET /api/memory/session-bridge` | documented omission |
@@ -128,7 +128,7 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `GET /api/plans/today` | documented omission |
 | route | `GET /api/profiles` | documented omission |
 | route | `GET /api/projects` | documented omission |
-| route | `GET /api/recall-traces` | documented omission |
+| route | `GET /api/recall-traces` | implemented |
 | route | `GET /api/recall-traces/:id` | documented omission |
 | route | `GET /api/remote-access` | documented omission |
 | route | `GET /api/routines` | documented omission |
@@ -161,13 +161,13 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `GET /api/unleashed/:name/status` | documented omission |
 | route | `GET /api/user-model` | documented omission |
 | route | `GET /api/vault-file` | documented omission |
-| route | `GET /api/vault-files` | documented omission |
+| route | `GET /api/vault-files` | implemented |
 | route | `GET /api/version` | documented omission |
 | route | `GET /api/voice/audio/:hash` | documented omission |
 | route | `GET /api/webhook-actions` | documented omission |
 | route | `GET /api/workspace-dirs` | documented omission |
 | route | `GET /auth/logout` | documented omission |
-| route | `GET /auth/sessions` | documented omission |
+| route | `GET /auth/sessions` | implemented |
 | route | `GET /health` | implemented |
 | route | `GET /icon.svg` | documented omission |
 | route | `GET /manifest.json` | documented omission |
