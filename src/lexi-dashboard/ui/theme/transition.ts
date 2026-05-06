@@ -76,10 +76,11 @@ export async function transitionTheme(
       return;
     }
     if (viewTransitionsSupported()) {
-      const startView = (
-        document as unknown as { startViewTransition: (cb: () => void) => { finished: Promise<void> } }
-      ).startViewTransition;
-      const t = startView(swap);
+      // Call as a method on document — extracting startViewTransition into a
+      // free variable loses `this` and throws "Illegal invocation" at runtime.
+      const t = (document as unknown as {
+        startViewTransition: (cb: () => void) => { finished: Promise<void> };
+      }).startViewTransition(swap);
       await t.finished;
     } else {
       swap();

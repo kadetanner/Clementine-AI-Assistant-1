@@ -47,9 +47,14 @@ export class LexiApp extends LitElement {
     if (this.route === 'home') return html`<lexi-home-view></lexi-home-view>`;
     if (this.route === 'agents') return html`<lexi-agents-view></lexi-agents-view>`;
     if (this.route === 'connections') return html`<lexi-connections-view></lexi-connections-view>`;
+    if (this.route === 'workflows') return html`<lexi-workflows-view></lexi-workflows-view>`;
+    if (this.route === 'vault') return html`<lexi-vault-view></lexi-vault-view>`;
+    if (this.route === 'memory') return html`<lexi-memory-view></lexi-memory-view>`;
+    if (this.route === 'cron') return html`<lexi-cron-view></lexi-cron-view>`;
+    if (this.route === 'settings') return html`<lexi-settings-view></lexi-settings-view>`;
     return html`
       <h1 style="margin:0 0 8px 0;font-size:28px;font-weight:600">${this.route}</h1>
-      <p style="color:var(--text-secondary)">This section is wired in a later plan.</p>
+      <p style="color:var(--text-secondary)">Unknown section: ${this.route}</p>
     `;
   }
 
