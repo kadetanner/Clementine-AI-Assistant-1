@@ -10,7 +10,7 @@ const outUi = path.join(repoRoot, 'dist/lexi-dashboard/ui');
 
 mkdirSync(outUi, { recursive: true });
 
-for (const sub of ['index.html', 'fonts', 'styles']) {
+for (const sub of ['index.html', 'fonts', 'styles', 'design']) {
   try { cpSync(path.join(srcUi, sub), path.join(outUi, sub), { recursive: true }); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
 }

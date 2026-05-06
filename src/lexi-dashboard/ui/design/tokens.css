@@ -1,0 +1,211 @@
+/* Lighthouse design tokens — single source of truth.
+ * Spec: docs/lexi/specs/2026-05-06-lexi-lighthouse-overhaul.md §4
+ * Aesthetic: Linear-precision, cyan accent, dark+light parity.
+ */
+
+:root {
+  /* Type */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Type scale */
+  --text-xs: 11px;   --line-xs: 14px;
+  --text-sm: 13px;   --line-sm: 18px;
+  --text-base: 14px; --line-base: 20px;
+  --text-lg: 16px;   --line-lg: 22px;
+  --text-xl: 20px;   --line-xl: 26px;
+  --text-2xl: 28px;  --line-2xl: 34px;
+
+  /* Space — 4px grid */
+  --sp-0: 0;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+  --sp-9: 48px;
+  --sp-10: 64px;
+  --sp-11: 80px;
+  --sp-12: 96px;
+
+  /* Radius */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-pill: 999px;
+
+  /* Elevation — restrained */
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.06), 0 1px 1px rgba(0,0,0,0.04);
+  --shadow-2: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04);
+  --shadow-3: 0 16px 32px rgba(0,0,0,0.16), 0 4px 8px rgba(0,0,0,0.08);
+
+  /* Motion */
+  --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --ease-in:  cubic-bezier(.6, .2, .8, .4);
+  --ease-spring: cubic-bezier(.18, 1.25, .4, 1);
+  --dur-1: 80ms;
+  --dur-2: 140ms;
+  --dur-3: 220ms;
+  --dur-4: 360ms;
+  --dur-5: 600ms;
+
+  /* Density (default = comfortable) */
+  --row-h: 32px;
+  --row-h-sm: 28px;
+  --control-h: 32px;
+  --control-h-sm: 26px;
+  --control-h-lg: 38px;
+  --pad-x: 12px;
+  --pad-y: 6px;
+
+  /* Z-index */
+  --z-overlay: 50;
+  --z-popover: 60;
+  --z-tooltip: 70;
+  --z-toast: 80;
+  --z-modal: 90;
+
+  /* Focus ring */
+  --focus-ring: 0 0 0 2px var(--bg-canvas), 0 0 0 4px var(--accent);
+}
+
+/* Density override */
+:root[data-density='compact'] {
+  --row-h: 26px;
+  --row-h-sm: 22px;
+  --control-h: 26px;
+  --control-h-sm: 22px;
+  --control-h-lg: 32px;
+  --pad-x: 8px;
+  --pad-y: 4px;
+}
+
+/* Dark theme (default) */
+:root,
+:root[data-theme='dark'] {
+  /* Surfaces */
+  --bg-canvas: #08090b;
+  --bg-panel: #0d0f12;
+  --bg-panel-2: #14171c;
+  --bg-overlay: rgba(8, 9, 11, 0.78);
+
+  --surface-1: #0d0f12;
+  --surface-2: #14171c;
+  --surface-3: #1c2026;
+
+  /* Borders */
+  --border-subtle: #1a1d22;
+  --border-default: #24282f;
+  --border-strong: #353a43;
+
+  /* Text */
+  --text-primary: #ededee;
+  --text-secondary: #a8aab1;
+  --text-tertiary: #6a6d75;
+  --text-disabled: #44464d;
+
+  /* Accent — cyan */
+  --accent: #22d3ee;
+  --accent-soft: rgba(34, 211, 238, 0.14);
+  --accent-strong: #67e8f9;
+  --accent-fg: #042f37;
+
+  /* Semantic */
+  --positive: #34d399;
+  --positive-soft: rgba(52, 211, 153, 0.16);
+  --positive-fg: #052e1f;
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.16);
+  --warning-fg: #2a1c00;
+  --danger: #f43f5e;
+  --danger-soft: rgba(244, 63, 94, 0.16);
+  --danger-fg: #2c0613;
+
+  /* Aliases for legacy components — keep working */
+  --bg-surface: var(--surface-1);
+  --bg-elevated: var(--surface-2);
+  --accent-hover: var(--accent-strong);
+  --accent-glow: var(--accent-soft);
+  --success: var(--positive);
+  --purple: #a78bfa;
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.4), 0 1px 1px rgba(0,0,0,0.3);
+  --shadow-2: 0 6px 18px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.3);
+  --shadow-3: 0 24px 48px rgba(0,0,0,0.55), 0 6px 14px rgba(0,0,0,0.35);
+}
+
+/* Light theme */
+:root[data-theme='light'] {
+  --bg-canvas: #fcfcfd;
+  --bg-panel: #ffffff;
+  --bg-panel-2: #f7f8fa;
+  --bg-overlay: rgba(252, 252, 253, 0.78);
+
+  --surface-1: #ffffff;
+  --surface-2: #f4f5f7;
+  --surface-3: #e9ebef;
+
+  --border-subtle: #ececef;
+  --border-default: #d8dade;
+  --border-strong: #b4b6bc;
+
+  --text-primary: #0c0d10;
+  --text-secondary: #4a4c52;
+  --text-tertiary: #8a8c93;
+  --text-disabled: #c2c4ca;
+
+  --accent: #0891b2;
+  --accent-soft: rgba(8, 145, 178, 0.10);
+  --accent-strong: #0e7490;
+  --accent-fg: #ecfeff;
+
+  --positive: #059669;
+  --positive-soft: rgba(5, 150, 105, 0.10);
+  --positive-fg: #ecfdf5;
+  --warning: #b45309;
+  --warning-soft: rgba(180, 83, 9, 0.10);
+  --warning-fg: #fffbeb;
+  --danger: #be123c;
+  --danger-soft: rgba(190, 18, 60, 0.10);
+  --danger-fg: #fff1f2;
+
+  --bg-surface: var(--surface-1);
+  --bg-elevated: var(--surface-2);
+  --accent-hover: var(--accent-strong);
+  --accent-glow: var(--accent-soft);
+  --success: var(--positive);
+  --purple: #7c3aed;
+
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-2: 0 6px 18px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.04);
+  --shadow-3: 0 24px 48px rgba(15, 23, 42, 0.18), 0 6px 14px rgba(15, 23, 42, 0.08);
+}
+
+/* Reduced motion respects user system preference */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms; --dur-2: 0ms; --dur-3: 0ms; --dur-4: 0ms; --dur-5: 0ms;
+  }
+}
+
+/* Tabular numerics for any element with .num */
+.num,
+.lx-num {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+
+/* Scrollbar — restrained */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; border: 2px solid transparent; }

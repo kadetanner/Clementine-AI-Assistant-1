@@ -1,4 +1,5 @@
 import { applyTheme, currentTheme, systemPrefers, type ThemeName } from './theme/themes.js';
+import './design/primitives/index.js';
 import './components/lexi-app.js';
 import './components/lexi-command-palette.js';
 import './components/workflows/lexi-workflows-view.js';

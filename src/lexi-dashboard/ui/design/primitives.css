@@ -1,0 +1,431 @@
+/* Lighthouse primitives — shared CSS for lx-* components.
+ * Each primitive owns a single class root (lx-button, lx-card, etc).
+ * Components in primitives/ are thin Lit wrappers that emit semantic
+ * markup with these classes.
+ */
+
+/* ── Button ───────────────────────────────────────────────────── */
+.lx-button {
+  --_h: var(--control-h);
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  height: var(--_h);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-sm); line-height: 1;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+  white-space: nowrap;
+}
+.lx-button:hover { background: var(--surface-2); border-color: var(--border-strong); }
+.lx-button:active { transform: translateY(0.5px); }
+.lx-button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.lx-button[disabled], .lx-button[aria-disabled='true'] {
+  opacity: 0.55; cursor: not-allowed; pointer-events: none;
+}
+.lx-button[data-variant='primary'] {
+  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+}
+.lx-button[data-variant='primary']:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.lx-button[data-variant='ghost'] {
+  background: transparent; border-color: transparent; color: var(--text-secondary);
+}
+.lx-button[data-variant='ghost']:hover { background: var(--surface-2); color: var(--text-primary); }
+.lx-button[data-variant='danger'] {
+  background: transparent; color: var(--danger); border-color: var(--border-default);
+}
+.lx-button[data-variant='danger']:hover { background: var(--danger-soft); border-color: var(--danger); }
+.lx-button[data-size='sm'] { --_h: var(--control-h-sm); padding: 0 var(--sp-2); font-size: var(--text-xs); }
+.lx-button[data-size='lg'] { --_h: var(--control-h-lg); padding: 0 var(--sp-4); font-size: var(--text-base); }
+.lx-button[data-loading='true'] { color: transparent; }
+.lx-button[data-loading='true']::after {
+  content: ''; position: absolute; width: 12px; height: 12px;
+  border: 1.5px solid currentColor; border-right-color: transparent;
+  border-radius: 50%;
+  animation: lx-spin 0.8s linear infinite;
+  color: var(--text-primary);
+}
+@keyframes lx-spin { to { transform: rotate(360deg); } }
+
+/* ── Card ─────────────────────────────────────────────────────── */
+.lx-card {
+  display: block;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+}
+.lx-card[data-elev='2'] { box-shadow: var(--shadow-2); border-color: var(--border-default); }
+.lx-card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: var(--sp-3);
+}
+.lx-card-title {
+  font-size: var(--text-base); line-height: var(--line-base);
+  font-weight: 600; color: var(--text-primary); margin: 0;
+}
+.lx-card-subtitle {
+  font-size: var(--text-xs); line-height: var(--line-xs);
+  color: var(--text-tertiary); margin: var(--sp-1) 0 0;
+}
+
+/* ── Input / Textarea / Select ────────────────────────────────── */
+.lx-input, .lx-textarea, .lx-select {
+  display: block; width: 100%;
+  height: var(--control-h);
+  padding: 0 var(--sp-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  line-height: 1;
+  outline: none;
+  transition: border-color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out);
+}
+.lx-textarea {
+  height: auto; min-height: calc(var(--control-h) * 3);
+  padding: var(--sp-2) var(--sp-3);
+  line-height: var(--line-sm);
+  resize: vertical;
+}
+.lx-input:hover, .lx-textarea:hover, .lx-select:hover { border-color: var(--border-strong); }
+.lx-input:focus, .lx-textarea:focus, .lx-select:focus {
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.lx-input::placeholder, .lx-textarea::placeholder { color: var(--text-tertiary); }
+.lx-input[disabled], .lx-textarea[disabled], .lx-select[disabled] {
+  opacity: 0.55; cursor: not-allowed; background: var(--surface-2);
+}
+.lx-input[data-state='invalid'] { border-color: var(--danger); }
+
+.lx-field { display: flex; flex-direction: column; gap: var(--sp-1); }
+.lx-label {
+  font-size: var(--text-xs); line-height: var(--line-xs);
+  color: var(--text-secondary); font-weight: 500;
+}
+.lx-help {
+  font-size: var(--text-xs); line-height: var(--line-xs);
+  color: var(--text-tertiary);
+}
+.lx-help[data-state='error'] { color: var(--danger); }
+
+/* ── Badge / Pill ─────────────────────────────────────────────── */
+.lx-badge {
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  height: 18px;
+  padding: 0 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  color: var(--text-secondary);
+  font-size: 10px; line-height: 1;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.lx-badge[data-tone='accent'] { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+.lx-badge[data-tone='positive'] { background: var(--positive-soft); border-color: transparent; color: var(--positive); }
+.lx-badge[data-tone='warning'] { background: var(--warning-soft); border-color: transparent; color: var(--warning); }
+.lx-badge[data-tone='danger'] { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+
+.lx-pill {
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  height: 22px; padding: 0 var(--sp-2);
+  background: var(--surface-2);
+  border-radius: var(--r-pill);
+  font-size: var(--text-xs); line-height: 1;
+  color: var(--text-secondary);
+}
+
+/* ── Status dot ───────────────────────────────────────────────── */
+.lx-status-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.lx-status-dot[data-state='ok'],
+.lx-status-dot[data-state='green']    { background: var(--positive); }
+.lx-status-dot[data-state='warn'],
+.lx-status-dot[data-state='amber']    { background: var(--warning); }
+.lx-status-dot[data-state='error'],
+.lx-status-dot[data-state='red']      { background: var(--danger); }
+.lx-status-dot[data-state='accent']   { background: var(--accent); }
+.lx-status-dot[data-pulse='true'] {
+  box-shadow: 0 0 0 0 currentColor;
+  animation: lx-pulse var(--dur-5) var(--ease-out) infinite;
+}
+@keyframes lx-pulse {
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  70%  { box-shadow: 0 0 0 6px transparent; opacity: 0.7; }
+  100% { box-shadow: 0 0 0 0 transparent; opacity: 1; }
+}
+
+/* ── Segmented control ────────────────────────────────────────── */
+.lx-segmented {
+  display: inline-flex; padding: 2px;
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-subtle);
+}
+.lx-segmented button {
+  height: calc(var(--control-h-sm));
+  padding: 0 var(--sp-3);
+  border: 0; border-radius: calc(var(--r-md) - 2px);
+  background: transparent; color: var(--text-secondary);
+  font-family: inherit; font-size: var(--text-xs); font-weight: 500;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.lx-segmented button[aria-selected='true'] { background: var(--surface-1); color: var(--text-primary); box-shadow: var(--shadow-1); }
+.lx-segmented button:hover:not([aria-selected='true']) { color: var(--text-primary); }
+
+/* ── Toggle ───────────────────────────────────────────────────── */
+.lx-toggle {
+  display: inline-flex; align-items: center;
+  width: 32px; height: 18px;
+  background: var(--surface-3); border-radius: var(--r-pill);
+  padding: 2px; cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out);
+}
+.lx-toggle::after {
+  content: ''; display: block;
+  width: 14px; height: 14px;
+  background: var(--text-secondary); border-radius: 50%;
+  transition: transform var(--dur-2) var(--ease-out), background var(--dur-1) var(--ease-out);
+}
+.lx-toggle[aria-checked='true'] { background: var(--accent); }
+.lx-toggle[aria-checked='true']::after { transform: translateX(14px); background: var(--accent-fg); }
+.lx-toggle[aria-disabled='true'] { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Tabs ─────────────────────────────────────────────────────── */
+.lx-tabs {
+  display: flex; gap: var(--sp-4);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.lx-tabs button {
+  height: 36px;
+  padding: 0 var(--sp-1);
+  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: var(--text-secondary); font-family: inherit; font-size: var(--text-sm); font-weight: 500;
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease-out), border-color var(--dur-2) var(--ease-out);
+}
+.lx-tabs button:hover { color: var(--text-primary); }
+.lx-tabs button[aria-selected='true'] { color: var(--text-primary); border-bottom-color: var(--accent); }
+
+/* ── Empty state ──────────────────────────────────────────────── */
+.lx-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; padding: var(--sp-8) var(--sp-4);
+  gap: var(--sp-2);
+  color: var(--text-tertiary);
+}
+.lx-empty svg, .lx-empty .icon { color: var(--text-tertiary); width: 28px; height: 28px; opacity: 0.7; }
+.lx-empty .title { color: var(--text-primary); font-size: var(--text-sm); font-weight: 600; margin: var(--sp-2) 0 0; }
+.lx-empty .desc { color: var(--text-tertiary); font-size: var(--text-xs); margin: 0; max-width: 360px; }
+.lx-empty .actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+
+/* ── Skeleton ─────────────────────────────────────────────────── */
+.lx-skeleton {
+  display: block; height: 12px; width: 100%;
+  background: linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 50%, var(--surface-2) 100%);
+  background-size: 200% 100%;
+  border-radius: var(--r-sm);
+  animation: lx-shimmer 1.4s linear infinite;
+}
+@keyframes lx-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ── Kbd ──────────────────────────────────────────────────────── */
+.lx-kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px;
+  padding: 0 4px;
+  background: var(--surface-2); border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px; line-height: 1; font-weight: 500;
+}
+
+/* ── Tooltip ──────────────────────────────────────────────────── */
+.lx-tooltip {
+  position: absolute; z-index: var(--z-tooltip);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--surface-3); border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  font-size: var(--text-xs); color: var(--text-primary);
+  pointer-events: none;
+  box-shadow: var(--shadow-2);
+  opacity: 0; transform: translateY(2px);
+  transition: opacity var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out);
+}
+.lx-tooltip[data-open='true'] { opacity: 1; transform: translateY(0); }
+
+/* ── Popover ──────────────────────────────────────────────────── */
+.lx-popover {
+  position: absolute; z-index: var(--z-popover);
+  background: var(--surface-1); border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  padding: var(--sp-2);
+  box-shadow: var(--shadow-3);
+  min-width: 200px;
+}
+
+/* ── Dialog ───────────────────────────────────────────────────── */
+.lx-dialog-backdrop {
+  position: fixed; inset: 0; z-index: var(--z-modal);
+  background: var(--bg-overlay);
+  backdrop-filter: blur(2px);
+  display: grid; place-items: center;
+}
+.lx-dialog {
+  background: var(--surface-1); border: 1px solid var(--border-default);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-3);
+  min-width: 400px; max-width: 640px; width: calc(100% - 64px);
+  padding: var(--sp-5);
+}
+.lx-dialog-title { font-size: var(--text-lg); font-weight: 600; margin: 0 0 var(--sp-2); }
+.lx-dialog-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); margin-top: var(--sp-5); }
+
+/* ── Drawer (right slideover) ─────────────────────────────────── */
+.lx-drawer-backdrop {
+  position: fixed; inset: 0; z-index: var(--z-modal);
+  background: var(--bg-overlay);
+}
+.lx-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: calc(var(--z-modal) + 1);
+  width: min(560px, calc(100% - 80px));
+  background: var(--surface-1);
+  border-left: 1px solid var(--border-default);
+  box-shadow: var(--shadow-3);
+  display: flex; flex-direction: column;
+  animation: lx-drawer-in var(--dur-3) var(--ease-out);
+}
+@keyframes lx-drawer-in {
+  from { transform: translateX(16px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.lx-drawer-header { padding: var(--sp-4); border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between; }
+.lx-drawer-body { flex: 1; overflow: auto; padding: var(--sp-4); }
+
+/* ── Toast ────────────────────────────────────────────────────── */
+.lx-toast-stack {
+  position: fixed; right: var(--sp-4); bottom: var(--sp-4); z-index: var(--z-toast);
+  display: flex; flex-direction: column; gap: var(--sp-2);
+}
+.lx-toast {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-1); border: 1px solid var(--border-default);
+  border-radius: var(--r-md); box-shadow: var(--shadow-2);
+  font-size: var(--text-sm); color: var(--text-primary);
+  min-width: 280px; max-width: 420px;
+  animation: lx-toast-in var(--dur-3) var(--ease-out);
+}
+@keyframes lx-toast-in {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.lx-toast[data-tone='positive'] { border-left: 3px solid var(--positive); }
+.lx-toast[data-tone='warning'] { border-left: 3px solid var(--warning); }
+.lx-toast[data-tone='danger'] { border-left: 3px solid var(--danger); }
+
+/* ── Table ────────────────────────────────────────────────────── */
+.lx-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+.lx-table th, .lx-table td {
+  padding: var(--pad-y) var(--pad-x);
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  height: var(--row-h);
+}
+.lx-table th {
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--surface-1);
+  position: sticky; top: 0; z-index: 1;
+}
+.lx-table tbody tr { transition: background var(--dur-1) var(--ease-out); }
+.lx-table tbody tr:hover { background: var(--surface-2); }
+.lx-table .num { text-align: right; }
+
+/* ── Meter ────────────────────────────────────────────────────── */
+.lx-meter {
+  position: relative;
+  height: 6px; width: 100%;
+  background: var(--surface-2); border-radius: var(--r-pill); overflow: hidden;
+}
+.lx-meter-fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width var(--dur-3) var(--ease-out);
+}
+.lx-meter[data-tone='warning'] .lx-meter-fill { background: var(--warning); }
+.lx-meter[data-tone='danger'] .lx-meter-fill { background: var(--danger); }
+.lx-meter[data-tone='positive'] .lx-meter-fill { background: var(--positive); }
+
+/* ── Code block ───────────────────────────────────────────────── */
+.lx-code {
+  display: block;
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--line-sm);
+  color: var(--text-primary);
+  overflow: auto;
+  white-space: pre;
+}
+
+/* ── Divider / Section header ─────────────────────────────────── */
+.lx-divider {
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  margin: var(--sp-4) 0;
+}
+.lx-section-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin: 0 0 var(--sp-3);
+}
+.lx-section-head .title { font-size: var(--text-sm); font-weight: 600; color: var(--text-primary); margin: 0; }
+.lx-section-head .meta { font-size: var(--text-xs); color: var(--text-tertiary); }
+
+/* ── Stack / Grid layout helpers ──────────────────────────────── */
+.lx-stack { display: flex; flex-direction: column; gap: var(--sp-3); }
+.lx-stack[data-gap='1'] { gap: var(--sp-1); }
+.lx-stack[data-gap='2'] { gap: var(--sp-2); }
+.lx-stack[data-gap='4'] { gap: var(--sp-4); }
+.lx-stack[data-gap='6'] { gap: var(--sp-6); }
+.lx-row { display: flex; flex-direction: row; gap: var(--sp-3); align-items: center; }
+.lx-row[data-gap='1'] { gap: var(--sp-1); }
+.lx-row[data-gap='2'] { gap: var(--sp-2); }
+.lx-row[data-gap='6'] { gap: var(--sp-6); }
+.lx-grid { display: grid; gap: var(--sp-3); }
+.lx-spacer { flex: 1; }
+
+/* ── Sparkline / Bar (containers only — JS draws inside) ──────── */
+.lx-spark { display: inline-block; height: 24px; width: 80px; vertical-align: middle; }
+.lx-bar { display: inline-block; height: 16px; width: 100%; }
+
+/* ── Diff view ────────────────────────────────────────────────── */
+.lx-diff { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); font-family: var(--font-mono); font-size: var(--text-xs); }
+.lx-diff .removed { background: var(--danger-soft); padding: 2px 4px; border-radius: var(--r-sm); }
+.lx-diff .added { background: var(--positive-soft); padding: 2px 4px; border-radius: var(--r-sm); }
