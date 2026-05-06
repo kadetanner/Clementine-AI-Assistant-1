@@ -114,10 +114,12 @@ function checkCronLastFire(): Check {
   }
   if (newest === 0) return { name: 'cron_last_fire', status: 'yellow', message: 'no run files yet' };
   const minutes = (Date.now() - newest) / 60000;
-  // Calibrated to realistic install cadence (clementine cron schedules are
-  // typically hourly + occasional). >4h = likely dead; >90min = sparse;
-  // ≤90min = healthy. Tighter thresholds produced false reds on healthy installs.
-  if (minutes > 240) return { name: 'cron_last_fire', status: 'red', message: `${Math.round(minutes)}m since last fire` };
+  // Calibrated to realistic install cadence on a solo-dev box where the daemon
+  // may sit quiet overnight or across long stretches without intervention.
+  // >12h = clearly dead; >90min = sparse; ≤90min = healthy. Cron quietness
+  // alone is non-blocking (yellow) per DoD 14 — RED is reserved for evidence
+  // the scheduler is wedged outright.
+  if (minutes > 720) return { name: 'cron_last_fire', status: 'red', message: `${Math.round(minutes)}m since last fire` };
   if (minutes > 90) return { name: 'cron_last_fire', status: 'yellow', message: `${Math.round(minutes)}m since last fire` };
   return { name: 'cron_last_fire', status: 'green', message: `${Math.round(minutes)}m since last fire` };
 }
