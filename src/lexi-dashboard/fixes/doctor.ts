@@ -18,10 +18,6 @@ const CRON_RUNS_DIR = join(CLEM_HOME, 'cron', 'runs');       // dir mtime advanc
 const CLAUDE_INTEGRATIONS = join(CLEM_HOME, 'claude-integrations.json'); // canonical integration registry
 const LEXI_PORT = Number(process.env.LEXI_PORT ?? '3030');
 
-function ageMs(path: string): number | null {
-  try { return Date.now() - statSync(path).mtimeMs; } catch { return null; }
-}
-
 function findFalkorSocket(): string | null {
   if (!existsSync(GRAPH_DB_DIR)) return null;
   try {
@@ -98,12 +94,31 @@ function checkVaultDirectory(): Check {
 }
 
 function checkCronLastFire(): Check {
-  // Use the cron/runs/ directory mtime — it advances every time a new run record is written.
-  const age = ageMs(CRON_RUNS_DIR);
-  if (age === null) return { name: 'cron_last_fire', status: 'yellow', message: `${CRON_RUNS_DIR} missing` };
-  const minutes = age / 60000;
-  if (minutes > 60) return { name: 'cron_last_fire', status: 'red', message: `${Math.round(minutes)}m since last fire` };
-  if (minutes > 15) return { name: 'cron_last_fire', status: 'yellow', message: `${Math.round(minutes)}m since last fire` };
+  // Walk cron/runs/ and use the most recent file mtime.
+  // APFS does not advance directory mtime when files inside are merely written-to
+  // (only on add/remove), so a long-lived heartbeat file getting appended doesn't
+  // bump the dir mtime.
+  if (!existsSync(CRON_RUNS_DIR)) {
+    return { name: 'cron_last_fire', status: 'yellow', message: `${CRON_RUNS_DIR} missing` };
+  }
+  let newest = 0;
+  try {
+    for (const f of readdirSync(CRON_RUNS_DIR)) {
+      try {
+        const m = statSync(join(CRON_RUNS_DIR, f)).mtimeMs;
+        if (m > newest) newest = m;
+      } catch { /* skip */ }
+    }
+  } catch {
+    return { name: 'cron_last_fire', status: 'yellow', message: `${CRON_RUNS_DIR} unreadable` };
+  }
+  if (newest === 0) return { name: 'cron_last_fire', status: 'yellow', message: 'no run files yet' };
+  const minutes = (Date.now() - newest) / 60000;
+  // Calibrated to realistic install cadence (clementine cron schedules are
+  // typically hourly + occasional). >4h = likely dead; >90min = sparse;
+  // ≤90min = healthy. Tighter thresholds produced false reds on healthy installs.
+  if (minutes > 240) return { name: 'cron_last_fire', status: 'red', message: `${Math.round(minutes)}m since last fire` };
+  if (minutes > 90) return { name: 'cron_last_fire', status: 'yellow', message: `${Math.round(minutes)}m since last fire` };
   return { name: 'cron_last_fire', status: 'green', message: `${Math.round(minutes)}m since last fire` };
 }
 
