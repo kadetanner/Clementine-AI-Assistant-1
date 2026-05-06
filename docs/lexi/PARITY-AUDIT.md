@@ -1,60 +1,16 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:39:11.399Z
+Generated: 2026-05-06T05:41:05.989Z
 
 - Upstream routes: **265**
-- Implemented in Lexi: **32**
+- Implemented in Lexi: **70**
 - Explicitly internal (acknowledged): **0**
-- **Missing: 233**
+- **Missing: 195**
 - Lexi-only routes (not in upstream): 10
-- Coverage: **12.1%**
-- Baseline ceiling: `233` (recorded 2026-05-06T05:37:35.532Z)
+- Coverage: **26.4%**
+- Baseline ceiling: `195` (recorded 2026-05-06T05:40:58.582Z)
 
 ## Missing routes by namespace
-
-### `/api/brain` — 20 missing
-
-- `POST /api/brain/seed/upload`
-- `POST /api/brain/seed/preview`
-- `POST /api/brain/seed/commit`
-- `POST /api/brain/seed/preview/stream`
-- `POST /api/brain/seed/commit/stream`
-- `GET /api/brain/connectors`
-- `POST /api/brain/mcp/probe`
-- `GET /api/brain/feeds`
-- `POST /api/brain/feeds`
-- `POST /api/brain/feeds/:name/run`
-- `DELETE /api/brain/feeds/:name`
-- `GET /api/brain/sources`
-- `POST /api/brain/sources/:slug/run`
-- `POST /api/brain/sources`
-- `DELETE /api/brain/sources/:slug`
-- `GET /api/brain/credentials`
-- `POST /api/brain/credentials`
-- `GET /api/brain/runs`
-- `GET /api/brain/artifacts/:id`
-- `GET /api/brain/library/search`
-
-### `/api/memory` — 18 missing
-
-- `GET /api/memory/supersedes`
-- `GET /api/memory/session-bridge`
-- `GET /api/memory/writes/recent`
-- `GET /api/memory/learnings`
-- `POST /api/memory/learnings/action`
-- `GET /api/memory/commitments`
-- `POST /api/memory/commitments/action`
-- `GET /api/memory/episodes`
-- `GET /api/memory/coverage`
-- `POST /api/memory/quick-add`
-- `POST /api/memory/health/action`
-- `GET /api/memory/chunks/:id`
-- `PUT /api/memory/chunks/:id`
-- `DELETE /api/memory/chunks/:id`
-- `POST /api/memory/chunks/:id/restore`
-- `POST /api/memory/chunks/:id/pin`
-- `GET /api/memory/chunks/:id/history`
-- `GET /api/memory/search`
 
 ### `/api/builder` — 16 missing
 
