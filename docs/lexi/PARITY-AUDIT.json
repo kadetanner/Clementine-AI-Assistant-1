@@ -4,7 +4,7 @@
     "implemented": 265,
     "internalAcknowledged": 0,
     "missing": 0,
-    "lexiOnly": 39,
+    "lexiOnly": 46,
     "coveragePct": 100
   },
   "baseline": {
@@ -289,6 +289,13 @@
     "POST /api/restart-self",
     "POST /api/voice/synthesize",
     "GET /api/secrets/refs",
+    "POST /api/lexi-chat/start",
+    "POST /api/lexi-chat/send",
+    "GET /api/lexi-chat/stream/:_",
+    "GET /api/lexi-chat/sessions",
+    "GET /api/lexi-chat/sessions/:_",
+    "DELETE /api/lexi-chat/sessions/:_",
+    "GET /api/lexi-chat/_invariants",
     "PUT /api/skills/:_",
     "GET /api/skills/:_/info",
     "POST /api/approvals/:_/decision",

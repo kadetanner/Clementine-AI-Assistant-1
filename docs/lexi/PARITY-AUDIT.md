@@ -1,12 +1,12 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:52:27.335Z
+Generated: 2026-05-06T05:56:10.731Z
 
 - Upstream routes: **265**
 - Implemented in Lexi: **265**
 - Explicitly internal (acknowledged): **0**
 - **Missing: 0**
-- Lexi-only routes (not in upstream): 39
+- Lexi-only routes (not in upstream): 46
 - Coverage: **100.0%**
 - Baseline ceiling: `0` (recorded 2026-05-06T05:47:54.919Z)
 
@@ -23,6 +23,13 @@ Generated: 2026-05-06T05:52:27.335Z
 - `POST /api/restart-self` — src/lexi-dashboard/fixes/restart-self.ts
 - `POST /api/voice/synthesize` — src/lexi-dashboard/fixes/voice-synthesize.ts
 - `GET /api/secrets/refs` — src/lexi-dashboard/proxy/upstream-routes.ts
+- `POST /api/lexi-chat/start` — src/lexi-dashboard/routes/chat-v2.ts
+- `POST /api/lexi-chat/send` — src/lexi-dashboard/routes/chat-v2.ts
+- `GET /api/lexi-chat/stream/:_` — src/lexi-dashboard/routes/chat-v2.ts
+- `GET /api/lexi-chat/sessions` — src/lexi-dashboard/routes/chat-v2.ts
+- `GET /api/lexi-chat/sessions/:_` — src/lexi-dashboard/routes/chat-v2.ts
+- `DELETE /api/lexi-chat/sessions/:_` — src/lexi-dashboard/routes/chat-v2.ts
+- `GET /api/lexi-chat/_invariants` — src/lexi-dashboard/routes/chat-v2.ts
 - `PUT /api/skills/:_` — src/lexi-dashboard/routes/operate-v2.ts
 - `GET /api/skills/:_/info` — src/lexi-dashboard/routes/operate-v2.ts
 - `POST /api/approvals/:_/decision` — src/lexi-dashboard/routes/operate-v2.ts
