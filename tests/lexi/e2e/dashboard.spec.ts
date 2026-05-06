@@ -23,7 +23,7 @@ const PENDING_SECTIONS = [
   'routines', 'brain', 'skills', 'approvals', 'budget',
   'logs', 'advisor', 'heartbeat', 'build',
   'team', 'projects', 'plans', 'claims',
-  'trace', 'search',
+  'trace',
 ] as const;
 
 test.beforeAll(async ({ request }) => {

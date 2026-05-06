@@ -23,6 +23,7 @@ import '../shell/lexi-system-map-drawer.js';
 import '../views/lexi-today-view.js';
 import '../views/lexi-phase-pending-view.js';
 import '../views/lexi-chat-view.js';
+import '../views/lexi-search-view.js';
 
 // Existing views — kept and wired into the new shell.
 import './lexi-agents-view.js';
@@ -40,7 +41,7 @@ const PHASE_PENDING_SECTIONS = new Set([
   'routines', 'brain', 'skills', 'approvals', 'budget',
   'logs', 'advisor', 'heartbeat', 'build',
   'team', 'projects', 'plans', 'claims',
-  'trace', 'search',
+  'trace',
 ]);
 
 export class LexiApp extends LitElement {
@@ -132,6 +133,7 @@ export class LexiApp extends LitElement {
     if (r === 'cron') return html`<lexi-cron-view></lexi-cron-view>`;
     if (r === 'settings') return html`<lexi-settings-view></lexi-settings-view>`;
     if (r === 'chat') return html`<lexi-chat-view></lexi-chat-view>`;
+    if (r === 'search') return html`<lexi-search-view></lexi-search-view>`;
     if (PHASE_PENDING_SECTIONS.has(r))
       return html`<lexi-phase-pending-view section=${r}></lexi-phase-pending-view>`;
     return html`<div class="lx-view-head"><h1>${r}</h1><p class="subtitle">Unknown section</p></div>`;

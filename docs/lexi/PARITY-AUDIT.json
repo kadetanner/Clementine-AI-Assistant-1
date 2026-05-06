@@ -4,7 +4,7 @@
     "implemented": 265,
     "internalAcknowledged": 0,
     "missing": 0,
-    "lexiOnly": 46,
+    "lexiOnly": 47,
     "coveragePct": 100
   },
   "baseline": {
@@ -325,6 +325,7 @@
     "POST /api/self-improve",
     "PUT /api/self-improve/:_",
     "DELETE /api/self-improve/:_",
+    "GET /api/lexi-search",
     "PUT /api/vault-file"
   ],
   "internalAcknowledged": []

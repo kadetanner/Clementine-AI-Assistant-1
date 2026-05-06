@@ -10,6 +10,7 @@ import { register as registerWorkflowsCronRoutinesV2 } from './routes/workflows-
 import { register as registerOperateV2 } from './routes/operate-v2.js';
 import { register as registerObservabilityMiscV2 } from './routes/observability-misc-v2.js';
 import { register as registerChatV2 } from './routes/chat-v2.js';
+import { register as registerSearchV2 } from './routes/search-v2.js';
 import { register as registerConnections } from './routes/connections.js';
 import { register as registerWorkflows } from './routes/workflows.js';
 import { register as registerVaultWrite } from './routes/vault-write.js';
@@ -42,6 +43,7 @@ export function registerLexiRoutes(app: Express): void {
   registerOperateV2(app);
   registerObservabilityMiscV2(app);
   registerChatV2(app);
+  registerSearchV2(app);
   registerConnections(app);
   registerWorkflows(app);
   registerVaultWrite(app);

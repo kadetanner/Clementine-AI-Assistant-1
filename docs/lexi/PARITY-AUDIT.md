@@ -1,12 +1,12 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:56:10.731Z
+Generated: 2026-05-06T05:58:47.542Z
 
 - Upstream routes: **265**
 - Implemented in Lexi: **265**
 - Explicitly internal (acknowledged): **0**
 - **Missing: 0**
-- Lexi-only routes (not in upstream): 46
+- Lexi-only routes (not in upstream): 47
 - Coverage: **100.0%**
 - Baseline ceiling: `0` (recorded 2026-05-06T05:47:54.919Z)
 
@@ -59,4 +59,5 @@ Generated: 2026-05-06T05:56:10.731Z
 - `POST /api/self-improve` — src/lexi-dashboard/routes/operate-v2.ts
 - `PUT /api/self-improve/:_` — src/lexi-dashboard/routes/operate-v2.ts
 - `DELETE /api/self-improve/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/lexi-search` — src/lexi-dashboard/routes/search-v2.ts
 - `PUT /api/vault-file` — src/lexi-dashboard/routes/vault-write.ts
