@@ -17,13 +17,14 @@ const LEGACY_SECTIONS = [
   { route: 'memory', tag: 'lexi-memory-view' },
   { route: 'cron', tag: 'lexi-cron-view' },
   { route: 'settings', tag: 'lexi-settings-view' },
+  // Phase 22 — trace promoted out of phase-pending into a real view
+  { route: 'trace', tag: 'lexi-trace-view' },
 ] as const;
 
 const PENDING_SECTIONS = [
   'routines', 'brain', 'skills', 'approvals', 'budget',
   'logs', 'advisor', 'heartbeat', 'build',
   'team', 'projects', 'plans', 'claims',
-  'trace',
 ] as const;
 
 test.beforeAll(async ({ request }) => {
@@ -214,6 +215,16 @@ test.describe('Section content', () => {
     const view = page.locator('lexi-settings-view');
     await expect(view).toContainText(/Theme/);
     await expect(view).toContainText(/Auth/);
+  });
+
+  test('trace — Runs + Timeline panes render', async ({ page }) => {
+    await gotoRoute(page, 'trace', 'lexi-trace-view');
+    const view = page.locator('lexi-trace-view');
+    await expect(view).toContainText(/Trace/);
+    await expect(view).toContainText(/Runs/);
+    await expect(view).toContainText(/Timeline/);
+    // /api/runs returns valid JSON; the view either lists runs or shows empty state
+    await expect(view).toContainText(/Pick a run|No runs yet|cron:|team-task:|unleashed:|discord:/);
   });
 });
 

@@ -9,10 +9,10 @@
 | Metric | Before Lighthouse | After Lighthouse |
 |---|---|---|
 | Upstream route coverage | 12/265 (4.5%) | **265/265 (100.0%)** |
-| Lexi-only routes added | 10 | **20** |
-| Unit tests | 263 | **315** |
-| E2E tests | 24 | **29** |
-| Source LOC under `src/lexi-dashboard/` | 5,601 | **~10,500** |
+| Lexi-only routes added | 10 | **23** |
+| Unit tests | 263 | **335** |
+| E2E tests | 24 | **30** |
+| Source LOC under `src/lexi-dashboard/` | 5,601 | **~11,000** |
 | Design system | mixed inline styles | tokens + 18 primitives |
 | Sections in nav | 8 | **17** + footer |
 
@@ -32,6 +32,7 @@
 | 19 | Chat console (NEW — exceeds upstream) | shipped |
 | 20 | Cross-surface search | shipped |
 | 21 | Final hardening + this report | shipped |
+| 22 | Live trace pillar — session-log tailer + trace view + SSE | shipped |
 
 ## Hard constraints honored
 
@@ -57,7 +58,7 @@
 | 2 | Every nav section has Playwright coverage | **PASS** (17 sections, 29 tests) |
 | 3 | Theme toggle works in Chromium / Safari / Firefox | Chromium PASS · Safari + Firefox await human |
 | 4 | ⌘K palette reachable from every view | **PASS** |
-| 5 | Live trace shows a real run start → finish | DEFERRED (needs daemon trace events) |
+| 5 | Live trace shows a real run start → finish | **PASS** (Phase 22: session-log tailer + `lexi-trace-view`; verified end-to-end) |
 | 6 | Chat assertions: `ANTHROPIC_API_KEY` was never used | **PASS** (`/api/lexi-chat/_invariants`) |
 | 7 | `verify-upstream-clean.sh` passes | **PASS** |
 | 8 | `npm run dod` produces all-green DOD-REPORT | 16/17 (DoD 8 manual gate only) |
@@ -65,10 +66,6 @@
 
 ## Known gaps (deferred follow-up)
 
-- **Trace pillar (Phase 14 sub-goal)** — the trace-store API is wired and the
-  agent-detail endpoint surfaces it, but there is no live agent run pushing
-  events through the SSE bus yet. Daemon-side hook needs to push run lifecycle
-  events; once present, `lexi-trace-view` will populate.
 - **DoD 8 manual three-browser sign-off** — Playwright covers Chromium. Safari
   and Firefox manual verification remains. Checklist at
   `tests/lexi/dod/browsers.md`.
@@ -76,11 +73,16 @@
   accomplish first-run navigation. A formal step-by-step tour was not built.
 - **Phase-pending sections (`brain`, `routines`, `skills`, `approvals`,
   `budget`, `logs`, `advisor`, `heartbeat`, `build`, `team`, `projects`,
-  `plans`, `claims`, `trace`)** — backend routes are wired (read paths return
-  real data, mutating paths honestly 501). Dedicated views for each are
-  still placeholders that name the implementing phase. The Today view + the
-  command palette + cross-surface search already surface these surfaces' data;
+  `plans`, `claims`)** — backend routes are wired (read paths return real
+  data, mutating paths honestly 501). Dedicated views for each are still
+  placeholders that name the implementing phase. The Today view + the command
+  palette + cross-surface search already surface these surfaces' data;
   dedicated views are progressive enhancement.
+- **Agent registry filter** — `/api/agents` discovery in `agents/vault-store`
+  filters Lexi herself out, so the registry currently returns only Jonah.
+  Phase 22 trace view derives agent slugs from session-key prefixes (`cron:`,
+  `team-task:->`, `unleashed:`, `discord:`) which surfaces every active agent
+  even when the registry is incomplete.
 
 ## Files of interest
 
