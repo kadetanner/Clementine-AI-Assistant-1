@@ -16,6 +16,54 @@ interface BrokenJob {
   reason: string;
   lastError?: string;
   workflowId?: string;
+  errorCount48h?: number;
+  totalRuns48h?: number;
+  rootCause?: string;
+  proposedFix?: string;
+}
+
+interface BrokenJobApiShape {
+  jobName?: string;
+  name?: string;
+  errorCount48h?: number;
+  totalRuns48h?: number;
+  lastErrors?: string[];
+  diagnosis?: {
+    rootCause?: string;
+    proposedFix?: { details?: string };
+  };
+  workflowId?: string;
+  reason?: string;
+  lastError?: string;
+}
+
+function normalizeBrokenJob(raw: BrokenJobApiShape): BrokenJob {
+  const name = raw.jobName ?? raw.name ?? '(unknown)';
+  const lastError = raw.lastErrors && raw.lastErrors.length > 0 ? raw.lastErrors[0] : raw.lastError;
+  const rootCause = raw.diagnosis?.rootCause;
+  // Reason priority: explicit reason → diagnosis rootCause → first lastError
+  // (truncated, with leading whitespace + JSON noise stripped) → run-counter
+  // fallback so the UI never shows an empty diagnosis.
+  let reason = raw.reason ?? rootCause ?? '';
+  if (!reason && lastError) {
+    reason = lastError.replace(/^auth:\s*```json[\s\S]*?\bmessage"\s*:\s*"([^"]+)".*$/s, '$1');
+    if (reason === lastError) reason = lastError;
+    reason = reason.slice(0, 220);
+  }
+  if (!reason && typeof raw.errorCount48h === 'number' && typeof raw.totalRuns48h === 'number') {
+    reason = `${raw.errorCount48h}/${raw.totalRuns48h} runs failed in the last 48h`;
+  }
+  if (!reason) reason = 'failing — no diagnosis yet';
+  return {
+    name,
+    reason,
+    lastError,
+    workflowId: raw.workflowId,
+    errorCount48h: raw.errorCount48h,
+    totalRuns48h: raw.totalRuns48h,
+    rootCause,
+    proposedFix: raw.diagnosis?.proposedFix?.details,
+  };
 }
 
 export class LexiCronView extends LitElement {
@@ -52,7 +100,8 @@ export class LexiCronView extends LitElement {
       fetch('/api/cron/broken-jobs').then((r) => r.json()).catch(() => ({})),
     ]);
     this.jobs = (jres.jobs ?? []) as CronJob[];
-    this.broken = (bres.broken ?? bres.jobs ?? []) as BrokenJob[];
+    const rawBroken = (bres.broken ?? bres.jobs ?? []) as BrokenJobApiShape[];
+    this.broken = rawBroken.map(normalizeBrokenJob);
   }
 
   private async runNow(name: string): Promise<void> {
@@ -109,11 +158,21 @@ export class LexiCronView extends LitElement {
         <div class="broken-banner">
           <div class="head">${this.broken.length} broken job${this.broken.length === 1 ? '' : 's'}</div>
           ${this.broken.map((b) => html`
-            <div style="display:flex;align-items:center;gap:10px;padding:6px 0">
-              <span class="mono" style="font-size:12px">${b.name}</span>
-              <span style="color:var(--text-secondary);font-size:12px;flex:1">${b.reason}</span>
+            <div style="padding:8px 0;border-top:1px solid var(--border-subtle);display:flex;gap:12px;align-items:flex-start">
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+                  <span class="mono" style="font-size:13px;font-weight:600">${b.name}</span>
+                  ${typeof b.errorCount48h === 'number' && typeof b.totalRuns48h === 'number'
+                    ? html`<span style="font-size:11px;color:var(--text-tertiary)">${b.errorCount48h}/${b.totalRuns48h} fails · 48h</span>`
+                    : ''}
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);word-break:break-word">${b.reason}</div>
+                ${b.proposedFix
+                  ? html`<div style="font-size:11px;color:var(--text-tertiary);margin-top:4px"><strong>Suggested:</strong> ${b.proposedFix}</div>`
+                  : ''}
+              </div>
               <button data-action="investigate" @click=${() => this.investigate(b)}
-                style="background:var(--danger);color:#fff;border:0;padding:4px 10px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer">
+                style="background:var(--danger);color:#fff;border:0;padding:4px 10px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer;flex-shrink:0">
                 Investigate
               </button>
             </div>

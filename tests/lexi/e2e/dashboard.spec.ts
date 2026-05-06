@@ -366,6 +366,69 @@ test.describe('Section content', () => {
   });
 });
 
+test.describe('Navigation hygiene', () => {
+  test('touring every route leaves exactly one view in the DOM', async ({ page }) => {
+    await page.goto('/');
+    const routes = [
+      'today','agents','skills','heartbeat','cron','memory','workflows','logs',
+      'budget','plans','team','projects','claims','brain','routines','approvals',
+      'advisor','build','settings','trace','chat','search','vault','connections',
+    ];
+    for (const r of routes) {
+      await page.goto(`/#/${r}`);
+      await page.waitForTimeout(150);
+    }
+    const counts = await page.evaluate(() => {
+      const tags = [
+        'lexi-today-view','lexi-agents-view','lexi-skills-view','lexi-heartbeat-view',
+        'lexi-cron-view','lexi-memory-view','lexi-workflows-view','lexi-logs-view',
+        'lexi-budget-view','lexi-plans-view','lexi-team-view','lexi-projects-view',
+        'lexi-claims-view','lexi-brain-view','lexi-routines-view','lexi-approvals-view',
+        'lexi-advisor-view','lexi-build-view','lexi-settings-view','lexi-trace-view',
+        'lexi-chat-view','lexi-search-view','lexi-vault-view','lexi-connections-view',
+      ];
+      const o: Record<string, number> = {};
+      for (const t of tags) {
+        const n = document.querySelectorAll(t).length;
+        if (n > 0) o[t] = n;
+      }
+      return o;
+    });
+    const tags = Object.keys(counts);
+    expect(tags.length, `expected exactly one mounted view, got: ${JSON.stringify(counts)}`).toBe(1);
+    expect(counts[tags[0]]).toBe(1);
+  });
+
+  test('drawers do not render their content inline when closed', async ({ page }) => {
+    await page.goto('/#/today');
+    await page.waitForTimeout(400);
+    const inline = await page.evaluate(() => {
+      const notif = document.querySelector('lexi-notifications-drawer');
+      const sys = document.querySelector('lexi-system-map-drawer');
+      return {
+        notifChildren: notif?.children.length ?? -1,
+        sysChildren: sys?.children.length ?? -1,
+      };
+    });
+    // When closed, both drawers should render `nothing` (zero children).
+    expect(inline.notifChildren).toBe(0);
+    expect(inline.sysChildren).toBe(0);
+  });
+
+  test('clicking the virtual Lexi agent does not 404 the detail pane', async ({ page }) => {
+    await page.goto('/#/agents');
+    await page.waitForTimeout(500);
+    // Click the lexi agent entry in the list. Match the rendered name link.
+    const lexiCard = page.locator('lexi-agents-view').getByText(/^lexi$/i).first();
+    if (await lexiCard.count() > 0) {
+      await lexiCard.click();
+      await page.waitForTimeout(400);
+      const view = page.locator('lexi-agents-view');
+      await expect(view, 'no 404 after clicking virtual lexi').not.toContainText(/failed:\s*404|Error:.*404/);
+    }
+  });
+});
+
 test.describe('Command palette (Cmd+K)', () => {
   test('Cmd+K opens palette from any section', async ({ page }) => {
     await gotoRoute(page, 'agents', 'lexi-agents-view');

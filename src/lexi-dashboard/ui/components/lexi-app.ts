@@ -113,6 +113,60 @@ export class LexiApp extends LitElement {
     super.disconnectedCallback();
   }
 
+  /**
+   * After every render, ensure the route host contains exactly one child:
+   * the view for the current route. We manage this imperatively because
+   * Lit's child-binding diff in light-DOM mode can leave the previous
+   * custom element mounted when `${expr}` swaps between different tag
+   * names — observed reproducibly going skills → heartbeat → connections,
+   * with each subsequent view stacking under the prior one.
+   */
+  protected updated(): void {
+    this.mountRouteView();
+  }
+
+  private mountRouteView(): void {
+    const host = this.querySelector('div.lexi-route-host');
+    if (!host) return;
+    const expected = this.tagForRoute(this.route);
+    const existing = host.firstElementChild;
+    if (existing && existing.tagName.toLowerCase() === expected) {
+      if (expected === 'lexi-phase-pending-view') {
+        existing.setAttribute('section', this.route);
+      }
+      return;
+    }
+    // Replace whatever is there with a freshly created element. createElement
+    // for a registered custom element triggers its connectedCallback the
+    // moment it joins the DOM.
+    host.replaceChildren();
+    if (expected === 'lexi-phase-pending-view') {
+      const el = document.createElement(expected);
+      el.setAttribute('section', this.route);
+      host.appendChild(el);
+    } else if (expected) {
+      host.appendChild(document.createElement(expected));
+    } else {
+      // Unknown route — build a fallback via DOM APIs (no innerHTML).
+      const div = document.createElement('div');
+      div.className = 'lx-view-head';
+      const h1 = document.createElement('h1');
+      h1.textContent = this.route;
+      const p = document.createElement('p');
+      p.className = 'subtitle';
+      p.textContent = 'Unknown section';
+      div.appendChild(h1);
+      div.appendChild(p);
+      host.appendChild(div);
+    }
+  }
+
+  private tagForRoute(route: string): string {
+    if (route === 'today' || route === 'home') return 'lexi-today-view';
+    if (PHASE_PENDING_SECTIONS.has(route)) return 'lexi-phase-pending-view';
+    return `lexi-${route}-view`;
+  }
+
   async refreshStatus(): Promise<void> {
     try {
       const r = await fetch('/api/doctor');
@@ -134,35 +188,16 @@ export class LexiApp extends LitElement {
     }
   }
 
+  /**
+   * Lit's child-binding diff has a bug in light-DOM mode where swapping
+   * different custom elements at a `${expr}` position can leave the old
+   * element mounted. We bypass it entirely by rendering a stable empty
+   * `<div class="lexi-route-host">` and managing its single child
+   * imperatively in `updated()`. This guarantees exactly one view at a
+   * time and avoids the stacking bug.
+   */
   private renderRoute(): TemplateResult {
-    const r = this.route;
-    if (r === 'today' || r === 'home') return html`<lexi-today-view></lexi-today-view>`;
-    if (r === 'agents') return html`<lexi-agents-view></lexi-agents-view>`;
-    if (r === 'connections') return html`<lexi-connections-view></lexi-connections-view>`;
-    if (r === 'workflows') return html`<lexi-workflows-view></lexi-workflows-view>`;
-    if (r === 'vault') return html`<lexi-vault-view></lexi-vault-view>`;
-    if (r === 'memory') return html`<lexi-memory-view></lexi-memory-view>`;
-    if (r === 'cron') return html`<lexi-cron-view></lexi-cron-view>`;
-    if (r === 'settings') return html`<lexi-settings-view></lexi-settings-view>`;
-    if (r === 'chat') return html`<lexi-chat-view></lexi-chat-view>`;
-    if (r === 'search') return html`<lexi-search-view></lexi-search-view>`;
-    if (r === 'trace') return html`<lexi-trace-view></lexi-trace-view>`;
-    if (r === 'logs') return html`<lexi-logs-view></lexi-logs-view>`;
-    if (r === 'advisor') return html`<lexi-advisor-view></lexi-advisor-view>`;
-    if (r === 'budget') return html`<lexi-budget-view></lexi-budget-view>`;
-    if (r === 'heartbeat') return html`<lexi-heartbeat-view></lexi-heartbeat-view>`;
-    if (r === 'brain') return html`<lexi-brain-view></lexi-brain-view>`;
-    if (r === 'routines') return html`<lexi-routines-view></lexi-routines-view>`;
-    if (r === 'skills') return html`<lexi-skills-view></lexi-skills-view>`;
-    if (r === 'approvals') return html`<lexi-approvals-view></lexi-approvals-view>`;
-    if (r === 'build') return html`<lexi-build-view></lexi-build-view>`;
-    if (r === 'team') return html`<lexi-team-view></lexi-team-view>`;
-    if (r === 'projects') return html`<lexi-projects-view></lexi-projects-view>`;
-    if (r === 'plans') return html`<lexi-plans-view></lexi-plans-view>`;
-    if (r === 'claims') return html`<lexi-claims-view></lexi-claims-view>`;
-    if (PHASE_PENDING_SECTIONS.has(r))
-      return html`<lexi-phase-pending-view section=${r}></lexi-phase-pending-view>`;
-    return html`<div class="lx-view-head"><h1>${r}</h1><p class="subtitle">Unknown section</p></div>`;
+    return html`<div class="lexi-route-host" data-route=${this.route}></div>`;
   }
 
   render(): TemplateResult {

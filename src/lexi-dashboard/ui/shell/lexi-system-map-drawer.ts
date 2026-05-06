@@ -7,6 +7,7 @@
  */
 import { LitElement, html, type TemplateResult } from 'lit';
 import '../design/primitives/lx-drawer.js';
+import '../design/primitives/lx-button.js';
 import '../design/primitives/lx-status-dot.js';
 import '../design/primitives/lx-empty-state.js';
 
@@ -66,25 +67,38 @@ export class LexiSystemMapDrawer extends LitElement {
   }
 
   render(): TemplateResult {
-    return html`<lx-drawer ?open=${this.open} title="System map" @close=${() => (this.open = false)}>
-      ${this.checks.length === 0
-        ? html`<lx-empty-state icon="activity" title="No checks reporting" desc="Doctor endpoint returned no data"></lx-empty-state>`
-        : html`<div class="lx-stack">
-            ${this.checks.map(
-              (c) => html`<div
-                style="display:flex;gap:var(--sp-3);align-items:flex-start;padding:var(--sp-3);border-radius:var(--r-md);border:1px solid var(--border-subtle);"
-              >
-                <lx-status-dot state=${this.toneFor(c.status)}></lx-status-dot>
-                <div style="flex:1;min-width:0;">
-                  <div style="font-weight:600;font-size:var(--text-sm);color:var(--text-primary);">${c.name}</div>
-                  <div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px;font-family:var(--font-mono);overflow-wrap:anywhere;">
-                    ${c.message}
-                  </div>
+    // Same light-DOM slot fix as the notifications drawer — gate at the
+    // outer level and render the overlay directly (sharing the .lx-drawer*
+    // classes from primitives.css) instead of slotting into <lx-drawer>.
+    if (!this.open) return html``;
+    const close = (): void => { this.open = false; };
+    const body = this.checks.length === 0
+      ? html`<lx-empty-state icon="activity" title="No checks reporting" desc="Doctor endpoint returned no data"></lx-empty-state>`
+      : html`<div class="lx-stack">
+          ${this.checks.map(
+            (c) => html`<div
+              style="display:flex;gap:var(--sp-3);align-items:flex-start;padding:var(--sp-3);border-radius:var(--r-md);border:1px solid var(--border-subtle);"
+            >
+              <lx-status-dot state=${this.toneFor(c.status)}></lx-status-dot>
+              <div style="flex:1;min-width:0;">
+                <div style="font-weight:600;font-size:var(--text-sm);color:var(--text-primary);">${c.name}</div>
+                <div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px;font-family:var(--font-mono);overflow-wrap:anywhere;">
+                  ${c.message}
                 </div>
-              </div>`,
-            )}
-          </div>`}
-    </lx-drawer>`;
+              </div>
+            </div>`,
+          )}
+        </div>`;
+    return html`
+      <div class="lx-drawer-backdrop" @click=${close}></div>
+      <aside class="lx-drawer" role="dialog" aria-modal="true" aria-label="System map">
+        <header class="lx-drawer-header">
+          <strong>System map</strong>
+          <lx-button variant="ghost" size="sm" icon="x" @click=${close}></lx-button>
+        </header>
+        <div class="lx-drawer-body">${body}</div>
+      </aside>
+    `;
   }
 }
 

@@ -21,6 +21,31 @@ export function createAgentsRouter(): Router {
 
   router.get('/:slug', async (req: Request, res: Response) => {
     const slug = String(req.params.slug);
+    // Phase 27 — `lexi` is synthesized as a virtual entry in the registry
+    // (no on-disk agent.md). Surface honest virtual detail rather than 404.
+    if (slug.toLowerCase() === 'lexi') {
+      try { await readAgent(slug, vaultOpts()); /* if it exists on disk later, fall through */ }
+      catch {
+        res.json({
+          slug: 'lexi',
+          name: 'Lexi',
+          model: 'dashboard',
+          tools_enabled: 0,
+          tools_disabled: 0,
+          memory_size_bytes: 0,
+          last_modified_at: Date.now(),
+          virtual: true,
+          role: 'dashboard',
+          prompt: 'Lexi runs as the local dashboard at http://127.0.0.1:3030. She has no agent.md because she is not invoked through the Claude Agent SDK — her behaviour is the dashboard itself. This entry exists so cron / team-task iterators that walk /api/agents see her without 404s.',
+          allowedTools: [],
+          disabledTools: [],
+          raw: '',
+          recent_activity: tailActivity(slug, 25),
+          last_active_at: lastActiveAt(slug),
+        });
+        return;
+      }
+    }
     try {
       const detail = await readAgent(slug, vaultOpts());
       res.json({ ...detail, recent_activity: tailActivity(slug, 25), last_active_at: lastActiveAt(slug) });

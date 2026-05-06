@@ -81,29 +81,43 @@ export class LexiNotificationsDrawer extends LitElement {
   };
 
   render(): TemplateResult {
-    return html`<lx-drawer ?open=${this.open} title="Notifications" @close=${this.close}>
-      ${this.items.length === 0
-        ? html`<lx-empty-state
-            icon="bell"
-            title="All quiet"
-            desc="No outstanding alerts. Stuck jobs, failed runs, and budget warnings will surface here."
-          ></lx-empty-state>`
-        : html`<div class="lx-stack">
-            ${this.items.map(
-              (n) => html`<a
-                href=${n.href ?? '#'}
-                @click=${this.close}
-                style="display:flex;gap:var(--sp-3);padding:var(--sp-3);border-radius:var(--r-md);text-decoration:none;color:inherit;border:1px solid var(--border-subtle);"
-              >
-                <lx-status-dot state=${n.tone}></lx-status-dot>
-                <div style="flex:1;min-width:0;">
-                  <div style="font-weight:600;font-size:var(--text-sm);color:var(--text-primary);">${n.title}</div>
-                  ${n.body ? html`<div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px;">${n.body}</div>` : ''}
-                </div>
-              </a>`,
-            )}
-          </div>`}
-    </lx-drawer>`;
+    // The drawer's children are projected into <lx-drawer>'s <slot>, which
+    // does not work in light-DOM mode (slot is shadow-DOM only). Gating the
+    // outer render keeps the drawer's body out of the page until opened.
+    if (!this.open) return html``;
+    const body = this.items.length === 0
+      ? html`<lx-empty-state
+          icon="bell"
+          title="All quiet"
+          desc="No outstanding alerts. Stuck jobs, failed runs, and budget warnings will surface here."
+        ></lx-empty-state>`
+      : html`<div class="lx-stack">
+          ${this.items.map(
+            (n) => html`<a
+              href=${n.href ?? '#'}
+              @click=${this.close}
+              style="display:flex;gap:var(--sp-3);padding:var(--sp-3);border-radius:var(--r-md);text-decoration:none;color:inherit;border:1px solid var(--border-subtle);"
+            >
+              <lx-status-dot state=${n.tone}></lx-status-dot>
+              <div style="flex:1;min-width:0;">
+                <div style="font-weight:600;font-size:var(--text-sm);color:var(--text-primary);">${n.title}</div>
+                ${n.body ? html`<div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px;">${n.body}</div>` : ''}
+              </div>
+            </a>`,
+          )}
+        </div>`;
+    // Render the overlay directly rather than via <lx-drawer>'s slot — same
+    // visual contract using the shared `.lx-drawer*` classes from primitives.css.
+    return html`
+      <div class="lx-drawer-backdrop" @click=${this.close}></div>
+      <aside class="lx-drawer" role="dialog" aria-modal="true" aria-label="Notifications">
+        <header class="lx-drawer-header">
+          <strong>Notifications</strong>
+          <lx-button variant="ghost" size="sm" icon="x" @click=${this.close}></lx-button>
+        </header>
+        <div class="lx-drawer-body">${body}</div>
+      </aside>
+    `;
   }
 }
 
