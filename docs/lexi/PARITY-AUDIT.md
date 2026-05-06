@@ -1,40 +1,16 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:34:11.699Z
+Generated: 2026-05-06T05:39:11.399Z
 
 - Upstream routes: **265**
-- Implemented in Lexi: **11**
+- Implemented in Lexi: **32**
 - Explicitly internal (acknowledged): **0**
-- **Missing: 254**
+- **Missing: 233**
 - Lexi-only routes (not in upstream): 10
-- Coverage: **4.2%**
-- Baseline ceiling: `254` (recorded 2026-05-06T05:00:00.000Z)
+- Coverage: **12.1%**
+- Baseline ceiling: `233` (recorded 2026-05-06T05:37:35.532Z)
 
 ## Missing routes by namespace
-
-### `/api/agents` — 21 missing
-
-- `GET /api/agents/:slug/skills`
-- `POST /api/agents/:slug/skills`
-- `DELETE /api/agents/:slug/skills/:name`
-- `GET /api/agents`
-- `POST /api/agents`
-- `PUT /api/agents/:slug`
-- `DELETE /api/agents/:slug`
-- `GET /api/agents/:slug/activity`
-- `GET /api/agents/:slug/execution-log`
-- `GET /api/agents/:slug/audit-summary`
-- `GET /api/agents/:slug/stats`
-- `GET /api/agents/compare`
-- `GET /api/agents/:slug/kpis`
-- `GET /api/agents/:slug/transcripts`
-- `GET /api/agents/:slug/health`
-- `GET /api/agents/:slug/pipeline`
-- `POST /api/agents/:slug/status`
-- `GET /api/agents/:slug/budget`
-- `GET /api/agents/:slug/revisions`
-- `POST /api/agents/:slug/revisions/:id/restore`
-- `GET /api/agents/:slug/detail`
 
 ### `/api/brain` — 20 missing
 
@@ -363,10 +339,6 @@ Generated: 2026-05-06T05:34:11.699Z
 
 - `GET /api/status`
 
-### `/api/agent-heartbeats` — 1 missing
-
-- `GET /api/agent-heartbeats`
-
 ### `/api/webhook-actions` — 1 missing
 
 - `GET /api/webhook-actions`
@@ -450,6 +422,10 @@ Generated: 2026-05-06T05:34:11.699Z
 ### `/api/claude-integrations` — 1 missing
 
 - `GET /api/claude-integrations`
+
+### `/api/agents` — 1 missing
+
+- `GET /api/agents`
 
 ### `/api/office` — 1 missing
 

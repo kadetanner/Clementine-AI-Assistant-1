@@ -1,6 +1,4 @@
 {
-  "maxMissing": 254,
-  "recordedAt": "2026-05-06T05:00:00.000Z",
-  "phase": 0,
-  "note": "Baseline at start of Lighthouse overhaul. Each phase decreases this. Target = 0 by phase 21."
+  "maxMissing": 233,
+  "recordedAt": "2026-05-06T05:37:35.532Z"
 }

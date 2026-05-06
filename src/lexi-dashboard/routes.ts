@@ -4,6 +4,7 @@ import { register as registerRestartSelf } from './fixes/restart-self.js';
 import { register as registerEvents } from './events/sse.js';
 import { register as registerUpstreamTaps } from './events/upstream-taps.js';
 import { register as registerAgents } from './routes/agents.js';
+import { register as registerAgentsV2 } from './routes/agents-v2.js';
 import { register as registerConnections } from './routes/connections.js';
 import { register as registerWorkflows } from './routes/workflows.js';
 import { register as registerVaultWrite } from './routes/vault-write.js';
@@ -27,6 +28,9 @@ export function registerLexiRoutes(app: Express): void {
   registerRestartSelf(app);
   registerEvents(app);
   registerUpstreamTaps(app);
+  // V2 must register before V1: V1 router has a catch-all `/:slug` that
+  // would otherwise swallow Lighthouse routes like `/api/agents/compare`.
+  registerAgentsV2(app);
   registerAgents(app);
   registerConnections(app);
   registerWorkflows(app);
