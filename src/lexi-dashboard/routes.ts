@@ -8,6 +8,7 @@ import { register as registerConnections } from './routes/connections.js';
 import { register as registerWorkflows } from './routes/workflows.js';
 import { register as registerVaultWrite } from './routes/vault-write.js';
 import { register as registerFixes } from './fixes/register.js';
+import { register as registerUpstreamProxy } from './proxy/upstream-routes.js';
 
 /**
  * Single aggregator for all Lexi /api/* routes.
@@ -18,6 +19,7 @@ import { register as registerFixes } from './fixes/register.js';
  * Plan 6 adds: workflows (diagnostics, stuck-steps).
  * Plan 7 adds: vault-write (PUT /api/vault-file).
  * Plan 8 adds: bug-fix endpoints (daily-plan, voice/synthesize, digest, goals, cron/stuck) + cron stuck-job detector.
+ * Plan 10 adds: in-process proxy for 10 upstream API endpoints required by Plan 4-7 components.
  * Future plans add more imports + calls below — server.ts never changes again.
  */
 export function registerLexiRoutes(app: Express): void {
@@ -30,4 +32,5 @@ export function registerLexiRoutes(app: Express): void {
   registerWorkflows(app);
   registerVaultWrite(app);
   registerFixes(app);
+  registerUpstreamProxy(app);
 }
