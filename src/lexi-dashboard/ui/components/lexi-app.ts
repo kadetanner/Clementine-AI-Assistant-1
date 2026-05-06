@@ -6,6 +6,7 @@ import './lexi-bottom-drawer.js';
 import './lexi-home-view.js';
 import './lexi-agents-view.js';
 import './connections/lexi-connections-view.js';
+import './lexi-stuck-banner.js';
 
 export class LexiApp extends LitElement {
   static properties = {
@@ -56,7 +57,10 @@ export class LexiApp extends LitElement {
     return html`
       <lexi-top-bar></lexi-top-bar>
       <lexi-nav-rail active="${this.route}"></lexi-nav-rail>
-      <main class="lexi-main">${this.renderRoute()}</main>
+      <main class="lexi-main">
+        <lexi-stuck-banner></lexi-stuck-banner>
+        ${this.renderRoute()}
+      </main>
       <lexi-right-rail></lexi-right-rail>
       <lexi-bottom-drawer></lexi-bottom-drawer>
     `;
