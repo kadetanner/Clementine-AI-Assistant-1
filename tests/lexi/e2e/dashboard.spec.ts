@@ -53,6 +53,16 @@ test.beforeAll(async ({ request }) => {
   }
 });
 
+// Phase 27 — the onboarding tour pops a modal overlay on first visit and
+// blocks pointer events on the page underneath. Pre-seed the localStorage
+// flag so it never opens during E2E. Tests that explicitly need the tour
+// can override by clearing the flag in their own beforeEach.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    try { window.localStorage.setItem('lexi-onboarding-seen', '1'); } catch { /* ignore */ }
+  });
+});
+
 async function waitForView(page: Page, tag: string): Promise<void> {
   await page.waitForFunction(
     (selector) => !!document.querySelector('main.lexi-main')?.querySelector(selector),

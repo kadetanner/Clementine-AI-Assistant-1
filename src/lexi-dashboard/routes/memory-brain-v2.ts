@@ -13,7 +13,7 @@ import type { Express, Request, Response } from 'express';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { clementineHome } from '../data/paths.js';
-import { graphSnapshot } from '../data/from-upstream/memory.js';
+import { graphSnapshot, memoryFreshness, memoryHealth } from '../data/from-upstream/memory.js';
 
 async function memoryStoreOrNull(): Promise<unknown | null> {
   try {
@@ -51,6 +51,20 @@ function safeListDir(p: string): string[] {
 
 export function register(app: Express): void {
   // ── Memory (full pillar) ────────────────────────────────────────────
+
+  // Freshness probe — surfaces .db / -wal / -shm mtimes plus a "walAhead"
+  // flag so the UI can warn when Lexi's read-only handle may be lagging
+  // unflushed daemon writes. Lighthouse spec §3 cross-process correctness.
+  app.get('/api/memory/freshness', (_req: Request, res: Response) => {
+    res.json(memoryFreshness());
+  });
+
+  // Read-only health from the new ?mode=ro adapter (separate from the
+  // legacy /api/memory proxy route, which mirrors upstream's wider shape).
+  app.get('/api/memory/ro-health', async (_req: Request, res: Response) => {
+    res.json(await memoryHealth());
+  });
+
   app.get('/api/memory/supersedes', async (_req: Request, res: Response) => {
     const store = await memoryStoreOrNull();
     const r = callIfFunction<unknown[]>(store, 'listSupersedes') ?? [];

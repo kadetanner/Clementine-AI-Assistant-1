@@ -37,9 +37,10 @@ describe('agents-v2 routes', () => {
   });
 
   it('GET /api/agents/:slug/budget reflects free-only invariant', async () => {
-    // Use a real agent slug if available; fallback to 404
+    // Use a real on-disk agent slug. Phase 27 synthesizes a virtual 'lexi'
+    // entry with no directory; per-agent dir-rooted routes 404 for it.
     const list = await (await fetch(`${baseUrl}/api/agents`)).json();
-    const slug = (list.agents ?? [])[0]?.slug;
+    const slug = (list.agents ?? []).find((a: { slug: string; virtual?: boolean }) => !a.virtual)?.slug;
     if (!slug) return;
     const r = await fetch(`${baseUrl}/api/agents/${slug}/budget`);
     expect(r.ok).toBe(true);
@@ -50,7 +51,7 @@ describe('agents-v2 routes', () => {
 
   it('GET /api/agents/:slug/activity returns runs array', async () => {
     const list = await (await fetch(`${baseUrl}/api/agents`)).json();
-    const slug = (list.agents ?? [])[0]?.slug;
+    const slug = (list.agents ?? []).find((a: { slug: string; virtual?: boolean }) => !a.virtual)?.slug;
     if (!slug) return;
     const r = await fetch(`${baseUrl}/api/agents/${slug}/activity`);
     expect(r.ok).toBe(true);

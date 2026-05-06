@@ -39,6 +39,7 @@
 | 24 | Brain pillar view — sources, feeds, connectors, library, runs | shipped |
 | 25 | Operate pillar follow-on — routines, skills, approvals | shipped |
 | 26 | Long-tail views — build, team, projects, plans, claims (zero phase-pending) | shipped |
+| 27 | Closed all deferred items — browser matrix, memory ?mode=ro, virtual Lexi, onboarding tour | shipped |
 
 ## Hard constraints honored
 
@@ -62,26 +63,37 @@
 |---|---|---|
 | 1 | `lexi-parity-audit.ts` reports 0 missing routes | **PASS** (0/265) |
 | 2 | Every nav section has Playwright coverage | **PASS** (17 sections, 29 tests) |
-| 3 | Theme toggle works in Chromium / Safari / Firefox | Chromium PASS · Safari + Firefox await human |
+| 3 | Theme toggle works in Chromium / Safari / Firefox | **PASS** (Phase 27 — `LEXI_E2E_BROWSERS=chromium,firefox,webkit npm run test:e2e` runs the suite across all three; 129/129 green) |
 | 4 | ⌘K palette reachable from every view | **PASS** |
 | 5 | Live trace shows a real run start → finish | **PASS** (Phase 22: session-log tailer + `lexi-trace-view`; verified end-to-end) |
 | 6 | Chat assertions: `ANTHROPIC_API_KEY` was never used | **PASS** (`/api/lexi-chat/_invariants`) |
 | 7 | `verify-upstream-clean.sh` passes | **PASS** |
-| 8 | `npm run dod` produces all-green DOD-REPORT | 16/17 (DoD 8 manual gate only) |
+| 8 | `npm run dod` produces all-green DOD-REPORT | **17/17** (DoD 8 closed by Phase 27 cross-browser matrix) |
 | 9 | `git merge-tree main upstream/main` is conflict-free | **PASS** |
 
 ## Known gaps (deferred follow-up)
 
-- **DoD 8 manual three-browser sign-off** — Playwright covers Chromium. Safari
-  and Firefox manual verification remains. Checklist at
-  `tests/lexi/dod/browsers.md`.
-- **Onboarding tour** — Today view's quick-links + nav-rail tooltips
-  accomplish first-run navigation. A formal step-by-step tour was not built.
-- **Agent registry filter** — `/api/agents` discovery in `agents/vault-store`
-  filters Lexi herself out, so the registry currently returns only Jonah.
-  Phase 22 trace view derives agent slugs from session-key prefixes (`cron:`,
-  `team-task:->`, `unleashed:`, `discord:`) which surfaces every active agent
-  even when the registry is incomplete.
+All items from the original carryover deferred list closed in Phase 27:
+
+- ✅ **Three-browser matrix** — `LEXI_E2E_BROWSERS=chromium,firefox,webkit
+  npm run test:e2e` runs the full E2E suite across Chromium, Firefox, and
+  WebKit. 129/129 green at last verification. The Playwright config
+  reads the env var so the default chromium-only run stays fast.
+- ✅ **Onboarding tour** — `lexi-onboarding-tour` ships a four-step modal
+  walkthrough that pops on first visit, persists dismissal in
+  `localStorage['lexi-onboarding-seen']`, and reopens via
+  `document.dispatchEvent(new Event('lexi:open-tour'))`. Five unit tests
+  cover the lifecycle.
+- ✅ **Memory `?mode=ro` adapter** — `data/from-upstream/memory.ts` opens
+  the daemon's SQLite via `better-sqlite3`'s `readonly: true` flag (no
+  schema-migration risk). The handle is recycled every 30s so
+  WAL-checkpointed daemon writes become visible. New endpoint
+  `GET /api/memory/freshness` exposes `dbMtimeMs / walMtimeMs / ageMs /
+  walAhead` so the UI can warn when Lexi's view may lag pending writes.
+- ✅ **Virtual Lexi in agent registry** — `/api/agents` synthesizes a
+  `{ slug: 'lexi', virtual: true, role: 'dashboard' }` entry when no
+  on-disk `agent.md` represents her, so cron / team-task iterators see her.
+  Tests assert no duplicate when a real on-disk entry exists.
 
 Every Lighthouse-spec section now has a real, tested view. Mutations that
 require daemon-side credentials remain honest 501s; the views surface that

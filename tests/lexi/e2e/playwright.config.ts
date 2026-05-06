@@ -25,7 +25,23 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
-  projects: [
-    { name: 'chromium', use: { browserName: 'chromium' } },
-  ],
+  // Three-browser matrix per DoD 8 — sequential because they share the live
+  // LaunchAgent on :3030 and SSE streams there don't tolerate concurrent
+  // tabs. Chromium runs by default; webkit + firefox runs are gated by env
+  // because they require their browser binaries (`npx playwright install
+  // webkit firefox`) and add ~10s per run on a clean machine.
+  projects: (() => {
+    const want = (process.env.LEXI_E2E_BROWSERS ?? 'chromium')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const all = {
+      chromium: { name: 'chromium', use: { browserName: 'chromium' as const } },
+      firefox:  { name: 'firefox',  use: { browserName: 'firefox'  as const } },
+      webkit:   { name: 'webkit',   use: { browserName: 'webkit'   as const } },
+    };
+    return want
+      .map((b) => (all as Record<string, typeof all.chromium | undefined>)[b])
+      .filter((p): p is typeof all.chromium => Boolean(p));
+  })(),
 });

@@ -10,7 +10,9 @@ export function clementineHome(): string {
 }
 
 export function vaultRoot(): string {
-  return path.join(clementineHome(), 'vault');
+  // LEXI_VAULT_ROOT lets tests redirect vault-rooted reads (memory adapter,
+  // agents discovery, etc.) without touching the user's real ~/.clementine.
+  return process.env.LEXI_VAULT_ROOT ?? path.join(clementineHome(), 'vault');
 }
 
 export function memoryDbPath(): string {

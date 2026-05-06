@@ -602,3 +602,61 @@
   cursor: pointer;
 }
 .lx-link:hover { text-decoration: underline; }
+
+/* ── Onboarding tour overlay (Phase 27) ─────────────────────────── */
+.lx-tour-backdrop {
+  position: fixed; inset: 0;
+  background: color-mix(in srgb, black 55%, transparent);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+  padding: var(--sp-4);
+}
+.lx-tour-card {
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
+  max-width: 520px;
+  width: 100%;
+  padding: var(--sp-5);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+}
+.lx-tour-progress { display: flex; gap: 4px; }
+.lx-tour-dot {
+  width: 24px; height: 4px;
+  border-radius: 2px;
+  background: var(--border-subtle);
+}
+.lx-tour-dot--active { background: var(--accent); }
+.lx-tour-title { margin: 0; font-size: var(--text-xl); font-weight: 600; }
+.lx-tour-body { margin: 0; color: var(--text-secondary); line-height: 1.5; }
+.lx-tour-actions { display: flex; align-items: center; justify-content: space-between; margin-top: var(--sp-2); gap: var(--sp-2); }
+.lx-tour-skip {
+  background: transparent;
+  border: 0; padding: 6px 10px;
+  color: var(--text-tertiary);
+  font: inherit;
+  cursor: pointer;
+}
+.lx-tour-skip:hover { color: var(--text-primary); }
+.lx-tour-primary, .lx-tour-secondary {
+  font: inherit;
+  padding: 8px 16px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+  margin-left: var(--sp-1);
+}
+.lx-tour-primary {
+  background: var(--accent);
+  color: var(--bg-canvas);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.lx-tour-primary:hover { filter: brightness(1.08); }
+.lx-tour-secondary {
+  background: transparent;
+  color: var(--text-primary);
+}
+.lx-tour-secondary:hover { background: var(--bg-subtle); }

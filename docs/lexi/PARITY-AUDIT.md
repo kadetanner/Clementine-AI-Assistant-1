@@ -1,12 +1,12 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T16:16:38.402Z
+Generated: 2026-05-06T16:45:59.133Z
 
 - Upstream routes: **265**
 - Implemented in Lexi: **265**
 - Explicitly internal (acknowledged): **0**
 - **Missing: 0**
-- Lexi-only routes (not in upstream): 50
+- Lexi-only routes (not in upstream): 52
 - Coverage: **100.0%**
 - Baseline ceiling: `0` (recorded 2026-05-06T05:47:54.919Z)
 
@@ -30,6 +30,8 @@ Generated: 2026-05-06T16:16:38.402Z
 - `GET /api/lexi-chat/sessions/:_` — src/lexi-dashboard/routes/chat-v2.ts
 - `DELETE /api/lexi-chat/sessions/:_` — src/lexi-dashboard/routes/chat-v2.ts
 - `GET /api/lexi-chat/_invariants` — src/lexi-dashboard/routes/chat-v2.ts
+- `GET /api/memory/freshness` — src/lexi-dashboard/routes/memory-brain-v2.ts
+- `GET /api/memory/ro-health` — src/lexi-dashboard/routes/memory-brain-v2.ts
 - `PUT /api/skills/:_` — src/lexi-dashboard/routes/operate-v2.ts
 - `GET /api/skills/:_/info` — src/lexi-dashboard/routes/operate-v2.ts
 - `POST /api/approvals/:_/decision` — src/lexi-dashboard/routes/operate-v2.ts

@@ -127,7 +127,25 @@ export function register(app: Express): void {
       const list = (mod as unknown as { listAgents: (opts?: { vaultRoot?: string }) => Promise<unknown[]> }).listAgents;
       if (typeof list !== 'function') return res.json({ agents: [] });
       const opts = process.env.LEXI_VAULT_ROOT ? { vaultRoot: process.env.LEXI_VAULT_ROOT } : undefined;
-      const agents = await list(opts);
+      const agents = (await list(opts)) as Array<{ slug?: string; [k: string]: unknown }>;
+      // Synthesize Lexi as a virtual registry entry. The dashboard runs as
+      // Lexi but historically has no agent.md, so cron/team-task iterators
+      // that walk /api/agents miss her entirely. Only synthesize when no
+      // real on-disk entry already represents her — never overwrite.
+      const hasLexi = agents.some((a) => (a.slug ?? '').toLowerCase() === 'lexi');
+      if (!hasLexi) {
+        agents.unshift({
+          slug: 'lexi',
+          name: 'Lexi',
+          model: 'dashboard',
+          tools_enabled: 0,
+          tools_disabled: 0,
+          memory_size_bytes: 0,
+          last_modified_at: Date.now(),
+          virtual: true,
+          role: 'dashboard',
+        });
+      }
       res.json({ agents });
     } catch {
       res.json({ agents: [] });

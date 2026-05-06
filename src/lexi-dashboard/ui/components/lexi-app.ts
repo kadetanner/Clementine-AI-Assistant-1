@@ -48,6 +48,7 @@ import './lexi-cron-view.js';
 import './lexi-settings-view.js';
 import './lexi-stuck-banner.js';
 import './lexi-command-palette.js';
+import './lexi-onboarding-tour.js';
 import './workflows/lexi-workflows-view.js';
 import './workflows/lexi-workflow-detail.js';
 
@@ -179,6 +180,7 @@ export class LexiApp extends LitElement {
       </main>
       <lexi-notifications-drawer></lexi-notifications-drawer>
       <lexi-system-map-drawer></lexi-system-map-drawer>
+      <lexi-onboarding-tour></lexi-onboarding-tour>
     `;
   }
 }
