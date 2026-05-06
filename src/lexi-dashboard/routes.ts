@@ -7,6 +7,7 @@ import { register as registerAgents } from './routes/agents.js';
 import { register as registerAgentsV2 } from './routes/agents-v2.js';
 import { register as registerMemoryBrainV2 } from './routes/memory-brain-v2.js';
 import { register as registerWorkflowsCronRoutinesV2 } from './routes/workflows-cron-routines-v2.js';
+import { register as registerOperateV2 } from './routes/operate-v2.js';
 import { register as registerConnections } from './routes/connections.js';
 import { register as registerWorkflows } from './routes/workflows.js';
 import { register as registerVaultWrite } from './routes/vault-write.js';
@@ -36,6 +37,7 @@ export function registerLexiRoutes(app: Express): void {
   registerAgents(app);
   registerMemoryBrainV2(app);
   registerWorkflowsCronRoutinesV2(app);
+  registerOperateV2(app);
   registerConnections(app);
   registerWorkflows(app);
   registerVaultWrite(app);

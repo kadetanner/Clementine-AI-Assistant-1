@@ -1,54 +1,16 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:42:52.617Z
+Generated: 2026-05-06T05:45:19.149Z
 
 - Upstream routes: **265**
-- Implemented in Lexi: **112**
+- Implemented in Lexi: **169**
 - Explicitly internal (acknowledged): **0**
-- **Missing: 153**
-- Lexi-only routes (not in upstream): 10
-- Coverage: **42.3%**
-- Baseline ceiling: `153` (recorded 2026-05-06T05:42:45.497Z)
+- **Missing: 96**
+- Lexi-only routes (not in upstream): 39
+- Coverage: **63.8%**
+- Baseline ceiling: `96` (recorded 2026-05-06T05:45:19.148Z)
 
 ## Missing routes by namespace
-
-### `/api/skills` — 7 missing
-
-- `GET /api/skills/pending`
-- `POST /api/skills/pending/:name/approve`
-- `POST /api/skills/pending/:name/reject`
-- `GET /api/skills`
-- `POST /api/skills`
-- `DELETE /api/skills/:name`
-- `GET /api/skills/:name`
-
-### `/api/team` — 7 missing
-
-- `GET /api/team/agents`
-- `GET /api/team/status`
-- `GET /api/team/messages`
-- `GET /api/team/topology`
-- `POST /api/team/message`
-- `GET /api/team/pending-requests`
-- `POST /api/team/request`
-
-### `/auth` — 6 missing
-
-- `POST /auth/login`
-- `GET /auth/logout`
-- `DELETE /auth/sessions/:id`
-- `GET /api/auth/anthropic/status`
-- `POST /api/auth/anthropic/login`
-- `POST /api/auth/anthropic/wait`
-
-### `/api/composio` — 6 missing
-
-- `GET /api/composio/status`
-- `GET /api/composio/toolkits`
-- `POST /api/composio/toolkits/:slug/authorize`
-- `POST /api/composio/toolkits/:slug/disconnect`
-- `POST /api/composio/connections/:id/rename`
-- `POST /api/composio/refresh`
 
 ### `/api/budgets` — 6 missing
 
@@ -58,6 +20,15 @@ Generated: 2026-05-06T05:42:52.617Z
 - `POST /api/budgets/safe`
 - `POST /api/budgets/1m`
 - `POST /api/budgets/doctor-fix`
+
+### `/api/team` — 6 missing
+
+- `GET /api/team/agents`
+- `GET /api/team/messages`
+- `GET /api/team/topology`
+- `POST /api/team/message`
+- `GET /api/team/pending-requests`
+- `POST /api/team/request`
 
 ### `/api/advisor` — 6 missing
 
@@ -76,14 +47,6 @@ Generated: 2026-05-06T05:42:52.617Z
 - `GET /api/heartbeat/agent/:slug`
 - `POST /api/heartbeat/queue`
 
-### `/api/plans` — 5 missing
-
-- `GET /api/plans/today`
-- `GET /api/plans/:date`
-- `GET /api/plans`
-- `POST /api/plans/apply`
-- `GET /api/plans/diff`
-
 ### `/api/remote-access` — 5 missing
 
 - `GET /api/remote-access`
@@ -92,78 +55,36 @@ Generated: 2026-05-06T05:42:52.617Z
 - `POST /api/remote-access/regenerate-token`
 - `POST /api/remote-access/toggle-auto-post`
 
-### `/api/sessions` — 4 missing
+### `/api/composio` — 4 missing
 
-- `GET /api/sessions`
-- `POST /api/sessions/:key/clear`
-- `GET /api/sessions/:key/messages`
-- `GET /api/sessions/:key/usage`
+- `POST /api/composio/toolkits/:slug/authorize`
+- `POST /api/composio/toolkits/:slug/disconnect`
+- `POST /api/composio/connections/:id/rename`
+- `POST /api/composio/refresh`
 
-### `/api/claims` — 4 missing
+### `/api/claims` — 3 missing
 
-- `GET /api/claims`
 - `POST /api/claims/:id/mark-verified`
 - `POST /api/claims/:id/mark-failed`
 - `POST /api/claims/:id/dismiss`
 
-### `/api/unleashed` — 4 missing
+### `/api/sessions` — 3 missing
 
-- `GET /api/unleashed`
-- `POST /api/unleashed/:name/cancel`
-- `DELETE /api/unleashed/:name`
-- `GET /api/unleashed/:name/status`
+- `POST /api/sessions/:key/clear`
+- `GET /api/sessions/:key/messages`
+- `GET /api/sessions/:key/usage`
 
-### `/api/user-model` — 4 missing
+### `/api/skills` — 3 missing
 
-- `GET /api/user-model`
-- `PUT /api/user-model/:slot`
-- `DELETE /api/user-model/:slot`
-- `POST /api/user-model/seed`
+- `GET /api/skills/pending`
+- `POST /api/skills/pending/:name/approve`
+- `POST /api/skills/pending/:name/reject`
 
-### `/api/mcp-servers` — 4 missing
+### `/api/self-improve` — 3 missing
 
-- `GET /api/mcp-servers`
-- `POST /api/mcp-servers`
-- `PUT /api/mcp-servers/:name`
-- `DELETE /api/mcp-servers/:name`
-
-### `/api/cli-tools` — 4 missing
-
-- `GET /api/cli-tools`
-- `POST /api/cli-tools`
-- `PUT /api/cli-tools/:cmd`
-- `DELETE /api/cli-tools/:cmd`
-
-### `/api/self-improve` — 4 missing
-
-- `GET /api/self-improve`
 - `POST /api/self-improve/run`
 - `POST /api/self-improve/apply/:id`
 - `POST /api/self-improve/deny/:id`
-
-### `/api/background-tasks` — 3 missing
-
-- `GET /api/background-tasks`
-- `POST /api/background-tasks/:id/cancel`
-- `DELETE /api/background-tasks/:id`
-
-### `/api/projects` — 3 missing
-
-- `GET /api/projects`
-- `POST /api/projects/link`
-- `POST /api/projects/unlink`
-
-### `/api/workspace-dirs` — 3 missing
-
-- `GET /api/workspace-dirs`
-- `POST /api/workspace-dirs`
-- `DELETE /api/workspace-dirs`
-
-### `/api/settings` — 3 missing
-
-- `GET /api/settings`
-- `PUT /api/settings/:key`
-- `DELETE /api/settings/:key`
 
 ### `/api/setup` — 3 missing
 
@@ -171,50 +92,36 @@ Generated: 2026-05-06T05:42:52.617Z
 - `POST /api/setup/discord/save`
 - `GET /api/setup/discord/invite-url`
 
+### `/api/plans` — 3 missing
+
+- `GET /api/plans/today`
+- `POST /api/plans/apply`
+- `GET /api/plans/diff`
+
 ### `/api/timers` — 2 missing
 
 - `GET /api/timers`
 - `POST /api/timers/:id/cancel`
 
-### `/api/tool-preferences` — 2 missing
+### `/api/projects` — 2 missing
 
-- `GET /api/tool-preferences`
-- `PUT /api/tool-preferences`
+- `POST /api/projects/link`
+- `POST /api/projects/unlink`
 
-### `/api/assistant-preferences` — 2 missing
+### `/api/unleashed` — 2 missing
 
-- `GET /api/assistant-preferences`
-- `PUT /api/assistant-preferences`
-
-### `/api/profiles` — 2 missing
-
-- `GET /api/profiles`
-- `POST /api/profiles/switch`
+- `POST /api/unleashed/:name/cancel`
+- `GET /api/unleashed/:name/status`
 
 ### `/api/chat` — 2 missing
 
 - `POST /api/chat`
 - `POST /api/chat/stream`
 
-### `/api/metrics` — 2 missing
-
-- `GET /api/metrics`
-- `GET /api/metrics/usage`
-
 ### `/api/build` — 2 missing
 
 - `GET /api/build/usage`
 - `GET /api/build/operations`
-
-### `/api/approvals` — 2 missing
-
-- `GET /api/approvals`
-- `POST /api/approvals/:id/:action`
-
-### `/api/salesforce` — 2 missing
-
-- `GET /api/salesforce/status`
-- `GET /api/salesforce/sync-history`
 
 ### `/webhook` — 1 missing
 
@@ -236,6 +143,10 @@ Generated: 2026-05-06T05:42:52.617Z
 
 - `GET /api/events`
 
+### `/auth` — 1 missing
+
+- `DELETE /auth/sessions/:id`
+
 ### `/api/version` — 1 missing
 
 - `GET /api/version`
@@ -247,10 +158,6 @@ Generated: 2026-05-06T05:42:52.617Z
 ### `/api/webhook-actions` — 1 missing
 
 - `GET /api/webhook-actions`
-
-### `/api/autonomy` — 1 missing
-
-- `GET /api/autonomy`
 
 ### `/api/home-digest` — 1 missing
 
@@ -272,10 +179,6 @@ Generated: 2026-05-06T05:42:52.617Z
 
 - `GET /api/routing-audit`
 
-### `/api/fs` — 1 missing
-
-- `GET /api/fs/browse`
-
 ### `/api/runagent` — 1 missing
 
 - `POST /api/runagent/test`
@@ -296,37 +199,29 @@ Generated: 2026-05-06T05:42:52.617Z
 
 - `POST /api/launch`
 
-### `/api/available-tools` — 1 missing
-
-- `GET /api/available-tools`
-
-### `/api/browse-dir` — 1 missing
-
-- `GET /api/browse-dir`
-
 ### `/api/graph` — 1 missing
 
 - `GET /api/graph/visualization`
+
+### `/api/profiles` — 1 missing
+
+- `POST /api/profiles/switch`
 
 ### `/api/recall-traces` — 1 missing
 
 - `GET /api/recall-traces/:id`
 
+### `/api/user-model` — 1 missing
+
+- `POST /api/user-model/seed`
+
 ### `/api/analytics` — 1 missing
 
 - `GET /api/analytics/tool-usage`
 
-### `/api/mcp-status` — 1 missing
+### `/api/metrics` — 1 missing
 
-- `GET /api/mcp-status`
-
-### `/api/mcp-permissions` — 1 missing
-
-- `GET /api/mcp-permissions`
-
-### `/api/claude-integrations` — 1 missing
-
-- `GET /api/claude-integrations`
+- `GET /api/metrics/usage`
 
 ### `/api/agents` — 1 missing
 
@@ -336,17 +231,17 @@ Generated: 2026-05-06T05:42:52.617Z
 
 - `GET /api/office`
 
+### `/api/approvals` — 1 missing
+
+- `POST /api/approvals/:id/:action`
+
 ### `/api/leads` — 1 missing
 
 - `POST /api/leads/import`
 
-### `/api/discord` — 1 missing
+### `/api/salesforce` — 1 missing
 
-- `GET /api/discord/channels`
-
-### `/api/channels` — 1 missing
-
-- `GET /api/channels/status`
+- `GET /api/salesforce/sync-history`
 
 ### `/api/slack` — 1 missing
 
@@ -383,4 +278,33 @@ Generated: 2026-05-06T05:42:52.617Z
 - `POST /api/restart-self` — src/lexi-dashboard/fixes/restart-self.ts
 - `POST /api/voice/synthesize` — src/lexi-dashboard/fixes/voice-synthesize.ts
 - `GET /api/secrets/refs` — src/lexi-dashboard/proxy/upstream-routes.ts
+- `PUT /api/skills/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/skills/:_/info` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/approvals/:_/decision` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/setup/status` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/setup` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/setup/complete` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/user-model` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/unleashed` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/unleashed/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/profiles` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/metrics` — src/lexi-dashboard/routes/operate-v2.ts
+- `DELETE /api/sessions/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/slack/status` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/plans` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/plans/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `DELETE /api/plans/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/projects` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/projects/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/claims` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/claims/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `DELETE /api/claims/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/team` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/team` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/team/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `DELETE /api/team/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `GET /api/team/leaderboard` — src/lexi-dashboard/routes/operate-v2.ts
+- `POST /api/self-improve` — src/lexi-dashboard/routes/operate-v2.ts
+- `PUT /api/self-improve/:_` — src/lexi-dashboard/routes/operate-v2.ts
+- `DELETE /api/self-improve/:_` — src/lexi-dashboard/routes/operate-v2.ts
 - `PUT /api/vault-file` — src/lexi-dashboard/routes/vault-write.ts
