@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Allowed paths in the diff against upstream/main
-ALLOWED_REGEX='^(src/lexi-dashboard/|bin/lexi$|scripts/(install-lexi-launchd\.sh|com\.lexi\.dashboard\.plist|esbuild-lexi\.mjs|audit-upstream-features\.mjs|audit-network\.mjs|test-launchd-lifecycle\.sh|verify-upstream-clean\.sh|run-dod\.mjs|generate-dod-report\.mjs)$|docs/lexi/|tests/lexi/|package\.json$|package-lock\.json$|src/cli/index\.ts$|\.gitignore$)'
+ALLOWED_REGEX='^(src/lexi-dashboard/|bin/lexi$|scripts/(install-lexi-launchd\.sh|com\.lexi\.dashboard\.plist|esbuild-lexi\.mjs|audit-upstream-features\.mjs|audit-network\.mjs|test-launchd-lifecycle\.sh|verify-upstream-clean\.sh|run-dod\.mjs|generate-dod-report\.mjs|lexi-parity-audit\.mjs|lexi-parity-baseline\.json)$|docs/lexi/|tests/lexi/|package\.json$|package-lock\.json$|src/cli/index\.ts$|\.gitignore$)'
 
 red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }

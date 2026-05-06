@@ -23,6 +23,9 @@
     "test:e2e": "playwright test --config=tests/lexi/e2e/playwright.config.ts",
     "dod": "node scripts/run-dod.mjs",
     "dod:report": "node scripts/generate-dod-report.mjs",
+    "parity": "node scripts/lexi-parity-audit.mjs",
+    "parity:strict": "node scripts/lexi-parity-audit.mjs --strict",
+    "parity:update-baseline": "node scripts/lexi-parity-audit.mjs --update-baseline",
     "postinstall": "node scripts/postinstall.js 2>/dev/null || true"
   },
   "dependencies": {
