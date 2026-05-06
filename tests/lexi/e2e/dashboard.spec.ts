@@ -19,11 +19,16 @@ const LEGACY_SECTIONS = [
   { route: 'settings', tag: 'lexi-settings-view' },
   // Phase 22 — trace promoted out of phase-pending into a real view
   { route: 'trace', tag: 'lexi-trace-view' },
+  // Phase 23 — observe pillar (logs, advisor, budget, heartbeat) shipped views
+  { route: 'logs', tag: 'lexi-logs-view' },
+  { route: 'advisor', tag: 'lexi-advisor-view' },
+  { route: 'budget', tag: 'lexi-budget-view' },
+  { route: 'heartbeat', tag: 'lexi-heartbeat-view' },
 ] as const;
 
 const PENDING_SECTIONS = [
-  'routines', 'brain', 'skills', 'approvals', 'budget',
-  'logs', 'advisor', 'heartbeat', 'build',
+  'routines', 'brain', 'skills', 'approvals',
+  'build',
   'team', 'projects', 'plans', 'claims',
 ] as const;
 
@@ -225,6 +230,39 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Timeline/);
     // /api/runs returns valid JSON; the view either lists runs or shows empty state
     await expect(view).toContainText(/Pick a run|No runs yet|cron:|team-task:|unleashed:|discord:/);
+  });
+
+  test('logs — pane and filter input render', async ({ page }) => {
+    await gotoRoute(page, 'logs', 'lexi-logs-view');
+    const view = page.locator('lexi-logs-view');
+    await expect(view).toContainText(/Logs/);
+    await expect(view).toContainText(/Filter/);
+  });
+
+  test('advisor — five tab pills render and reflect status', async ({ page }) => {
+    await gotoRoute(page, 'advisor', 'lexi-advisor-view');
+    const view = page.locator('lexi-advisor-view');
+    await expect(view).toContainText(/Advisor/);
+    await expect(view).toContainText(/Decisions/);
+    await expect(view).toContainText(/Effectiveness/);
+    await expect(view).toContainText(/Trends/);
+    await expect(view).toContainText(/Analytics/);
+  });
+
+  test('budget — surfaces free-only invariant and $0.00 spend', async ({ page }) => {
+    await gotoRoute(page, 'budget', 'lexi-budget-view');
+    const view = page.locator('lexi-budget-view');
+    await expect(view).toContainText(/Free only|Paid enabled/);
+    await expect(view).toContainText(/MTD spend/);
+    await expect(view).toContainText(/\$\d+\.\d{2}/);
+  });
+
+  test('heartbeat — global + control + per-agent panes render', async ({ page }) => {
+    await gotoRoute(page, 'heartbeat', 'lexi-heartbeat-view');
+    const view = page.locator('lexi-heartbeat-view');
+    await expect(view).toContainText(/Heartbeat/);
+    await expect(view).toContainText(/Global/);
+    await expect(view).toContainText(/Per-agent/);
   });
 });
 

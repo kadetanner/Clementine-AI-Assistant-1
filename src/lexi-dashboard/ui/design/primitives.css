@@ -532,3 +532,61 @@
   background: var(--bg-subtle);
   margin-left: var(--sp-1);
 }
+
+/* ── Codeblock + log pane (Phase 23 observe views) ──────────────── */
+.lx-codeblock {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2);
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+.lx-log-pane {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2);
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre;
+}
+.lx-log-line {
+  display: block;
+  padding: 0 4px;
+  border-radius: 2px;
+  white-space: pre;
+}
+.lx-log-line--warn  { color: var(--warn, var(--accent)); background: var(--warn-soft, transparent); }
+.lx-log-line--error { color: var(--danger); background: var(--danger-soft); }
+
+/* ── Tab pill (Phase 23 — used by advisor view) ─────────────────── */
+.lx-tab-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.lx-tab-pill:hover { background: var(--bg-subtle); color: var(--text-primary); }
+.lx-tab-pill--active {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}

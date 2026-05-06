@@ -25,6 +25,10 @@ import '../views/lexi-phase-pending-view.js';
 import '../views/lexi-chat-view.js';
 import '../views/lexi-search-view.js';
 import '../views/lexi-trace-view.js';
+import '../views/lexi-logs-view.js';
+import '../views/lexi-advisor-view.js';
+import '../views/lexi-budget-view.js';
+import '../views/lexi-heartbeat-view.js';
 
 // Existing views — kept and wired into the new shell.
 import './lexi-agents-view.js';
@@ -39,8 +43,8 @@ import './workflows/lexi-workflows-view.js';
 import './workflows/lexi-workflow-detail.js';
 
 const PHASE_PENDING_SECTIONS = new Set([
-  'routines', 'brain', 'skills', 'approvals', 'budget',
-  'logs', 'advisor', 'heartbeat', 'build',
+  'routines', 'brain', 'skills', 'approvals',
+  'build',
   'team', 'projects', 'plans', 'claims',
 ]);
 
@@ -135,6 +139,10 @@ export class LexiApp extends LitElement {
     if (r === 'chat') return html`<lexi-chat-view></lexi-chat-view>`;
     if (r === 'search') return html`<lexi-search-view></lexi-search-view>`;
     if (r === 'trace') return html`<lexi-trace-view></lexi-trace-view>`;
+    if (r === 'logs') return html`<lexi-logs-view></lexi-logs-view>`;
+    if (r === 'advisor') return html`<lexi-advisor-view></lexi-advisor-view>`;
+    if (r === 'budget') return html`<lexi-budget-view></lexi-budget-view>`;
+    if (r === 'heartbeat') return html`<lexi-heartbeat-view></lexi-heartbeat-view>`;
     if (PHASE_PENDING_SECTIONS.has(r))
       return html`<lexi-phase-pending-view section=${r}></lexi-phase-pending-view>`;
     return html`<div class="lx-view-head"><h1>${r}</h1><p class="subtitle">Unknown section</p></div>`;
