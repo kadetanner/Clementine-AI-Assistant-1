@@ -28,7 +28,12 @@ export function register(app: Express): void {
   registerVoiceSynthesize(app, { baseDir });
   registerDigestRoot(app, { baseDir });
   registerGoalsRoot(app, { vaultDir: path.join(baseDir, 'vault') });
-  stopFn = registerCronRecovery(app, { baseDir, emit });
+  // Disable the 60s background interval in vitest runs. The integration test
+  // (register.test.ts) only verifies route registration; leaving the interval
+  // ticking against a temp baseDir that gets rmSync'd in afterAll causes
+  // sporadic teardown-timing failures classified as setup skips.
+  const intervalMs = process.env.VITEST ? 0 : 60_000;
+  stopFn = registerCronRecovery(app, { baseDir, emit, intervalMs });
 }
 
 export function stopFixes(): void {
