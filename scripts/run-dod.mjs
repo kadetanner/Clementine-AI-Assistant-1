@@ -72,8 +72,9 @@ if (build.status !== 0) {
 // 8: browsers — manual
 {
   const checklist = path.join(repoRoot, 'tests/lexi/dod/browsers.md');
-  const signed = existsSync(checklist) && /<!--\s*DOD-8-SIGNED:/.test(readFileSync(checklist, 'utf8'));
-  record(8, signed, signed ? 'manually signed off' : 'awaiting manual sign-off (add DOD-8-SIGNED comment)');
+  // Match a real ISO date — the placeholder `YYYY-MM-DD` literal must NOT count as signed.
+  const signed = existsSync(checklist) && /<!--\s*DOD-8-SIGNED:\s*\d{4}-\d{2}-\d{2}\s*-->/.test(readFileSync(checklist, 'utf8'));
+  record(8, signed, signed ? 'manually signed off' : 'awaiting manual sign-off (add DOD-8-SIGNED: YYYY-MM-DD comment with real date)');
 }
 
 // 9: command palette coverage
