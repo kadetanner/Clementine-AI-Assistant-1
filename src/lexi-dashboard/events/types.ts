@@ -7,6 +7,7 @@ export const EVENT_TYPES = [
   'webhook_received',
   'workflow_state',
   'cron_job_stuck',
+  'agent_run_event',
 ] as const;
 
 export type LexiEventType = (typeof EVENT_TYPES)[number];
