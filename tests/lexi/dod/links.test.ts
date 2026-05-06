@@ -68,10 +68,13 @@ describe('DoD 1-4 · links, buttons, forms', () => {
     ).toBe(true);
     const js = readFileSync(bundlePath, 'utf8');
     for (const ident of [
-      'lexi-home-view',
+      'lexi-today-view',
       'lexi-stuck-banner',
       'lexi-agents-view',
       'lexi-settings-view',
+      'lexi-top-bar-v2',
+      'lexi-nav-rail-v2',
+      'lexi-notifications-drawer',
     ]) {
       expect(js, `bundle should reference ${ident}`).toContain(ident);
     }

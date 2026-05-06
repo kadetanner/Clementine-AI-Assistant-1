@@ -1,30 +1,31 @@
 /**
  * Real-browser E2E suite for Lexi Dashboard.
  *
- * What this validates that the prior (Plan 9) DoD harness did not:
- *   - Sections actually mount their components (not the placeholder).
- *   - Theme toggle works at runtime (not just on refresh).
- *   - Each section renders content from its proxied data layer.
- *   - No console errors on a normal navigation.
- *   - Cmd+K opens the palette and section navigation works.
- *
- * Run: npx playwright test --config=tests/lexi/e2e/playwright.config.ts
+ * Lighthouse Phase 12 update: validates the new shell (top-bar-v2, nav-rail-v2,
+ * notifications drawer, system-map drawer) and the v2 nav structure (17 items
+ * across 5 groups). Existing 8 sections still mount their existing views.
  */
 import { test, expect, type Page } from '@playwright/test';
 
-const SECTIONS = [
-  'home',
-  'agents',
-  'connections',
-  'workflows',
-  'vault',
-  'memory',
-  'cron',
-  'settings',
+// Old + new sections combined.
+const LEGACY_SECTIONS = [
+  { route: 'today', tag: 'lexi-today-view' },
+  { route: 'agents', tag: 'lexi-agents-view' },
+  { route: 'connections', tag: 'lexi-connections-view' },
+  { route: 'workflows', tag: 'lexi-workflows-view' },
+  { route: 'vault', tag: 'lexi-vault-view' },
+  { route: 'memory', tag: 'lexi-memory-view' },
+  { route: 'cron', tag: 'lexi-cron-view' },
+  { route: 'settings', tag: 'lexi-settings-view' },
 ] as const;
 
-// Skip the entire file when port 3030 isn't reachable — keeps CI green when
-// LaunchAgent isn't loaded.
+const PENDING_SECTIONS = [
+  'routines', 'brain', 'skills', 'approvals', 'budget',
+  'logs', 'advisor', 'heartbeat', 'build',
+  'team', 'projects', 'plans', 'claims',
+  'chat', 'trace', 'search',
+] as const;
+
 test.beforeAll(async ({ request }) => {
   try {
     const r = await request.get('/health', { timeout: 2_000 });
@@ -34,48 +35,72 @@ test.beforeAll(async ({ request }) => {
   }
 });
 
-async function gotoSection(page: Page, section: string): Promise<void> {
-  await page.goto(`/#/${section}`);
-  // Lit renders are async — wait for the section's component to be in the DOM
+async function waitForView(page: Page, tag: string): Promise<void> {
   await page.waitForFunction(
-    (s) => {
-      const main = document.querySelector('main.lexi-main');
-      const tag = `lexi-${s === 'workflows' ? 'workflows' : s}-view`;
-      return !!main?.querySelector(tag);
-    },
-    section,
+    (selector) => !!document.querySelector('main.lexi-main')?.querySelector(selector),
+    tag,
     { timeout: 5_000 },
   );
 }
 
+async function gotoRoute(page: Page, route: string, expectTag: string): Promise<void> {
+  await page.goto(`/#/${route}`);
+  await waitForView(page, expectTag);
+}
+
 test.describe('Shell', () => {
-  test('serves the SPA root with the lexi-app element', async ({ page }) => {
+  test('serves the SPA root with the v2 shell elements', async ({ page }) => {
     await page.goto('/');
     await expect(page.locator('lexi-app')).toBeVisible();
-    await expect(page.locator('lexi-top-bar')).toBeVisible();
-    await expect(page.locator('lexi-nav-rail')).toBeVisible();
+    await expect(page.locator('lexi-top-bar-v2')).toBeVisible();
+    await expect(page.locator('lexi-nav-rail-v2')).toBeVisible();
   });
 
-  test('all 8 sections mount their component (no placeholder)', async ({ page }) => {
-    for (const section of SECTIONS) {
-      await gotoSection(page, section);
+  test('nav rail shows all 17 nav items in 5 groups + 2 footer', async ({ page }) => {
+    await page.goto('/');
+    const items = await page.locator('lexi-nav-rail-v2 .lx-nav-item').count();
+    // 17 grouped + 2 footer
+    expect(items).toBeGreaterThanOrEqual(19);
+  });
+
+  test('all legacy sections mount their component (no placeholder)', async ({ page }) => {
+    for (const s of LEGACY_SECTIONS) {
+      await gotoRoute(page, s.route, s.tag);
       const main = page.locator('main.lexi-main');
-      await expect(main, `section ${section}`).not.toContainText('This section is wired in a later plan');
-      await expect(main, `section ${section}`).not.toContainText('Unknown section');
+      await expect(main, `section ${s.route}`).not.toContainText('This section is wired in a later plan');
+      await expect(main, `section ${s.route}`).not.toContainText('Unknown section');
     }
   });
 
-  test('no JS errors on a full nav tour', async ({ page }) => {
+  test('pending sections render the phase-pending placeholder honestly', async ({ page }) => {
+    for (const s of PENDING_SECTIONS) {
+      await gotoRoute(page, s, 'lexi-phase-pending-view');
+      const view = page.locator('lexi-phase-pending-view');
+      await expect(view, `pending ${s}`).toBeVisible();
+      // Honest: must call out a phase, not a deceptive "wired" placeholder
+      await expect(view).toContainText(/Phase \d+/);
+    }
+  });
+
+  test('no JS errors on a full nav tour through all 17 sections', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
     await page.goto('/');
-    for (const section of SECTIONS) {
-      await gotoSection(page, section);
-      await page.waitForTimeout(300);
+    for (const s of LEGACY_SECTIONS) {
+      await gotoRoute(page, s.route, s.tag);
+      await page.waitForTimeout(150);
     }
-    // SSE stream chunked-encoding warnings come through page.on('requestfailed')
-    // not pageerror, and are cosmetic on hashchange — ignore.
+    for (const s of PENDING_SECTIONS) {
+      await gotoRoute(page, s, 'lexi-phase-pending-view');
+      await page.waitForTimeout(80);
+    }
     expect(errors, `pageerrors during tour: ${errors.join(' | ')}`).toEqual([]);
+  });
+
+  test('home alias routes to Today view', async ({ page }) => {
+    await page.goto('/#/home');
+    await waitForView(page, 'lexi-today-view');
+    await expect(page.locator('lexi-today-view')).toBeVisible();
   });
 });
 
@@ -84,7 +109,6 @@ test.describe('Theme toggle', () => {
     await page.goto('/');
     const before = await page.evaluate(() => document.documentElement.dataset.theme);
     await page.click('button[aria-label="Toggle theme"]');
-    // View Transitions + spotlight wipe ~ 450ms, then settle
     await page.waitForFunction(
       (initial) => document.documentElement.dataset.theme !== initial,
       before,
@@ -117,37 +141,61 @@ test.describe('Theme toggle', () => {
   });
 });
 
+test.describe('Notifications drawer', () => {
+  test('bell icon opens the drawer', async ({ page }) => {
+    await page.goto('/');
+    await page.click('button[aria-label="Notifications"]');
+    await expect(page.locator('lexi-notifications-drawer .lx-drawer')).toBeVisible({ timeout: 3_000 });
+  });
+});
+
+test.describe('System map drawer', () => {
+  test('status dot opens the drawer with doctor checks', async ({ page }) => {
+    await page.goto('/');
+    await page.click('button[aria-label*="System status"]');
+    await expect(page.locator('lexi-system-map-drawer .lx-drawer')).toBeVisible({ timeout: 3_000 });
+  });
+});
+
 test.describe('Section content', () => {
+  test('today — Now Playing + At-a-glance counters', async ({ page }) => {
+    await gotoRoute(page, 'today', 'lexi-today-view');
+    const view = page.locator('lexi-today-view');
+    await expect(view).toContainText(/Today/);
+    await expect(view).toContainText(/At a glance/);
+    // Counter labels
+    await expect(view).toContainText(/Agents/);
+    await expect(view).toContainText(/Memory/);
+  });
+
   test('agents — list contains at least one agent card', async ({ page }) => {
-    await gotoSection(page, 'agents');
+    await gotoRoute(page, 'agents', 'lexi-agents-view');
     const view = page.locator('lexi-agents-view');
     await expect(view).toContainText(/\d+\/\d+\s+tools/);
   });
 
   test('connections — filter chips and connection cards render', async ({ page }) => {
-    await gotoSection(page, 'connections');
+    await gotoRoute(page, 'connections', 'lexi-connections-view');
     const view = page.locator('lexi-connections-view');
     await expect(view).toContainText(/Kind/);
     await expect(view).toContainText(/Status/);
-    // Should have at least one of mcp/composio/oauth label or "No connections"
     await expect(view).toContainText(/mcp|composio|oauth|No connections/);
   });
 
   test('workflows — at least one workflow row', async ({ page }) => {
-    await gotoSection(page, 'workflows');
+    await gotoRoute(page, 'workflows', 'lexi-workflows-view');
     const view = page.locator('lexi-workflows-view');
-    // Workflow IDs follow workflow:* or cron:* pattern
     await expect(view).toContainText(/workflow:|cron:/);
   });
 
   test('vault — file tree shows folders', async ({ page }) => {
-    await gotoSection(page, 'vault');
+    await gotoRoute(page, 'vault', 'lexi-vault-view');
     const view = page.locator('lexi-vault-view');
     await expect(view).toContainText(/Daily-Notes|System|People/);
   });
 
   test('memory — tabs render (Stats/Graph/Recall Traces/Integrity)', async ({ page }) => {
-    await gotoSection(page, 'memory');
+    await gotoRoute(page, 'memory', 'lexi-memory-view');
     const view = page.locator('lexi-memory-view');
     await expect(view).toContainText(/Stats/);
     await expect(view).toContainText(/Graph/);
@@ -156,32 +204,22 @@ test.describe('Section content', () => {
   });
 
   test('cron — at least one cron job row', async ({ page }) => {
-    await gotoSection(page, 'cron');
+    await gotoRoute(page, 'cron', 'lexi-cron-view');
     const view = page.locator('lexi-cron-view');
-    // Cron schedule format like "0 8 * * *"
     await expect(view).toContainText(/\d+\s+\d+\s+\*\s+\*\s+\*/);
   });
 
   test('settings — tabs render', async ({ page }) => {
-    await gotoSection(page, 'settings');
+    await gotoRoute(page, 'settings', 'lexi-settings-view');
     const view = page.locator('lexi-settings-view');
     await expect(view).toContainText(/Theme/);
     await expect(view).toContainText(/Auth/);
-  });
-
-  test('home — now-playing card renders', async ({ page }) => {
-    await gotoSection(page, 'home');
-    const view = page.locator('lexi-home-view');
-    await expect(view).toBeVisible();
-    // Empty-state copy is the current shipped behavior; documented gap in
-    // spec §6 (home should also have Today panel + at-a-glance counters).
-    await expect(view).toContainText(/lexi/i);
   });
 });
 
 test.describe('Command palette (Cmd+K)', () => {
   test('Cmd+K opens palette from any section', async ({ page }) => {
-    await gotoSection(page, 'agents');
+    await gotoRoute(page, 'agents', 'lexi-agents-view');
     await page.keyboard.press('Meta+k');
     const palette = page.locator('lexi-command-palette[open]');
     await expect(palette).toBeVisible({ timeout: 3_000 });
@@ -198,13 +236,10 @@ test.describe('Command palette (Cmd+K)', () => {
 });
 
 test.describe('Backend endpoints (sanity)', () => {
-  // These overlap the old DoD endpoint coverage but verify the proxy layer
-  // actually serves real data, not just 200s.
   test('GET /api/cron has jobs array', async ({ request }) => {
     const r = await request.get('/api/cron');
     expect(r.ok()).toBe(true);
     const body = await r.json();
-    // Upstream's getCronJobs returns { jobs: [...] }
     expect(body.jobs ?? body).toBeDefined();
   });
 
