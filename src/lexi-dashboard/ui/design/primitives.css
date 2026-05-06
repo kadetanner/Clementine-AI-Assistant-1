@@ -590,3 +590,15 @@
   color: var(--text-primary);
   border-color: var(--border-default);
 }
+
+/* Plain text-button used inline in row layouts (Phase 25 — routines list). */
+.lx-link {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--text-primary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.lx-link:hover { text-decoration: underline; }

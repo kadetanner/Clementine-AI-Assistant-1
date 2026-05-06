@@ -26,10 +26,13 @@ const LEGACY_SECTIONS = [
   { route: 'heartbeat', tag: 'lexi-heartbeat-view' },
   // Phase 24 — brain pillar shipped view
   { route: 'brain', tag: 'lexi-brain-view' },
+  // Phase 25 — operate pillar follow-on (routines, skills, approvals)
+  { route: 'routines',  tag: 'lexi-routines-view' },
+  { route: 'skills',    tag: 'lexi-skills-view' },
+  { route: 'approvals', tag: 'lexi-approvals-view' },
 ] as const;
 
 const PENDING_SECTIONS = [
-  'routines', 'skills', 'approvals',
   'build',
   'team', 'projects', 'plans', 'claims',
 ] as const;
@@ -279,6 +282,30 @@ test.describe('Section content', () => {
     // The connectors registry is static — at least one always shows
     await view.locator('.lx-tab-pill', { hasText: 'Connectors' }).click();
     await expect(view).toContainText(/Web Search|GitHub|Slack|Google Drive/);
+  });
+
+  test('routines — list pane + run-history pane render', async ({ page }) => {
+    await gotoRoute(page, 'routines', 'lexi-routines-view');
+    const view = page.locator('lexi-routines-view');
+    await expect(view).toContainText(/Routines/);
+    await expect(view).toContainText(/Run history/);
+    await expect(view).toContainText(/No routines configured|Pick a routine|enabled|disabled/);
+  });
+
+  test('skills — list pane + editor pane render', async ({ page }) => {
+    await gotoRoute(page, 'skills', 'lexi-skills-view');
+    const view = page.locator('lexi-skills-view');
+    await expect(view).toContainText(/Skills/);
+    await expect(view).toContainText(/Editor/);
+    await expect(view).toContainText(/Create/);
+  });
+
+  test('approvals — pending + decided buckets render', async ({ page }) => {
+    await gotoRoute(page, 'approvals', 'lexi-approvals-view');
+    const view = page.locator('lexi-approvals-view');
+    await expect(view).toContainText(/Approvals/);
+    await expect(view).toContainText(/Pending \(/);
+    await expect(view).toContainText(/Decided \(/);
   });
 });
 
