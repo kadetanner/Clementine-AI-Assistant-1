@@ -173,6 +173,134 @@ export class LexiAgentsView extends LitElement {
 
   render() {
     return html`
+      <style>
+        lexi-agents-view {
+          display: grid;
+          grid-template-columns: minmax(240px, 320px) 1fr;
+          gap: var(--sp-3);
+          align-items: start;
+        }
+        @media (max-width: 920px) {
+          lexi-agents-view { grid-template-columns: 1fr; }
+        }
+        lexi-agents-view aside,
+        lexi-agents-view section {
+          background: var(--bg-surface, var(--bg-canvas));
+          border: 1px solid var(--border-subtle);
+          border-radius: var(--r-md);
+          padding: var(--sp-3);
+          min-width: 0;
+        }
+        lexi-agents-view .placeholder {
+          padding: var(--sp-3);
+          color: var(--text-tertiary);
+          font-size: var(--text-sm);
+        }
+        lexi-agents-view .agent-row {
+          display: grid;
+          grid-template-columns: 10px 1fr;
+          gap: var(--sp-2);
+          align-items: center;
+          padding: var(--sp-2) var(--sp-3);
+          border-radius: var(--r-sm);
+          cursor: pointer;
+          border: 1px solid transparent;
+        }
+        lexi-agents-view .agent-row:hover { background: var(--bg-subtle); }
+        lexi-agents-view .agent-row[aria-selected='true'] {
+          background: var(--bg-subtle);
+          border-color: var(--border-default);
+        }
+        lexi-agents-view .agent-meta { min-width: 0; }
+        lexi-agents-view .agent-name {
+          font-weight: 600;
+          font-size: var(--text-sm);
+          color: var(--text-primary);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        lexi-agents-view .agent-sub {
+          font-size: var(--text-xs);
+          color: var(--text-tertiary);
+        }
+        lexi-agents-view .dot {
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: var(--text-tertiary);
+        }
+        lexi-agents-view .dot[data-status='running'] { background: var(--positive, #10b981); }
+        lexi-agents-view .dot[data-status='idle']    { background: var(--text-tertiary); }
+        lexi-agents-view .detail-header {
+          display: flex;
+          align-items: baseline;
+          gap: var(--sp-2);
+          flex-wrap: wrap;
+          margin-bottom: var(--sp-3);
+          padding-bottom: var(--sp-3);
+          border-bottom: 1px solid var(--border-subtle);
+        }
+        lexi-agents-view .detail-header h2 {
+          margin: 0;
+          font-size: var(--text-xl);
+          font-weight: 600;
+        }
+        lexi-agents-view .detail-header .model {
+          color: var(--text-tertiary);
+          font-size: var(--text-xs);
+          font-family: var(--font-mono);
+        }
+        lexi-agents-view .detail-header button {
+          margin-left: auto;
+          font: inherit;
+          font-size: var(--text-xs);
+          padding: 4px 10px;
+          border-radius: var(--r-sm);
+          border: 1px solid var(--border-default);
+          background: transparent;
+          color: var(--text-primary);
+          cursor: pointer;
+        }
+        lexi-agents-view .detail-header button.danger {
+          color: var(--danger);
+          border-color: var(--danger);
+        }
+        lexi-agents-view .detail-header button.danger:hover {
+          background: var(--danger-soft, rgba(239,68,68,0.1));
+        }
+        lexi-agents-view .tabs {
+          display: flex;
+          gap: var(--sp-1);
+          flex-wrap: wrap;
+          margin-bottom: var(--sp-3);
+          border-bottom: 1px solid var(--border-subtle);
+        }
+        lexi-agents-view .tab {
+          padding: 6px 12px;
+          font-size: var(--text-sm);
+          color: var(--text-tertiary);
+          cursor: pointer;
+          border-bottom: 2px solid transparent;
+          margin-bottom: -1px;
+        }
+        lexi-agents-view .tab:hover { color: var(--text-primary); }
+        lexi-agents-view .tab[aria-selected='true'] {
+          color: var(--text-primary);
+          border-bottom-color: var(--accent);
+          font-weight: 600;
+        }
+        lexi-agents-view .log-entry {
+          font-family: var(--font-mono);
+          font-size: var(--text-xs);
+          padding: 4px 0;
+          color: var(--text-secondary);
+          border-bottom: 1px solid var(--border-subtle);
+        }
+        lexi-agents-view .log-entry .ts {
+          color: var(--text-tertiary);
+          margin-right: var(--sp-2);
+        }
+      </style>
       <aside>${this.renderList()}</aside>
       <section>${this.error ? html`<div class="placeholder">Error: ${this.error}</div>` : this.renderDetail()}</section>
     `;

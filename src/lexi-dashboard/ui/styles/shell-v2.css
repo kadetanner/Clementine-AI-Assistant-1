@@ -188,3 +188,21 @@ main.lexi-main {
   padding: 2px var(--sp-2);
   font-size: 10px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
 }
+
+/* All view custom elements default to block-level so their inner grids /
+ * flexbox layouts can size correctly. Specific views may override (e.g.
+ * lexi-agents-view sets display: grid). Without this rule unrecognized
+ * custom elements inherit display: inline and collapse to width: 0. */
+.lexi-route-host > [class*="-view"],
+lexi-today-view, lexi-agents-view, lexi-connections-view, lexi-workflows-view,
+lexi-vault-view, lexi-memory-view, lexi-cron-view, lexi-settings-view,
+lexi-chat-view, lexi-search-view, lexi-trace-view, lexi-logs-view,
+lexi-advisor-view, lexi-budget-view, lexi-heartbeat-view, lexi-brain-view,
+lexi-routines-view, lexi-skills-view, lexi-approvals-view, lexi-build-view,
+lexi-team-view, lexi-projects-view, lexi-plans-view, lexi-claims-view,
+lexi-phase-pending-view {
+  display: block;
+}
+/* Re-assert the agents view grid since the rule above would otherwise
+ * downgrade it to block. */
+lexi-agents-view { display: grid; }
