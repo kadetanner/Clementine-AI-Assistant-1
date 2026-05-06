@@ -1,67 +1,16 @@
 # Lexi Parity Audit
 
-Generated: 2026-05-06T05:41:05.989Z
+Generated: 2026-05-06T05:42:52.617Z
 
 - Upstream routes: **265**
-- Implemented in Lexi: **70**
+- Implemented in Lexi: **112**
 - Explicitly internal (acknowledged): **0**
-- **Missing: 195**
+- **Missing: 153**
 - Lexi-only routes (not in upstream): 10
-- Coverage: **26.4%**
-- Baseline ceiling: `195` (recorded 2026-05-06T05:40:58.582Z)
+- Coverage: **42.3%**
+- Baseline ceiling: `153` (recorded 2026-05-06T05:42:45.497Z)
 
 ## Missing routes by namespace
-
-### `/api/builder` — 16 missing
-
-- `GET /api/builder/workflows/:id`
-- `PUT /api/builder/workflows/:id`
-- `POST /api/builder/workflows/:id/run`
-- `GET /api/builder/mcp-discovery`
-- `DELETE /api/builder/workflows/:id`
-- `POST /api/builder/workflows/:id/save-from-drawflow`
-- `POST /api/builder/workflows/:id/validate`
-- `POST /api/builder/workflows/:id/test`
-- `POST /api/builder/runs/:runId/cancel`
-- `POST /api/builder/workflows/:id/dry-run`
-- `POST /api/builder/workflows`
-- `POST /api/builder/chat`
-- `POST /api/builder/chat/stream`
-- `POST /api/builder/reset`
-- `POST /api/builder/test`
-- `POST /api/builder/save`
-
-### `/api/cron` — 14 missing
-
-- `POST /api/cron/run/:job`
-- `POST /api/cron/broken-jobs/:jobName/apply-fix`
-- `POST /api/cron/broken-jobs/:jobName/dismiss-diagnosis`
-- `GET /api/cron/traces/:job`
-- `POST /api/cron`
-- `PUT /api/cron/:name`
-- `POST /api/cron/:name/toggle`
-- `DELETE /api/cron/:name`
-- `GET /api/cron/:job/prompt-history`
-- `GET /api/cron/:job/attachments`
-- `POST /api/cron/:job/attachments`
-- `DELETE /api/cron/:job/attachments/:filename`
-- `GET /api/cron/:job/attachments/:filename`
-- `POST /api/cron/train`
-
-### `/api/routines` — 12 missing
-
-- `GET /api/routines`
-- `GET /api/routines/mcp-tools`
-- `GET /api/routines/cli-tools`
-- `GET /api/routines/:id`
-- `POST /api/routines`
-- `PUT /api/routines/:id`
-- `DELETE /api/routines/:id`
-- `POST /api/routines/:id/toggle`
-- `POST /api/routines/:id/run`
-- `POST /api/routines/:id/dry-run`
-- `POST /api/routines/:id/test`
-- `GET /api/routines/:id/runs`
 
 ### `/api/skills` — 7 missing
 
