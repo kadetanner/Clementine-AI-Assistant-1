@@ -9,10 +9,7 @@ import path from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import {
-  buildContextThrashRecoveryPrompt,
-  contextThrashRecoveryNotice,
   isAutonomousNothingOutput,
-  looksLikeContextThrashText,
   looksLikeProviderApiErrorResponse,
   oneMillionContextRecoveryMessage,
   PersonalAssistant,
@@ -111,7 +108,7 @@ export function classifyChatError(err: unknown): ChatErrorKind {
   if (isCreditBalanceError(msg)) return 'billing';
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
   if (looksLikeClaudeOneMillionContextError(msg)) return 'one_million_context';
-  if (looksLikeContextThrashText(msg) || /context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long|rapid_refill_breaker|autocompact|context.?refilled/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -1005,71 +1002,6 @@ export class Gateway {
 
     return opts.ack
       ?? `On it — running this in the background. I'll follow up when it's done. Task ${task.id}. Reply "status" to check in or "cancel" to stop.`;
-  }
-
-  private startContextThrashRecovery(
-    sessionKey: string,
-    text: string,
-    priorFailureText: string,
-    details: Record<string, unknown> = {},
-  ): string {
-    const currentSess = this.getSession(sessionKey);
-    const jobName = `recovery-${Date.now()}`;
-    currentSess.deepTask = {
-      jobName,
-      taskDesc: `Recover after context overflow: ${text.slice(0, 160)}`,
-      startedAt: new Date().toISOString(),
-    };
-    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-    this.recordInteractiveFailure(sessionKey, text, priorFailureText, 'context_thrash', {
-      jobName,
-      ...details,
-    });
-
-    this.assistant.runUnleashedTask(
-      jobName,
-      buildContextThrashRecoveryPrompt(text, priorFailureText),
-      2,
-      undefined,
-      undefined,
-      undefined,
-      1,
-      agentSlug,
-    ).then(async (result) => {
-      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-        logger.info({ sessionKey, jobName }, 'Context-thrash recovery resolved after cancellation/replacement; suppressing follow-up');
-        return;
-      }
-      logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Context-thrash recovery completed');
-      if (result && !isAutonomousNothingOutput(result)) {
-        this.assistant.injectPendingContext(sessionKey, text, result);
-        await this._deliverDeepResult(
-          sessionKey,
-          `[CONTEXT_THRASH_RECOVERY_RESULT] You just completed the smaller recovery pass. Summarize the result conversationally and briefly. Lead with whether the original request is fixed, still blocked, or needs approval.\n\nOriginal request: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-          result,
-        );
-      }
-    }).catch(async (err) => {
-      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-        logger.info({ sessionKey, jobName }, 'Context-thrash recovery failed after cancellation/replacement; suppressing failure follow-up');
-        return;
-      }
-      logger.error({ err, sessionKey, jobName }, 'Context-thrash recovery failed');
-      this.recordInteractiveFailure(sessionKey, text, err, 'context_thrash_recovery_failed', { jobName });
-      const failMsg = `Recovery pass failed: ${String(err).slice(0, 200)}`;
-      this.assistant.injectPendingContext(sessionKey, text, failMsg);
-      await this._deliverDeepResult(
-        sessionKey,
-        `[CONTEXT_THRASH_RECOVERY_RESULT] The smaller recovery pass failed: ${failMsg}. Tell the user briefly and suggest checking status/log slices, not full logs.`,
-        failMsg,
-      );
-    }).finally(() => {
-      const s = this.sessions.get(sessionKey);
-      if (s?.deepTask?.jobName === jobName) delete s.deepTask;
-    });
-
-    return `${contextThrashRecoveryNotice()} I restarted it as a smaller background recovery pass and will follow up here.`;
   }
 
   /**
@@ -2423,6 +2355,76 @@ export class Gateway {
         }
 
         try {
+          // ── Phase 5: canonical SDK chat path is now DEFAULT ──────────
+          // The new runAgent() wrapper is the canonical path. Set
+          // CLEMENTINE_USE_RUNAGENT_CHAT=0 to fall back to legacy.
+          // The legacy path remains as the in-process error fallback
+          // when runAgent throws.
+          if (process.env.CLEMENTINE_USE_RUNAGENT_CHAT !== '0'
+              && this.isTrustedPersonalSession(sessionKey)
+              && !sessState.pendingInterrupt
+          ) {
+            const { runAgent } = await import('../agent/run-agent.js');
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              profile: resolvedProfile?.slug,
+              path: 'runagent_chat',
+            }, 'Phase 2: routing chat through runAgent');
+
+            try {
+              const runAgentResult = await runAgent(originalText, {
+                sessionKey: effectiveSessionKey,
+                source: 'chat',
+                profile: resolvedProfile,
+                agentManager: this.getAgentManager(),
+                memoryStore: this.assistant.getMemoryStore?.() ?? null,
+                onText: wrappedOnText,
+                onToolActivity: ({ tool, input }) => {
+                  toolActivityCount++;
+                  if (wrappedOnToolActivity) {
+                    return wrappedOnToolActivity(tool, input);
+                  }
+                  return undefined;
+                },
+                abortSignal: chatAc.signal,
+              });
+
+              clearTimeout(chatTimer);
+              clearTimeout(hardWallTimer);
+
+              // Mirror transcript so memory + recall continue working.
+              const memoryStore = this.assistant.getMemoryStore?.();
+              if (memoryStore) {
+                try {
+                  memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
+                  memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
+                } catch (err) {
+                  logger.debug({ err }, 'runAgent chat: transcript mirror failed (non-fatal)');
+                }
+              }
+
+              // Fire auto-memory extraction in the background so
+              // MEMORY.md continues to update like the legacy path.
+              this.assistant
+                .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
+                .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'runAgent chat: auto-memory failed (non-fatal)'));
+
+              logger.info({
+                sessionKey: effectiveSessionKey,
+                totalMs: Date.now() - tInnerStart,
+                routedVia: 'runagent_chat',
+                numTurns: runAgentResult.numTurns,
+                cost: Number(runAgentResult.totalCostUsd.toFixed(4)),
+                responseLen: runAgentResult.text.length,
+              }, 'chat:latency');
+              return runAgentResult.text;
+            } catch (err) {
+              logger.warn({ err, sessionKey: effectiveSessionKey }, 'runAgent chat path failed — falling back to legacy chat');
+              // Fall through to the legacy chat path so the user
+              // still gets a response.
+            }
+          }
+
           // ── Pre-LLM plan routing (Gap #3 from orchestration audit) ──
           // When the user's text clearly maps to multi-step parallel
           // work, route through the orchestrator BEFORE the main agent
@@ -2627,14 +2629,6 @@ export class Gateway {
             return "Claude returned a provider API error instead of a normal answer. I've reset this session so the error does not get replayed into future context. Please try that question again.";
           }
 
-          if (response && looksLikeContextThrashText(response)) {
-            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Context-thrash text returned from assistant — starting recovery pass');
-            return this.startContextThrashRecovery(sessionKey, text, response, {
-              toolActivityCount,
-              source: 'assistant_response',
-            });
-          }
-
           // ── Auto-plan detection ──────────────────────────────────────
           // If the agent signals a complex task, auto-route to the orchestrator
           const planMatch = response?.match(/^\[PLAN_NEEDED:\s*(.+?)\]\s*/);
@@ -2781,14 +2775,6 @@ export class Gateway {
             return "Stopped. What would you like to do instead?";
           }
 
-          if (looksLikeContextThrashText(err)) {
-            logger.warn({ sessionKey, err: String(err).slice(0, 300) }, 'Context-thrash exception — starting recovery pass');
-            return this.startContextThrashRecovery(sessionKey, text, String(err), {
-              toolActivityCount,
-              source: 'exception',
-            });
-          }
-
           // ── Max turns hit — auto-escalate to deep mode instead of failing silently ──
           // This is the #1 cause of "agent stops responding": it ran out of turns
           // exploring files, the SDK throws, and the user gets nothing.
@@ -2907,6 +2893,42 @@ export class Gateway {
       events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();
       try {
+        // ── Phase 5: canonical SDK heartbeat path is now DEFAULT ──────
+        // runAgentHeartbeat is the canonical path (no tools, Haiku,
+        // single turn). Set CLEMENTINE_USE_RUNAGENT_HEARTBEAT=0 to
+        // fall back to legacy.
+        const useRunAgentHeartbeat = process.env.CLEMENTINE_USE_RUNAGENT_HEARTBEAT !== '0';
+        if (useRunAgentHeartbeat) {
+          try {
+            const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
+            logger.info({ agent, path: 'runagent_heartbeat' }, 'Phase 4: routing heartbeat through runAgentHeartbeat');
+            const result = await runAgentHeartbeat({
+              standingInstructions,
+              changesSummary,
+              timeContext,
+              dedupContext,
+              profile,
+              memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            });
+            scanner.refreshIntegrity();
+            events.emit('heartbeat:complete', {
+              agent,
+              durationMs: Date.now() - hbStart,
+              responseLength: result.text?.length ?? 0,
+            });
+            logger.info({
+              agent,
+              cost: Number(result.totalCostUsd.toFixed(4)),
+              numTurns: result.numTurns,
+              durationMs: Date.now() - hbStart,
+            }, 'runAgentHeartbeat: heartbeat complete');
+            return result.text;
+          } catch (err) {
+            logger.warn({ err, agent }, 'runAgentHeartbeat path failed — falling back to legacy heartbeat path');
+            // Fall through to legacy.
+          }
+        }
+
         const response = await this.assistant.heartbeat(
           standingInstructions,
           changesSummary,
@@ -2951,6 +2973,59 @@ export class Gateway {
       const cronStart = Date.now();
       try {
         let response: string;
+
+        // ── Phase 5: canonical SDK cron path is now DEFAULT ──────────
+        // runAgentCron() is the canonical path. Set
+        // CLEMENTINE_USE_RUNAGENT_CRON=0 to fall back to legacy.
+        const useRunAgentCron = process.env.CLEMENTINE_USE_RUNAGENT_CRON !== '0';
+        if (useRunAgentCron && !opts?.disableAllTools) {
+          try {
+            const { runAgentCron } = await import('../agent/run-agent-cron.js');
+            const profile = agentSlug && agentSlug !== 'clementine'
+              ? this.getAgentManager().get(agentSlug) ?? null
+              : null;
+            logger.info({ jobName, agentSlug, tier, path: 'runagent_cron' }, 'Phase 3: routing cron through runAgentCron');
+
+            const cronResult = await runAgentCron({
+              jobName,
+              jobPrompt,
+              tier,
+              maxTurns,
+              profile,
+              agentManager: this.getAgentManager(),
+              memoryStore: this.assistant.getMemoryStore?.() ?? null,
+              successCriteria,
+              model,
+              workDir,
+              // Phase 4: post-task hooks restore reflection + skill
+              // extraction on the new cron path. The PersonalAssistant
+              // implements both members directly.
+              postTaskHooks: this.assistant,
+            });
+
+            response = cronResult.text;
+            scanner.refreshIntegrity();
+            events.emit('cron:complete', {
+              jobName,
+              mode: 'runagent',
+              durationMs: Date.now() - cronStart,
+              responseLength: response?.length ?? 0,
+            });
+            logger.info({
+              jobName,
+              cost: Number(cronResult.totalCostUsd.toFixed(4)),
+              numTurns: cronResult.numTurns,
+              composioConnected: cronResult.composioConnected.length,
+              externalConnected: cronResult.externalConnected.length,
+              durationMs: Date.now() - cronStart,
+            }, 'runAgentCron: cron job complete');
+            return response;
+          } catch (err) {
+            logger.warn({ err, jobName }, 'runAgentCron path failed — falling back to legacy cron path');
+            // Fall through to legacy below.
+          }
+        }
+
         if (mode === 'unleashed') {
           response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours, agentSlug);
         } else {
@@ -2990,6 +3065,46 @@ export class Gateway {
     const releaseLane = await lanes.acquire('cron');
     try {
       logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
+
+      // ── Phase 5: canonical SDK team-task path is now DEFAULT ───────
+      // runAgentTeamTask is the canonical path (one runAgent call —
+      // SDK owns the inner loop). Set CLEMENTINE_USE_RUNAGENT_TEAM=0
+      // to fall back to legacy.
+      const useRunAgentTeam = process.env.CLEMENTINE_USE_RUNAGENT_TEAM !== '0';
+      if (useRunAgentTeam) {
+        try {
+          const { runAgentTeamTask } = await import('../agent/run-agent-team-task.js');
+          logger.info({ fromSlug, toSlug: profile.slug, path: 'runagent_team_task' }, 'Phase 4: routing team task through runAgentTeamTask');
+          const result = await runAgentTeamTask({
+            fromName,
+            fromSlug,
+            content,
+            profile,
+            agentManager: this.getAgentManager(),
+            memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            abortSignal: abortController?.signal,
+          });
+          scanner.refreshIntegrity();
+          logger.info({
+            fromSlug,
+            toSlug: profile.slug,
+            cost: Number(result.totalCostUsd.toFixed(4)),
+            numTurns: result.numTurns,
+            composioConnected: result.composioConnected.length,
+          }, 'runAgentTeamTask: team task complete');
+          // Best-effort streaming: if a callback is provided, deliver
+          // the final text in one chunk (the SDK already streamed it
+          // internally to runAgent's onText, but we collected it).
+          if (onText && result.text) {
+            try { onText(result.text); } catch { /* ignore */ }
+          }
+          return result.text;
+        } catch (err) {
+          logger.warn({ err, fromSlug, toSlug: profile.slug }, 'runAgentTeamTask path failed — falling back to legacy team-task path');
+          // Fall through to legacy.
+        }
+      }
+
       const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText, abortController);
       scanner.refreshIntegrity();
       return response;
