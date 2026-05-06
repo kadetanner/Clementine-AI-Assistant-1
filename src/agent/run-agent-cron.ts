@@ -22,12 +22,14 @@ import {
   BASE_DIR,
   VAULT_DIR,
   CRON_PROGRESS_DIR,
+  BUDGET,
 } from '../config.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
+import { buildAutonomousMemoryContext } from './run-agent-context.js';
 import { listAllGoals } from '../tools/shared.js';
 
 const CRON_PROGRESS_PENDING_MAX_ITEMS = 20;
@@ -240,6 +242,12 @@ export interface CronPostTaskHooks {
     durationMs: number,
     agentSlug?: string,
   ) => Promise<void>;
+  triggerMemoryExtractionPostExchange: (
+    userMessage: string,
+    assistantResponse: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ) => Promise<void>;
 }
 
 export interface RunAgentCronOptions {
@@ -299,6 +307,10 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   const ownerName = process.env.OWNER_NAME ?? 'the user';
 
   // ── Compose context blocks (mirrors legacy runCronJob) ─────────────
+  // Memory block goes first so the agent reads its long-term context
+  // before the run-specific progress/goals/etc. For a hired agent
+  // (Ross/Sasha) this is their own MEMORY.md, not Clementine's global.
+  const memoryContext = buildAutonomousMemoryContext(opts.profile);
   const progressContext = buildProgressContext(opts.jobName);
   const goalContext = buildGoalContext(opts.jobName);
   const delegationContext = buildDelegationContext(agentSlug);
@@ -314,6 +326,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   // Final prompt
   const builtPrompt =
     `[Scheduled task: ${opts.jobName}]\n\n` +
+    memoryContext +
     progressContext +
     goalContext +
     skillContext +
@@ -345,7 +358,13 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   });
 
   // ── Run via canonical runAgent ────────────────────────────────────
-  const maxBudget = opts.maxBudgetUsd ?? (tier >= 2 ? 3.0 : 1.0);
+  // Per-tier cap from config (BUDGET.cronT1 / BUDGET.cronT2). Sourced
+  // from env / clementine.json / dashboard writes. 0 means uncapped —
+  // we pass undefined so runAgent omits the SDK option entirely.
+  // Caller can still override via opts.maxBudgetUsd.
+  const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
+  const maxBudget: number | undefined =
+    opts.maxBudgetUsd ?? (configuredCap > 0 ? configuredCap : undefined);
   const effort: 'low' | 'medium' | 'high' = tier >= 2 ? 'high' : 'medium';
 
   logger.info({
@@ -368,7 +387,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     memoryStore: opts.memoryStore,
     model: opts.model,
     effort,
-    maxBudgetUsd: maxBudget,
+    ...(maxBudget !== undefined ? { maxBudgetUsd: maxBudget } : {}),
     maxTurns: opts.maxTurns,
     abortSignal: opts.abortSignal,
     extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
@@ -386,11 +405,13 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     }
   }
 
-  // ── Post-task hooks: reflection + skill extraction ────────────────
-  // Both fire-and-forget — never block the cron deliverable on these.
-  // They are the same passes the legacy runCronJob fires; without them
-  // the new path would lose the success-grading + procedural-memory
-  // growth that makes Clementine self-improving.
+  // ── Post-task hooks: reflection + skill extraction + memory ──────
+  // All fire-and-forget — never block the cron deliverable on these.
+  // Reflection grades the run, skill extraction banks repeatable
+  // procedures, memory extraction distills facts the agent learned
+  // (e.g. "Mark Finizio is now the buyer at FamilyCenter") into the
+  // agent's MEMORY.md. The legacy runCronJob fired reflection +
+  // skill but never memory extraction; that gap is closed now.
   if (opts.postTaskHooks && deliverable && deliverable.trim() !== '__NOTHING__') {
     const durationMs = Date.now() - startedAt;
     opts.postTaskHooks
@@ -399,6 +420,14 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     opts.postTaskHooks
       .triggerSkillExtractionFromExecution('cron', opts.jobName, opts.jobPrompt, deliverable, durationMs, agentSlug)
       .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: skill extraction failed (non-fatal)'));
+    opts.postTaskHooks
+      .triggerMemoryExtractionPostExchange(
+        opts.jobPrompt,
+        deliverable,
+        `cron:${opts.jobName}`,
+        opts.profile ?? undefined,
+      )
+      .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: memory extraction failed (non-fatal)'));
   }
 
   return {
