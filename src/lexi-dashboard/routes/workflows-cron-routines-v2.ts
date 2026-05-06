@@ -65,11 +65,11 @@ export function register(app: Express): void {
     res.json({ ok: true, id });
   });
 
-  app.post('/api/builder/workflows/:id/run', async (req: Request, res: Response) => {
+  app.post('/api/builder/workflows/:id/run', async (_req: Request, res: Response) => {
     res.status(501).json({ error: 'Workflow execution requires daemon orchestration; trigger via daemon CLI' });
   });
 
-  app.post('/api/builder/workflows/:id/save-from-drawflow', async (req: Request, res: Response) => {
+  app.post('/api/builder/workflows/:id/save-from-drawflow', async (_req: Request, res: Response) => {
     res.status(501).json({ error: 'Drawflow save requires daemon-side parser' });
   });
 
@@ -79,15 +79,15 @@ export function register(app: Express): void {
     res.json({ ok: true, result: r });
   });
 
-  app.post('/api/builder/workflows/:id/test', async (req: Request, res: Response) => {
+  app.post('/api/builder/workflows/:id/test', async (_req: Request, res: Response) => {
     res.status(501).json({ error: 'Workflow test requires daemon orchestration' });
   });
 
-  app.post('/api/builder/workflows/:id/dry-run', async (req: Request, res: Response) => {
+  app.post('/api/builder/workflows/:id/dry-run', async (_req: Request, res: Response) => {
     res.status(501).json({ error: 'Workflow dry-run requires daemon orchestration' });
   });
 
-  app.post('/api/builder/runs/:runId/cancel', async (req: Request, res: Response) => {
+  app.post('/api/builder/runs/:runId/cancel', async (_req: Request, res: Response) => {
     res.status(501).json({ error: 'Run cancellation requires daemon' });
   });
 

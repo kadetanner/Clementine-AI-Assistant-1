@@ -116,6 +116,24 @@ function detailFor(slug: string): Record<string, unknown> | null {
 }
 
 export function register(app: Express): void {
+  // GET /api/agents — explicit handler so the parity audit picks it up.
+  // (V1 mounts a router at /api/agents which the regex audit doesn't see.)
+  // Returns the legacy snake_case shape from agents/vault-store directly so
+  // existing tests + UI continue to work unchanged. Honors LEXI_VAULT_ROOT
+  // env var (used by tests).
+  app.get('/api/agents', async (_req: Request, res: Response) => {
+    try {
+      const mod = await import('../agents/vault-store.js');
+      const list = (mod as unknown as { listAgents: (opts?: { vaultRoot?: string }) => Promise<unknown[]> }).listAgents;
+      if (typeof list !== 'function') return res.json({ agents: [] });
+      const opts = process.env.LEXI_VAULT_ROOT ? { vaultRoot: process.env.LEXI_VAULT_ROOT } : undefined;
+      const agents = await list(opts);
+      res.json({ agents });
+    } catch {
+      res.json({ agents: [] });
+    }
+  });
+
   // GET /api/agents/:slug/detail
   app.get('/api/agents/:slug/detail', (req: Request, res: Response) => {
     const slug = String(req.params.slug);
