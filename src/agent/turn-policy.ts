@@ -6,10 +6,11 @@
  * promotes the request to a richer path.
  */
 
-import { routeToolSurface } from './tool-router.js';
+import { routeToolSurface, type ToolRouteDecision } from './tool-router.js';
 import type { IntentClassification } from './intent-classifier.js';
 
 export type RetrievalTier = 'none' | 'core' | 'search' | 'full';
+export type TurnExecutionMode = 'local' | 'lightweight_llm' | 'tool_llm' | 'background';
 
 export interface TurnPolicy {
   retrievalTier: RetrievalTier;
@@ -19,6 +20,10 @@ export interface TurnPolicy {
   effort: 'low' | 'medium' | 'high';
   allowProactiveGoals: boolean;
   fetchLinks: boolean;
+  /** Do not resume the prior Claude SDK session for this turn. */
+  suppressSessionResume?: boolean;
+  /** Do not inject restored/pending/background context for this turn. */
+  suppressContextInjection?: boolean;
   reason: string;
 }
 
@@ -29,12 +34,47 @@ export interface TurnPolicyInput {
   isAutonomous?: boolean;
 }
 
+export interface TurnDecision {
+  mode: TurnExecutionMode;
+  policy: TurnPolicy;
+  toolRoute: ToolRouteDecision;
+  userVisibleStatus: string;
+  reason: string;
+}
+
 const URL_RE = /https?:\/\//i;
 const MEMORY_REF_RE = /\b(remember|memory|memories|previous|last time|earlier|we discussed|where were we|pick up|continue|you know about me|my preference|preferences|what did i say|what do i like)\b/i;
 const GOAL_REF_RE = /\b(goal|goals|objective|objectives|blocker|next action|next step|roadmap|priority|priorities)\b/i;
-const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run)\b/i;
+const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run|diagnose|investigate|troubleshoot|cron|scheduler|lease)\b/i;
 const COMPLEX_RE = /\b(multiple|several|many|bulk|batch|parallel|deep mode|background|research|analyze|audit|review|across|end to end|entire)\b/i;
 const ADMIN_RE = /\b(self[- ]?update|restart|daemon|npm publish|publish to npm|doctor|integration|credential|env var|environment variable|set up|setup|configure)\b/i;
+const BACKGROUND_STATUS_FOLLOWUP_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b|\b(status|progress|progress update|any updates?|done yet|did it finish|still running|coming along|background status)\b/i;
+const STANDALONE_GREETINGS = new Set([
+  'hi',
+  'hey',
+  'hey there',
+  'hello',
+  'hello there',
+  'yo',
+  'sup',
+  "what's up",
+  'whats up',
+  'good morning',
+  'good afternoon',
+  'good evening',
+  'morning',
+  'gm',
+]);
+
+export function isStandaloneGreeting(text: string): boolean {
+  const normalized = text
+    .trim()
+    .toLowerCase()
+    .replace(/^[^\w']+|[^\w']+$/g, '')
+    .replace(/\s+/g, ' ');
+  const withoutName = normalized.replace(/\s+clementine$/i, '');
+  return STANDALONE_GREETINGS.has(normalized) || STANDALONE_GREETINGS.has(withoutName);
+}
 
 function wordCount(text: string): number {
   const trimmed = text.trim();
@@ -96,6 +136,34 @@ export function decideTurnPolicy(input: TurnPolicyInput): TurnPolicy {
       allowProactiveGoals: true,
       fetchLinks: hasUrl,
       reason: 'explicit-full-surface',
+    };
+  }
+
+  if (input.hasRecentContext && BACKGROUND_STATUS_FOLLOWUP_RE.test(text)) {
+    return {
+      retrievalTier: 'search',
+      disableAllTools: false,
+      enableTeams: false,
+      maxTurns: Math.min(intent.suggestedMaxTurns, 6),
+      effort: 'low',
+      allowProactiveGoals: false,
+      fetchLinks: false,
+      reason: 'background-status-followup',
+    };
+  }
+
+  if (isStandaloneGreeting(text)) {
+    return {
+      retrievalTier: 'none',
+      disableAllTools: true,
+      enableTeams: false,
+      maxTurns: 2,
+      effort: 'low',
+      allowProactiveGoals: false,
+      fetchLinks: false,
+      suppressSessionResume: true,
+      suppressContextInjection: true,
+      reason: 'standalone-greeting',
     };
   }
 
@@ -187,5 +255,40 @@ export function decideTurnPolicy(input: TurnPolicyInput): TurnPolicy {
     allowProactiveGoals: false,
     fetchLinks: false,
     reason: 'safe-core-default',
+  };
+}
+
+export function decideTurn(input: TurnPolicyInput): TurnDecision {
+  const policy = decideTurnPolicy(input);
+  const toolRoute = routeToolSurface(input.text);
+  const text = input.text.trim();
+  const wantsBackground = /\b(background|deep mode|keep working|don't stop|dont stop|run in the background|autonomous)\b/i.test(text);
+  const explicitWork = /\b(work|task|do|run|fix|implement|audit|research|analy[sz]e|review|build|ship|finish|complete|continue|handle)\b/i.test(text);
+  const needsTools = !policy.disableAllTools || toolRoute.fullSurface || toolRoute.bundles.length > 0;
+  const backgroundRequested = wantsBackground && needsTools && (explicitWork || policy.enableTeams || policy.retrievalTier === 'full');
+
+  let mode: TurnExecutionMode;
+  if (input.isAutonomous || backgroundRequested) {
+    mode = 'background';
+  } else if (policy.disableAllTools && policy.retrievalTier === 'none') {
+    mode = 'lightweight_llm';
+  } else {
+    mode = 'tool_llm';
+  }
+
+  const userVisibleStatus = mode === 'background'
+    ? 'working in background'
+    : mode === 'lightweight_llm'
+      ? 'answering'
+      : toolRoute.bundles.length > 0 || toolRoute.fullSurface
+        ? 'checking tools'
+        : 'thinking';
+
+  return {
+    mode,
+    policy,
+    toolRoute,
+    userVisibleStatus,
+    reason: policy.reason,
   };
 }

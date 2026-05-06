@@ -216,8 +216,25 @@ clementine login | auth              Authenticate Claude Code / OAuth providers
 clementine chat                      Interactive REPL
 clementine memory status             Index size, recent activity
 clementine memory search <q>         FTS5 search
+clementine memory model status       Local dense embedding model cache
+clementine memory model install      Pre-cache the local embedding model
 clementine memory dedup | reembed    Maintenance
 clementine brain digest              Run the brain digest pipeline
+```
+
+Dense neural recall uses a local Transformers.js embedding model. Model
+weights are not bundled into the npm tarball; the first install caches them
+under `~/.clementine/models/`. To make repo or npm updates prefetch the model
+automatically, set this once in `~/.clementine/.env`:
+
+```
+CLEMENTINE_PREFETCH_EMBEDDINGS=1
+```
+
+You can also opt in for a single install/update command:
+
+```
+CLEMENTINE_INSTALL_EMBEDDINGS=1 npm install -g clementine-agent
 ```
 
 **Projects & agents**
@@ -324,14 +341,34 @@ clementine restart                    # apply changes
 
 Your overrides live in `~/.clementine/.env` — **they survive every `npm update -g` / `clementine update`** because they're in your data home, not the package directory.
 
+The dashboard exposes these spend controls in Settings -> Channels & Env ->
+Spend Guards & Context Health, including direct dollar-cap editing, Default
+Caps, Safe Recovery, and No Caps presets. When a dashboard change needs the
+daemon to reload, Clementine shows a Restart Clementine prompt and handles the
+restart from the browser.
+
+For spend/context tuning, `clementine budgets` gives a safer shortcut:
+
+```bash
+clementine budgets              # show chat/cron/heartbeat caps and 1M context state
+clementine budgets safe         # lower background budgets and force standard 200K context
+clementine budgets 1m auto      # allow included Opus 1M, keep Sonnet on 200K
+clementine budgets 1m on        # force 1M context for Extra Usage/API users
+clementine budgets 1m off       # disable 1M context for maximum compatibility
+clementine budgets set chat 10  # raise one budget cap
+clementine budgets set chat 0   # remove one cap
+```
+
 **Commonly tuned knobs:**
 
 | Key | Default | What it does |
 |-----|---------|--------------|
 | `BUDGET_CHAT_USD` | `5.00` | Max spend per interactive chat message |
-| `BUDGET_CRON_T1_USD` | `2.00` | Max spend per tier-1 cron job |
-| `BUDGET_CRON_T2_USD` | `5.00` | Max spend per tier-2 cron job |
-| `BUDGET_HEARTBEAT_USD` | `0.50` | Max spend per heartbeat tick |
+| `BUDGET_CRON_T1_USD` | `0.75` | Max spend per tier-1 cron job |
+| `BUDGET_CRON_T2_USD` | `1.50` | Max spend per tier-2 cron job |
+| `BUDGET_HEARTBEAT_USD` | `0.25` | Max spend per heartbeat tick |
+| `CLEMENTINE_1M_CONTEXT_MODE` | `auto` | `auto` allows included Opus 1M on Max/Team/Enterprise while keeping Sonnet on 200K; `off` forces 200K; `on` forces 1M |
+| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | legacy | Backward-compatible Claude Code switch; `budgets safe` writes `1`, `budgets 1m auto` removes it |
 | `DEFAULT_MODEL_TIER` | `sonnet` | Default model: `haiku` / `sonnet` / `opus` |
 | `HEARTBEAT_INTERVAL_MINUTES` | `30` | How often the agent auto-checks in |
 | `HEARTBEAT_ACTIVE_START` | `8` | First hour of the active window (0–23) |

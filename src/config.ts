@@ -37,30 +37,229 @@ function readEnvFile(): Record<string, string> {
 
 const env = readEnvFile();
 
-// ── Claude Code CLI runtime env propagation ─────────────────────────
+// ── Claude Code 1M context mode ─────────────────────────────────────
 //
-// The Claude Code CLI binary bundled inside @anthropic-ai/claude-agent-sdk
-// auto-attaches the `context-1m-2025-08-07` beta header for any model that
-// supports a 1M context (Sonnet 4.6, Opus 4.6/4.7, etc.). On accounts
-// without the "extra usage" entitlement, every API call then fails with
-// "Extra usage is required for 1M context."
+// Claude Code's long-context behavior is plan/auth/model-specific:
+//   - Claude Code subscription auth can expose long context on Opus without
+//     the Sonnet [1m] Extra Usage path.
+//   - Console/API Sonnet 1M is requested with the [1m] suffix and may have
+//     different pricing/eligibility.
 //
-// We don't ask for 1M anywhere in our code, but the CLI does on its own.
-// The CLI honors CLAUDE_CODE_DISABLE_1M_CONTEXT — when truthy, the auto-
-// enable path is skipped and the standard 200K context is used.
+// Clementine therefore uses a higher-level mode instead of blindly forcing
+// CLAUDE_CODE_DISABLE_1M_CONTEXT for every SDK subprocess:
+//   auto  (default): allow Opus long-context routing, but keep Sonnet/Haiku
+//                    on the standard path unless Sonnet [1m] is explicit.
+//   off:              force 200K everywhere; best recovery/safe mode.
+//   on:               allow long-context routing; only for eligible users.
 //
-// Default to disabled here so users without extra usage stop hitting the
-// gate. Anyone who has paid for / been entitled to 1M can opt back in by
-// setting CLAUDE_CODE_DISABLE_1M_CONTEXT=0 in their .env.
-{
-  const userPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  if (userPref === undefined || userPref === '') {
-    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+// The legacy CLAUDE_CODE_DISABLE_1M_CONTEXT key is still honored when the new
+// mode is absent, so existing installs keep their previous behavior.
+export type OneMillionContextMode = 'auto' | 'off' | 'on';
+export type ClaudePlan = 'pro' | 'max' | 'team' | 'enterprise' | 'api' | 'unknown';
+
+function normalizeOneMillionContextMode(value: unknown): OneMillionContextMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'auto') return 'auto';
+  if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+  if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+  return null;
+}
+
+function legacyDisableToOneMillionContextMode(value: unknown): OneMillionContextMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+  if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+  return null;
+}
+
+function normalizeClaudePlan(value: unknown): ClaudePlan | null {
+  const v = String(value ?? '').trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (!v) return null;
+  if (v === 'pro') return 'pro';
+  if (v === 'max') return 'max';
+  if (['team', 'team-standard', 'team-premium'].includes(v)) return 'team';
+  if (['enterprise', 'ent'].includes(v)) return 'enterprise';
+  if (['api', 'payg', 'pay-as-you-go', 'usage-based'].includes(v)) return 'api';
+  if (v === 'unknown') return 'unknown';
+  return null;
+}
+
+const oneMillionModePref = env['CLEMENTINE_1M_CONTEXT_MODE'] ?? process.env.CLEMENTINE_1M_CONTEXT_MODE;
+const legacyOneMillionPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+const claudePlanPref = env['CLEMENTINE_CLAUDE_PLAN'] ?? process.env.CLEMENTINE_CLAUDE_PLAN;
+
+export const CLEMENTINE_1M_CONTEXT_MODE: OneMillionContextMode =
+  normalizeOneMillionContextMode(oneMillionModePref)
+  ?? legacyDisableToOneMillionContextMode(legacyOneMillionPref)
+  ?? 'auto';
+export const CLEMENTINE_CLAUDE_PLAN: ClaudePlan =
+  normalizeClaudePlan(claudePlanPref) ?? 'unknown';
+
+if (CLEMENTINE_1M_CONTEXT_MODE === 'off') {
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+} else if (CLEMENTINE_1M_CONTEXT_MODE === 'on') {
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '0';
+} else if (oneMillionModePref !== undefined) {
+  // Explicit auto mode should override stale shell/package env inherited from
+  // older installs. Per-query SDK options decide whether to disable 1M.
+  delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+}
+
+function modelFamily(model: string | null | undefined): 'opus' | 'sonnet' | 'haiku' | 'opusplan' | 'other' {
+  const m = String(model ?? '').toLowerCase();
+  if (m.includes('opusplan')) return 'opusplan';
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku')) return 'haiku';
+  return 'other';
+}
+
+export function currentOneMillionContextMode(): OneMillionContextMode {
+  return normalizeOneMillionContextMode(process.env.CLEMENTINE_1M_CONTEXT_MODE)
+    ?? CLEMENTINE_1M_CONTEXT_MODE;
+}
+
+export function currentClaudePlan(): ClaudePlan {
+  return normalizeClaudePlan(process.env.CLEMENTINE_CLAUDE_PLAN)
+    ?? CLEMENTINE_CLAUDE_PLAN;
+}
+
+export function planIncludesSubscriptionOpusOneMillion(plan: ClaudePlan = currentClaudePlan()): boolean {
+  return plan === 'max' || plan === 'team' || plan === 'enterprise';
+}
+
+export function claudeCodeDisableOneMillionForModel(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
+): '1' | '0' | undefined {
+  if (mode === 'off') return '1';
+  if (usesOneMillionContext(model, mode, plan)) return '0';
+  return '1';
+}
+
+function upsertRuntimeEnvValue(baseDir: string, key: string, value: string): void {
+  const envPath = path.join(baseDir, '.env');
+  let text = '';
+  if (existsSync(envPath)) {
+    text = readFileSync(envPath, 'utf-8');
   } else {
-    // Propagate the user's explicit choice from .env into process.env so the
-    // spawned CLI subprocess inherits it.
-    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = userPref;
+    fs.mkdirSync(baseDir, { recursive: true });
   }
+
+  const line = `${key}=${value}`;
+  const re = new RegExp(`^${key}=.*$`, 'm');
+  const next = re.test(text)
+    ? text.replace(re, line)
+    : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`;
+  fs.writeFileSync(envPath, next, { mode: 0o600 });
+}
+
+export function looksLikeClaudeOneMillionContextError(value: unknown): boolean {
+  const text = String(value ?? '');
+  return /extra usage.*1m context|1m context.*extra usage|context-1m|1m.*extra usage|requires?.*1m/i.test(text);
+}
+
+export function applyOneMillionContextRecovery(baseDir: string = BASE_DIR): void {
+  process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+  try {
+    upsertRuntimeEnvValue(baseDir, 'CLEMENTINE_1M_CONTEXT_MODE', 'off');
+    upsertRuntimeEnvValue(baseDir, 'CLAUDE_CODE_DISABLE_1M_CONTEXT', '1');
+  } catch {
+    // Runtime env is already safe. Persisting is best-effort because this path
+    // is often called while handling an SDK failure.
+  }
+}
+
+export function claudeOneMillionEnvForModel(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
+): Record<string, string> {
+  const disableValue = claudeCodeDisableOneMillionForModel(model, mode, plan);
+  return {
+    CLEMENTINE_1M_CONTEXT_MODE: mode,
+    ...(disableValue !== undefined ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: disableValue } : {}),
+  };
+}
+
+type ClaudeSdkOptionsLike = {
+  model?: string;
+  env?: Record<string, string | undefined>;
+  betas?: unknown[];
+  mcpServers?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export function normalizeClaudeSdkOptionsForOneMillionContext<T extends ClaudeSdkOptionsLike>(options: T): T {
+  const rawModel = typeof options.model === 'string' ? options.model : '';
+  const model = rawModel ? normalizeClaudeModelForOneMillionContext(rawModel) : rawModel;
+  const oneMillionEnv = claudeOneMillionEnvForModel(model || rawModel || null);
+  const disableValue = oneMillionEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  const next: ClaudeSdkOptionsLike = {
+    ...options,
+    ...(rawModel ? { model } : {}),
+    env: { ...(options.env ?? {}), ...oneMillionEnv },
+    ...(disableValue === '1' ? { betas: [] } : {}),
+  };
+
+  if (options.mcpServers && typeof options.mcpServers === 'object') {
+    const servers: Record<string, unknown> = {};
+    for (const [name, server] of Object.entries(options.mcpServers)) {
+      if (server && typeof server === 'object' && !Array.isArray(server)) {
+        const serverObj = server as Record<string, unknown>;
+        const supportsEnv = serverObj.type === 'stdio' || 'env' in serverObj;
+        if (!supportsEnv) {
+          servers[name] = server;
+          continue;
+        }
+        const serverEnv = serverObj.env && typeof serverObj.env === 'object' && !Array.isArray(serverObj.env)
+          ? serverObj.env as Record<string, string | undefined>
+          : {};
+        servers[name] = {
+          ...serverObj,
+          env: { ...serverEnv, ...oneMillionEnv },
+        };
+      } else {
+        servers[name] = server;
+      }
+    }
+    next.mcpServers = servers;
+  }
+
+  return next as T;
+}
+
+export function normalizeClaudeModelForOneMillionContext(
+  model: string,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+): string {
+  const family = modelFamily(model);
+  if (mode === 'on') return family === 'sonnet' || family === 'opus' ? model : model.replace(/\[1m\]/ig, '');
+  const shouldStrip = mode === 'off'
+    || (family === 'sonnet' && !/\[1m\]/i.test(model))
+    || family === 'haiku'
+    || family === 'opusplan';
+  return shouldStrip ? model.replace(/\[1m\]/ig, '') : model;
+}
+
+export function usesOneMillionContext(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
+): boolean {
+  if (mode === 'off') return false;
+  const family = modelFamily(model);
+  if (family === 'opus') {
+    return mode === 'on'
+      || /\[1m\]/i.test(String(model ?? ''))
+      || (mode === 'auto' && planIncludesSubscriptionOpusOneMillion(plan));
+  }
+  if (family !== 'sonnet') return false;
+  return mode === 'on' || /\[1m\]/i.test(String(model ?? ''));
 }
 
 // ── Keychain-ref resolution (lazy, cached) ──────────────────────────
@@ -210,6 +409,12 @@ function getEnvOrJsonNumber(envKey: string, jsonValue: number | undefined, fallb
 export const ASSISTANT_NAME = getEnvOrJson('ASSISTANT_NAME', json.assistantName, 'Clementine');
 export const ASSISTANT_NICKNAME = getEnv('ASSISTANT_NICKNAME', 'Clemmy');
 export const OWNER_NAME = getEnvOrJson('OWNER_NAME', json.ownerName, '');
+export const ASSISTANT_EXPERIENCE = {
+  proactivity: getEnvOrJson('ASSISTANT_PROACTIVITY', json.assistant?.proactivity, 'balanced') as 'quiet' | 'balanced' | 'proactive' | 'operator',
+  responseStyle: getEnvOrJson('ASSISTANT_RESPONSE_STYLE', json.assistant?.responseStyle, 'balanced') as 'concise' | 'balanced' | 'detailed',
+  progressVisibility: getEnvOrJson('ASSISTANT_PROGRESS_VISIBILITY', json.assistant?.progressVisibility, 'normal') as 'quiet' | 'normal' | 'detailed',
+  autonomy: getEnvOrJson('ASSISTANT_AUTONOMY', json.assistant?.autonomy, 'balanced') as 'ask_first' | 'balanced' | 'act_when_safe',
+};
 
 // ── Secrets (with macOS Keychain fallback) ───────────────────────────
 
@@ -249,9 +454,9 @@ export const MODELS: Models = {
 // `budgets.*` keys in clementine.json.
 
 export const BUDGET = {
-  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.50), // per heartbeat (Haiku)
-  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 2.00),         // per tier-1 cron job
-  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 5.00),         // per tier-2 cron job
+  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.25), // per heartbeat (Haiku)
+  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 0.75),         // per tier-1 cron job
+  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 1.50),         // per tier-2 cron job
   chat: getEnvOrJsonNumber('BUDGET_CHAT_USD', json.budgets?.chat, 5.00),                // per interactive chat
   unleashedPhase: undefined,
   memoryExtraction: undefined,

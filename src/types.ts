@@ -19,6 +19,7 @@ export interface SearchResult {
   category?: string | null;
   topic?: string | null;
   pinned?: boolean;
+  confidence?: number;
 }
 
 export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice' | 'procedure';
@@ -303,6 +304,7 @@ export interface HeartbeatWorkItem {
 export interface BackgroundTask {
   id: string;
   fromAgent: string;          // Slug of the agent that initiated the task
+  sessionKey?: string;        // Chat/session that requested the task, when user-visible
   prompt: string;             // The full task prompt
   maxMinutes: number;         // Hard wall-clock cap
   status: 'pending' | 'running' | 'done' | 'failed' | 'aborted';
@@ -364,6 +366,25 @@ export interface CronJobDefinition {
   confirmationTimeoutMin?: number; // Minutes to wait for confirmation before auto-proceeding (default: 5)
 }
 
+export type LongTaskRisk = 'normal' | 'long' | 'huge' | 'unsafe';
+export type LongTaskRoute = 'standard' | 'checkpointed' | 'opus_1m' | 'sonnet_1m' | 'split_required';
+
+export interface LongTaskPreflightSnapshot {
+  risk: LongTaskRisk;
+  route: LongTaskRoute;
+  estimatedInputTokens: number;
+  contextWindowTokens: number;
+  modelBefore?: string;
+  modelAfter?: string;
+  modeBefore?: CronJobDefinition['mode'];
+  modeAfter?: CronJobDefinition['mode'];
+  requiresUserRefinement: boolean;
+  canProceedWithApproval?: boolean;
+  approvalReason?: string;
+  approvalModel?: string;
+  reasons: string[];
+}
+
 export type TerminalReason =
   | 'blocking_limit' | 'rapid_refill_breaker' | 'prompt_too_long'
   | 'image_error' | 'model_error' | 'aborted_streaming' | 'aborted_tools'
@@ -383,6 +404,7 @@ export interface CronRunEntry {
   outputPreview?: string;
   deliveryFailed?: boolean;
   deliveryError?: string;
+  longTaskPreflight?: LongTaskPreflightSnapshot;
   advisorApplied?: {
     adjustedMaxTurns?: number;
     adjustedModel?: string;
@@ -403,6 +425,7 @@ export interface Models {
 // ── Transcript ───────────────────────────────────────────────────────
 
 export interface TranscriptTurn {
+  id?: number;
   sessionKey: string;
   role: string;
   content: string;
@@ -412,6 +435,16 @@ export interface TranscriptTurn {
 
 export interface SessionSummary {
   sessionKey: string;
+  summary: string;
+  exchangeCount: number;
+  createdAt: string;
+}
+
+export interface SessionLineageEntry {
+  sessionKey: string;
+  parentSessionId: string | null;
+  childSessionId: string | null;
+  reason: string;
   summary: string;
   exchangeCount: number;
   createdAt: string;
@@ -564,6 +597,7 @@ export interface WorkflowInput {
 export type WorkflowStepKind =
   | 'prompt'
   | 'mcp'
+  | 'cli'
   | 'channel'
   | 'transform'
   | 'conditional'
@@ -573,6 +607,14 @@ export interface WorkflowStepMcpConfig {
   server: string;
   tool: string;
   inputs?: Record<string, unknown>;
+}
+
+export interface WorkflowStepCliConfig {
+  cmd: string;                   // CLI binary name as discovered (e.g. 'sf', 'gh', 'gcloud')
+  args?: string[];               // argv tokens; each token may include {{steps.x}} templates
+  workDir?: string;              // optional cwd; defaults to BASE_DIR
+  timeoutMs?: number;            // default 60_000
+  captureStderr?: boolean;       // include stderr in output (default false: stdout only)
 }
 
 export interface WorkflowStepChannelConfig {
@@ -611,6 +653,7 @@ export interface WorkflowStep {
   workDir?: string;
   kind?: WorkflowStepKind;
   mcp?: WorkflowStepMcpConfig;
+  cli?: WorkflowStepCliConfig;
   channel?: WorkflowStepChannelConfig;
   transform?: WorkflowStepTransformConfig;
   conditional?: WorkflowStepConditionalConfig;
@@ -628,6 +671,11 @@ export interface WorkflowDefinition {
   synthesis?: { prompt: string };
   sourceFile: string;
   agentSlug?: string;
+  /** Optional linked-project path. Becomes the default cwd for CLI steps and
+   *  the fallback workDir for prompt/MCP steps that don't set one explicitly. */
+  project?: string;
+  /** Default model for prompt steps that don't set their own. e.g. "claude-opus-4-7". */
+  model?: string;
 }
 
 export type WorkflowOriginKind = 'workflow' | 'cron';
@@ -1061,6 +1109,8 @@ export interface IngestionRun {
   recordsWritten: number;
   recordsSkipped: number;
   recordsFailed: number;
+  recordsUnchanged?: number;
+  recallCheckStatus?: string | null;
   overviewNotePath?: string | null;
   errorsJson?: string | null;      // JSON array of {record, error}
   status: 'running' | 'ok' | 'error' | 'partial';

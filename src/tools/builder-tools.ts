@@ -38,7 +38,7 @@ import type {
   WorkflowStepLoopConfig,
 } from '../types.js';
 
-const STEP_KINDS = ['prompt', 'mcp', 'channel', 'transform', 'conditional', 'loop'] as const;
+const STEP_KINDS = ['prompt', 'mcp', 'cli', 'channel', 'transform', 'conditional', 'loop'] as const;
 
 const stepShape = z.object({
   id: z.string().describe('Step id (unique within workflow)'),
@@ -50,6 +50,7 @@ const stepShape = z.object({
   workDir: z.string().optional(),
   kind: z.enum(STEP_KINDS).optional().describe('Default: prompt'),
   mcp: z.object({ server: z.string(), tool: z.string(), inputs: z.record(z.string(), z.unknown()).optional() }).optional(),
+  cli: z.object({ cmd: z.string(), args: z.array(z.string()).optional(), workDir: z.string().optional(), timeoutMs: z.number().optional(), captureStderr: z.boolean().optional() }).optional(),
   channel: z.object({ channel: z.enum(['discord', 'slack', 'telegram', 'whatsapp', 'email', 'webhook']), target: z.string(), content: z.string() }).optional(),
   transform: z.object({ expression: z.string() }).optional(),
   conditional: z.object({ condition: z.string(), trueNext: z.array(z.string()).optional(), falseNext: z.array(z.string()).optional() }).optional(),
@@ -203,6 +204,8 @@ server.tool(
       steps: z.array(stepShape),
       synthesis: z.object({ prompt: z.string() }).optional(),
       agentSlug: z.string().optional(),
+      project: z.string().optional().describe('Linked-project path; default cwd for CLI steps'),
+      model: z.string().optional().describe('Default model for prompt steps without their own'),
     }),
     force: z.boolean().optional().describe('Bypass validation errors (warnings always ignored)'),
   },
@@ -519,6 +522,7 @@ function normalizeStep(s: z.infer<typeof stepShape>): WorkflowStep {
     workDir: s.workDir,
     kind: s.kind,
     mcp: s.mcp as WorkflowStepMcpConfig | undefined,
+    cli: s.cli as WorkflowStep['cli'],
     channel: s.channel as WorkflowStepChannelConfig | undefined,
     transform: s.transform as WorkflowStepTransformConfig | undefined,
     conditional: s.conditional as WorkflowStepConditionalConfig | undefined,

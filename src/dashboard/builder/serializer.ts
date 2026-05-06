@@ -302,6 +302,7 @@ function parseWorkflowFile(filePath: string): WorkflowDefinition {
     const kind = s.kind as WorkflowStepKind | undefined;
     if (kind && kind !== 'prompt') step.kind = kind;
     if (s.mcp && typeof s.mcp === 'object') step.mcp = s.mcp as WorkflowStep['mcp'];
+    if (s.cli && typeof s.cli === 'object') step.cli = s.cli as WorkflowStep['cli'];
     if (s.channel && typeof s.channel === 'object') step.channel = s.channel as WorkflowStep['channel'];
     if (s.transform && typeof s.transform === 'object') step.transform = s.transform as WorkflowStep['transform'];
     if (s.conditional && typeof s.conditional === 'object') step.conditional = s.conditional as WorkflowStep['conditional'];
@@ -327,6 +328,8 @@ function parseWorkflowFile(filePath: string): WorkflowDefinition {
     synthesis,
     sourceFile: filePath,
     agentSlug: typeof data.agentSlug === 'string' ? (data.agentSlug as string) : undefined,
+    project: typeof data.project === 'string' ? (data.project as string) : undefined,
+    model: typeof data.model === 'string' ? (data.model as string) : undefined,
   };
 }
 
@@ -488,6 +491,8 @@ function saveWorkflowFile(
   // Agent slug for legacy global workflows that target a specific agent.
   // For agent-dir workflows the slug lives in the path, not the frontmatter.
   if (!agentSlug && wf.agentSlug) data.agentSlug = wf.agentSlug;
+  if (wf.project) data.project = wf.project;
+  if (wf.model) data.model = wf.model;
   if (Object.keys(wf.inputs).length > 0) data.inputs = wf.inputs;
   data.steps = wf.steps.map(serializeStep);
   if (wf.synthesis) data.synthesis = wf.synthesis;
@@ -510,6 +515,7 @@ function serializeStep(step: WorkflowStep): Record<string, unknown> {
   const kind = step.kind ?? 'prompt';
   if (kind !== 'prompt') out.kind = kind;
   if (step.mcp) out.mcp = step.mcp;
+  if (step.cli) out.cli = step.cli;
   if (step.channel) out.channel = step.channel;
   if (step.transform) out.transform = step.transform;
   if (step.conditional) out.conditional = step.conditional;
@@ -713,5 +719,7 @@ export function workflowFrontmatterString(wf: WorkflowDefinition): string {
   };
   if (wf.synthesis) data.synthesis = wf.synthesis;
   if (wf.agentSlug) data.agentSlug = wf.agentSlug;
+  if (wf.project) data.project = wf.project;
+  if (wf.model) data.model = wf.model;
   return yaml.dump(data);
 }

@@ -18,12 +18,15 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
 import { AGENTS_DIR, BASE_DIR, CRON_FILE } from '../config.js';
 import type { Gateway } from './router.js';
 import type { BrokenJob } from './failure-monitor.js';
+import { loadPromptOverrides, loadPromptOverridesForJob } from '../agent/prompt-overrides/loader.js';
+import { isCreditBalanceError } from './credit-guard.js';
 
 const logger = pino({ name: 'clementine.failure-diagnostics' });
 
@@ -97,6 +100,9 @@ export interface Diagnosis {
   };
   riskLevel: 'low' | 'medium' | 'high';
   generatedAt: string;
+  observedAt?: string;
+  lastRunAt?: string | null;
+  evidenceHash?: string;
 }
 
 interface DiagnosisCache {
@@ -144,14 +150,17 @@ function readJobDefinition(jobName: string): string | null {
     if (!existsSync(file)) continue;
     try {
       const raw = readFileSync(file, 'utf-8');
-      // Find the YAML block for "- name: bareName" and return until the next
-      // "- name:" at the same indent or end of file.
-      const pattern = new RegExp(
-        `^(  - name: ${bareName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$[\\s\\S]*?)(?=^  - name: |\\z)`,
-        'm',
-      );
-      const m = raw.match(pattern);
-      if (m) return m[1]!.slice(0, 6000);
+      const lines = raw.split('\n');
+      const start = lines.findIndex((line) => line.trim() === `- name: ${bareName}`);
+      if (start === -1) continue;
+      let end = lines.length;
+      for (let i = start + 1; i < lines.length; i++) {
+        if (/^  - name:\s+/.test(lines[i] ?? '')) {
+          end = i;
+          break;
+        }
+      }
+      return lines.slice(start, end).join('\n').slice(0, 6000);
     } catch { /* skip */ }
   }
   return null;
@@ -187,12 +196,15 @@ function readRecentRuns(jobName: string, limit = 10): string {
           durationMs: number;
           error?: string;
           outputPreview?: string;
+          terminalReason?: string;
           attempt?: number;
         };
-        const detail = d.status === 'ok'
-          ? `preview="${(d.outputPreview ?? '').slice(0, 120).replace(/\n/g, ' ')}"`
-          : `error="${(d.error ?? '').split('\n')[0]!.slice(0, 160)}"`;
-        return `${d.startedAt} ${d.status} (${Math.round(d.durationMs / 1000)}s) ${detail}`;
+        const detailParts = [
+          d.terminalReason ? `terminal=${d.terminalReason}` : '',
+          d.error ? `error="${d.error.split('\n')[0]!.slice(0, 160)}"` : '',
+          d.outputPreview ? `preview="${d.outputPreview.slice(0, 160).replace(/\n/g, ' ')}"` : '',
+        ].filter(Boolean);
+        return `${d.startedAt} ${d.status} (${Math.round(d.durationMs / 1000)}s) ${detailParts.join(' ')}`;
       } catch {
         return line.slice(0, 160);
       }
@@ -201,6 +213,47 @@ function readRecentRuns(jobName: string, limit = 10): string {
   } catch {
     return '(failed to read run log)';
   }
+}
+
+function activePromptOverrideText(jobName: string, agentSlug?: string, opts?: { baseDir?: string }): string {
+  try {
+    loadPromptOverrides(opts);
+    return loadPromptOverridesForJob(jobName, agentSlug, opts);
+  } catch {
+    return '';
+  }
+}
+
+function evidenceHashFor(broken: BrokenJob, jobDef: string | null, recentRuns: string, promptOverrides: string): string {
+  const payload = JSON.stringify({
+    jobName: broken.jobName,
+    lastErrorAt: broken.lastErrorAt,
+    lastErrors: broken.lastErrors,
+    circuitBreakerEngagedAt: broken.circuitBreakerEngagedAt,
+    lastAdvisorOpinion: broken.lastAdvisorOpinion,
+    jobDef: jobDef?.slice(0, 3000) ?? null,
+    recentRuns,
+    promptOverrides: promptOverrides.slice(0, 3000),
+  });
+  return createHash('sha256').update(payload).digest('hex');
+}
+
+function annotateDiagnosis(diagnosis: Diagnosis, broken: BrokenJob, evidenceHash: string): Diagnosis {
+  return {
+    ...diagnosis,
+    generatedAt: new Date().toISOString(),
+    observedAt: new Date().toISOString(),
+    lastRunAt: broken.lastErrorAt,
+    evidenceHash,
+  };
+}
+
+function cachedDiagnosisMatches(diagnosis: Diagnosis, broken: BrokenJob, evidenceHash: string): boolean {
+  const age = Date.now() - Date.parse(diagnosis.generatedAt);
+  if (!Number.isFinite(age) || age >= CACHE_TTL_MS) return false;
+  if (diagnosis.lastRunAt !== broken.lastErrorAt) return false;
+  if (diagnosis.evidenceHash !== evidenceHash) return false;
+  return true;
 }
 
 function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: string | null, recentRuns: string): string {
@@ -285,6 +338,148 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '  "riskLevel": "low|medium|high"',
     '}',
   ].filter(Boolean).join('\n');
+}
+
+function bareJobName(jobName: string): string {
+  return jobName.includes(':') ? jobName.split(':').slice(1).join(':') : jobName;
+}
+
+function promptOverrideForContextOverflow(jobName: string): AutoApplyPromptOverride {
+  return {
+    kind: 'prompt-override',
+    scope: 'job',
+    scopeKey: bareJobName(jobName),
+    content: [
+      '# Bounded Run Guidance',
+      '',
+      'Keep this job inside the context window.',
+      '- Do not read full CRON.md, full run histories, or raw integration exports.',
+      '- Pull records in batches of 20 or fewer unless the job prompt gives a smaller cap.',
+      '- Redirect large command/API output to temp files and summarize IDs, counts, names, statuses, and next actions only.',
+      '- Never paste raw integration, email, browser, tool, or other large JSON output into the conversation.',
+      '- If context starts filling, stop with a concise partial summary and pending list instead of retrying broad reads.',
+    ].join('\n'),
+  };
+}
+
+function hasContextOverflowPromptOverride(
+  jobName: string,
+  agentSlug?: string,
+  opts?: { baseDir?: string },
+): boolean {
+  const override = activePromptOverrideText(jobName, agentSlug, opts).toLowerCase();
+  return /bounded run guidance|context window|full run histories|raw integration exports|large json output/.test(override);
+}
+
+export function diagnoseKnownFailurePattern(
+  broken: BrokenJob,
+  jobDef: string | null,
+  recentRuns: string,
+  opts?: { baseDir?: string },
+): Diagnosis | null {
+  const haystack = [
+    broken.jobName,
+    broken.lastAdvisorOpinion ?? '',
+    ...broken.lastErrors,
+    recentRuns,
+  ].join('\n').toLowerCase();
+
+  if (isCreditBalanceError(haystack)) {
+    return {
+      rootCause: 'Claude is blocked by an org usage or billing limit, so this is not a job-definition failure.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'escalate_to_owner',
+        details: 'Keep background jobs paused until the Claude org usage limit resets or billing capacity is restored. Do not retry or auto-apply job fixes for this error.',
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (/rapid_refill_breaker|autocompact.*thrash|context refilled|prompt is too long|prompt too long|context.?length|maximum context|input is too long/.test(haystack)) {
+    if (hasContextOverflowPromptOverride(broken.jobName, broken.agentSlug, opts)) {
+      return {
+        rootCause: 'The job is still overflowing the Claude context window even though bounded-run prompt guidance is already active.',
+        confidence: 'high',
+        proposedFix: {
+          type: 'escalate_to_owner',
+          details: 'Do not apply another prompt override. Treat this as an engine/tool-surface issue: stop retrying the same broad unleashed phase, reduce the active tool surface or split the job, and inspect the latest phase trace.',
+        },
+        riskLevel: 'medium',
+        generatedAt: new Date().toISOString(),
+      };
+    }
+    const autoApply = jobDef ? promptOverrideForContextOverflow(broken.jobName) : undefined;
+    return {
+      rootCause: 'The job is overflowing the Claude context window. This is usually caused by broad file reads, full run-history reads, or raw integration output being pulled into the prompt.',
+      confidence: 'high',
+      proposedFix: {
+        type: autoApply ? 'prompt_override' : 'prompt_change',
+        details: 'Bound the job/diagnostic prompt: read tight chunks, cap batches at 20 records, summarize raw API output from temp files, and stop with a partial summary instead of retrying when context gets tight.',
+        ...(autoApply ? { autoApply } : {}),
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  const maxTurns = haystack.match(/maximum number of turns\s*\(?(\d+)?\)?|max_turns/i);
+  if (maxTurns) {
+    const observed = Number(maxTurns[1]);
+    const next = Number.isFinite(observed) && observed > 0 ? Math.min(90, Math.max(15, observed * 3)) : 30;
+    return {
+      rootCause: 'The job reached its turn cap before finishing.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'config_change',
+        details: `Raise max_turns to ${next} only if the prompt already keeps tool output bounded. If output is large, add bounded-output guidance first.`,
+        ...(jobDef ? {
+          autoApply: {
+            kind: 'cron',
+            operations: [{ op: 'set', field: 'max_turns', value: next }],
+          } satisfies AutoApplyCron,
+        } : {}),
+      },
+      riskLevel: 'medium',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (/\b(401|403)\b|not authenticated|invalid api key|credential|please run \/login|does not have access/.test(haystack)) {
+    return {
+      rootCause: 'The latest failures look credential-related.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'credential_refresh',
+        details: 'Refresh the affected integration credentials, then run a small probe before re-enabling full job volume.',
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (/no local bash|permission denied|blocked|task_blocked/.test(haystack)) {
+    const autoApply: AutoApplyPromptOverride | undefined = jobDef ? {
+      kind: 'prompt-override',
+      scope: 'job',
+      scopeKey: bareJobName(broken.jobName),
+      content: 'Use only tools available to this agent. If local shell access is unavailable, report BLOCKED with the missing capability and do not retry the same unavailable tool.',
+    } : undefined;
+    return {
+      rootCause: 'The job appears to be selecting a tool or capability that is unavailable in its current agent scope.',
+      confidence: 'medium',
+      proposedFix: {
+        type: autoApply ? 'prompt_override' : 'agent_scope',
+        details: 'Tighten the job prompt or agent scope so it only uses available tools, and make unavailable-tool failures stop instead of looping.',
+        ...(autoApply ? { autoApply } : {}),
+      },
+      riskLevel: 'medium',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  return null;
 }
 
 function parseResponse(raw: string): Diagnosis | null {
@@ -405,19 +600,32 @@ export async function diagnoseBrokenJob(
   broken: BrokenJob,
   gateway: Gateway,
 ): Promise<Diagnosis | null> {
-  const cache = loadCache();
-  const cached = cache[broken.jobName];
-  if (cached) {
-    const age = Date.now() - Date.parse(cached.generatedAt);
-    if (Number.isFinite(age) && age < CACHE_TTL_MS) {
-      logger.debug({ job: broken.jobName, ageMin: Math.round(age / 60000) }, 'Using cached diagnosis');
-      return cached;
-    }
-  }
-
   const jobDef = readJobDefinition(broken.jobName);
   const agentProfile = broken.agentSlug ? readAgentProfile(broken.agentSlug) : null;
   const recentRuns = readRecentRuns(broken.jobName, 10);
+  const activeOverrides = activePromptOverrideText(broken.jobName, broken.agentSlug);
+  const evidenceHash = evidenceHashFor(broken, jobDef, recentRuns, activeOverrides);
+  const cache = loadCache();
+  const cached = cache[broken.jobName];
+  if (cached && cachedDiagnosisMatches(cached, broken, evidenceHash)) {
+    const age = Date.now() - Date.parse(cached.generatedAt);
+    logger.debug({ job: broken.jobName, ageMin: Math.round(age / 60000) }, 'Using cached diagnosis');
+    return cached;
+  }
+
+  const knownDiagnosis = diagnoseKnownFailurePattern(broken, jobDef, recentRuns);
+  if (knownDiagnosis) {
+    const annotated = annotateDiagnosis(knownDiagnosis, broken, evidenceHash);
+    cache[broken.jobName] = annotated;
+    saveCache(cache);
+    logger.info({
+      job: broken.jobName,
+      confidence: annotated.confidence,
+      fixType: annotated.proposedFix.type,
+    }, 'Broken-job diagnosis generated from known pattern');
+    return annotated;
+  }
+
   const prompt = buildPrompt(broken, jobDef, agentProfile, recentRuns);
 
   let rawResponse: string;
@@ -428,6 +636,13 @@ export async function diagnoseBrokenJob(
       1,        // tier 1 — cheap
       5,        // maxTurns — diagnosis doesn't need tools typically
       'haiku',  // model — keep cost negligible
+      undefined,
+      'standard',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err, job: broken.jobName }, 'Diagnostic LLM call failed');
@@ -440,14 +655,15 @@ export async function diagnoseBrokenJob(
     return null;
   }
 
-  cache[broken.jobName] = diagnosis;
+  const annotated = annotateDiagnosis(diagnosis, broken, evidenceHash);
+  cache[broken.jobName] = annotated;
   saveCache(cache);
   logger.info({
     job: broken.jobName,
-    confidence: diagnosis.confidence,
-    fixType: diagnosis.proposedFix.type,
+    confidence: annotated.confidence,
+    fixType: annotated.proposedFix.type,
   }, 'Broken-job diagnosis generated');
-  return diagnosis;
+  return annotated;
 }
 
 /**

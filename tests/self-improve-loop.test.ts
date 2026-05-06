@@ -15,6 +15,7 @@ describe('classifyFailure', () => {
   it('recognizes autocompact thrashing as safe-cron-config', () => {
     const r = classifyFailure(['Autocompact is thrashing: the context refilled to the limit']);
     expect(r.category).toBe('safe-cron-config');
+    expect(r.fields).toEqual(['mode', 'max_hours']);
   });
 
   it('recognizes the old taskBudget rejection as no-op (already fixed in code)', () => {
@@ -98,7 +99,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     );
   }
 
-  it('auto-applies the unleashed fix and DMs the owning agent', async () => {
+  it('writes a safe cron-config proposal by default and DMs the owning agent', async () => {
     writeCronFile([
       { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'ross-the-sdr' },
     ]);
@@ -109,13 +110,18 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     const result = await loop.tick();
 
     expect(result.processed).toBe(1);
-    expect(result.applied).toBe(1);
+    expect(result.applied).toBe(0);
+    expect(result.pending).toBe(1);
 
-    // CRON.md was updated
+    // CRON.md was not edited without approval
     const updated = matter(readFileSync(cronPath, 'utf-8'));
     const job = (updated.data.jobs as Array<Record<string, unknown>>)[0];
-    expect(job.mode).toBe('unleashed');
-    expect(job.max_hours).toBe(1);
+    expect(job.mode).toBeUndefined();
+    expect(job.max_hours).toBeUndefined();
+    const proposals = readdirSync(pendingDir);
+    expect(proposals.length).toBe(1);
+    const proposal = JSON.parse(readFileSync(path.join(pendingDir, proposals[0]), 'utf-8'));
+    expect(proposal.category).toBe('safe-cron-config');
 
     // Trigger was removed
     expect(existsSync(path.join(triggersDir, 'market-leader-followup.json'))).toBe(false);
@@ -124,8 +130,31 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     expect(send).toHaveBeenCalledTimes(1);
     const [text, ctx] = send.mock.calls[0];
     expect(ctx?.agentSlug).toBe('ross-the-sdr');
-    expect(text).toMatch(/Auto-fixed/);
+    expect(text).toMatch(/Fix proposal saved/);
     expect(text).toMatch(/market-leader-followup/);
+  });
+
+  it('can opt into auto-applying the unleashed fix', async () => {
+    writeCronFile([
+      { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'ross-the-sdr' },
+    ]);
+    writeTrigger('market-leader-followup', ['Reached maximum number of turns (8)']);
+
+    const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
+    const loop = new SelfImproveLoop(
+      { send },
+      { triggersDir, pendingDir, cronPath, disableWatch: true, allowAutoApplySafeFixes: true },
+    );
+    const result = await loop.tick();
+
+    expect(result.applied).toBe(1);
+    const updated = matter(readFileSync(cronPath, 'utf-8'));
+    const job = (updated.data.jobs as Array<Record<string, unknown>>)[0];
+    expect(job.mode).toBe('unleashed');
+    expect(job.max_hours).toBe(1);
+    const [text, ctx] = send.mock.calls[0];
+    expect(ctx?.agentSlug).toBe('ross-the-sdr');
+    expect(text).toMatch(/Auto-fixed/);
   });
 
   it('treats clementine-owned jobs as un-scoped (Clementine main bot)', async () => {
@@ -235,7 +264,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
       expect(send).toHaveBeenCalled();
       const [text, ctx] = send.mock.calls[0];
       expect(ctx?.agentSlug).toBe('ross-the-sdr');
-      expect(text).toMatch(/Auto-fixed/);
+      expect(text).toMatch(/Fix proposal saved/);
     } finally {
       loop.stop();
     }
@@ -267,7 +296,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     );
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true, allowAutoApplySafeFixes: true });
     const result = await loop.tick();
 
     expect(result.applied).toBe(1);
@@ -306,7 +335,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     );
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true, allowAutoApplySafeFixes: true });
     const result = await loop.tick();
 
     expect(result.applied).toBe(1);
@@ -351,7 +380,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('b', ['Autocompact is thrashing']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true, allowAutoApplySafeFixes: true });
     const result = await loop.tick();
 
     expect(result.processed).toBe(2);

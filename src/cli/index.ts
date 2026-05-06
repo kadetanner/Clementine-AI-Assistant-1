@@ -39,6 +39,7 @@ import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
 import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, cmdBrowserConnect, maybePromptBrowserHarness } from './browser.js';
+import { parseEnvText } from '../config/env-parser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 import { registerLexiCommand } from '../lexi-dashboard/launch/lexi-cli.js';
 
@@ -88,6 +89,39 @@ function getLaunchdPlistPath(): string {
 
 function getSystemdServiceName(): string {
   return `${getAssistantName().toLowerCase()}.service`;
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function dirSizeBytes(dir: string): number {
+  if (!existsSync(dir)) return 0;
+  let total = 0;
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) total += dirSizeBytes(full);
+      else if (entry.isFile()) total += statSync(full).size;
+    }
+  } catch {
+    return total;
+  }
+  return total;
+}
+
+async function suppressStdout<T>(fn: () => Promise<T>): Promise<T> {
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  (process.stdout.write as unknown as (chunk: unknown, encoding?: unknown, cb?: unknown) => boolean) = () => true;
+  try {
+    return await fn();
+  } finally {
+    process.stdout.write = originalWrite as typeof process.stdout.write;
+  }
 }
 
 function getSystemdServicePath(): string {
@@ -289,6 +323,8 @@ async function cmdLaunch(options: { foreground?: boolean; install?: boolean; uni
     <string>${buildLaunchdPath()}</string>
     <key>CLEMENTINE_HOME</key>
     <string>${BASE_DIR}</string>
+    <key>CLEMENTINE_LAUNCHD_MANAGED</key>
+    <string>1</string>
   </dict>
 </dict>
 </plist>`;
@@ -824,6 +860,24 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     console.log(`  ${DIM}  ○  memory database (created on first launch)${RESET}`);
   }
 
+  // Local dense embedding model cache. Doctor does a cheap filesystem check;
+  // `--fix` runs the real model probe/installer so users can verify the model
+  // without needing to know the hidden Transformers.js cache mechanics.
+  const modelCacheDir = path.join(BASE_DIR, 'models');
+  const modelCacheBytes = dirSizeBytes(modelCacheDir);
+  if (modelCacheBytes >= 1024 * 1024) {
+    console.log(`  ${GREEN}OK${RESET}  local embedding model cache (${formatBytes(modelCacheBytes)})`);
+    console.log(`       ${DIM}Verify load: clementine memory model status --probe${RESET}`);
+  } else {
+    console.log(`  ${YELLOW}WARN${RESET}  local embedding model not installed/verified`);
+    const installCmd = `"${process.execPath}" "${path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js')}" memory model install`;
+    if (!tryFix('local embedding model', installCmd, { cwd: PACKAGE_ROOT, timeout: 10 * 60_000 })) {
+      console.log(`       Install: ${CYAN}clementine memory model install${RESET}`);
+      console.log(`       Auto-prefetch on updates: ${CYAN}clementine config set CLEMENTINE_PREFETCH_EMBEDDINGS 1${RESET}`);
+      issues++;
+    }
+  }
+
   // Channel tokens (informational)
   if (existsSync(ENV_PATH)) {
     const env = readFileSync(ENV_PATH, 'utf-8');
@@ -950,7 +1004,7 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
   console.log();
 }
 
-function cmdConfigSet(key: string, value: string): void {
+function upsertEnvValue(key: string, value: string): void {
   ensureDataHome();
 
   let content = '';
@@ -971,6 +1025,19 @@ function cmdConfigSet(key: string, value: string): void {
   // hardening also fixes pre-existing .env files via `clementine config
   // harden-permissions`.
   writeFileSync(ENV_PATH, content, { mode: 0o600 });
+}
+
+function removeEnvValue(key: string): void {
+  if (!existsSync(ENV_PATH)) return;
+  const upperKey = key.toUpperCase();
+  const content = readFileSync(ENV_PATH, 'utf-8');
+  const lines = content.split(/\r?\n/).filter(line => !new RegExp(`^${upperKey}=`).test(line));
+  writeFileSync(ENV_PATH, lines.join('\n').trimEnd() + '\n', { mode: 0o600 });
+}
+
+function cmdConfigSet(key: string, value: string): void {
+  const upperKey = key.toUpperCase();
+  upsertEnvValue(upperKey, value);
   console.log(`  Set ${upperKey}=${value}`);
 }
 
@@ -1020,6 +1087,232 @@ function cmdConfigList(): void {
     }
   }
   console.log();
+}
+
+// ── Budgets ─────────────────────────────────────────────────────────
+
+const SAFE_BACKGROUND_BUDGETS = [
+  { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'heartbeat' },
+  { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'tier-1 cron' },
+  { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'tier-2 cron' },
+] as const;
+
+const BUDGET_ALIASES: Record<string, string> = {
+  chat: 'BUDGET_CHAT_USD',
+  heartbeat: 'BUDGET_HEARTBEAT_USD',
+  hb: 'BUDGET_HEARTBEAT_USD',
+  cron1: 'BUDGET_CRON_T1_USD',
+  'cron-1': 'BUDGET_CRON_T1_USD',
+  cront1: 'BUDGET_CRON_T1_USD',
+  'cron-t1': 'BUDGET_CRON_T1_USD',
+  t1: 'BUDGET_CRON_T1_USD',
+  cron2: 'BUDGET_CRON_T2_USD',
+  'cron-2': 'BUDGET_CRON_T2_USD',
+  cront2: 'BUDGET_CRON_T2_USD',
+  'cron-t2': 'BUDGET_CRON_T2_USD',
+  t2: 'BUDGET_CRON_T2_USD',
+};
+
+type OneMillionCliMode = 'auto' | 'off' | 'on';
+
+function normalizeOneMillionCliMode(value: unknown): OneMillionCliMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'auto') return 'auto';
+  if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+  if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+  return null;
+}
+
+function legacyDisableToOneMillionCliMode(value: unknown): OneMillionCliMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+  if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+  return null;
+}
+
+function normalizeBudgetKey(name: string): string | null {
+  const raw = name.trim();
+  const upper = raw.toUpperCase();
+  if (upper === 'BUDGET_CHAT_USD' || upper === 'BUDGET_HEARTBEAT_USD' || upper === 'BUDGET_CRON_T1_USD' || upper === 'BUDGET_CRON_T2_USD') {
+    return upper;
+  }
+  return BUDGET_ALIASES[raw.toLowerCase()] ?? null;
+}
+
+function formatBudgetValue(value: unknown): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  return `$${n.toFixed(2)}`;
+}
+
+function readPersistedEnvValue(key: string): string | undefined {
+  if (!existsSync(ENV_PATH)) return undefined;
+  try {
+    return parseEnvText(readFileSync(ENV_PATH, 'utf-8'))[key];
+  } catch {
+    return undefined;
+  }
+}
+
+async function cmdBudgetsShow(): Promise<void> {
+  const { computeEffectiveConfig } = await import('../config/effective-config.js');
+  const cfg = computeEffectiveConfig(BASE_DIR);
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RESET = '\x1b[0m';
+
+  const rows = [
+    ['chat', 'BUDGET_CHAT_USD'],
+    ['heartbeat', 'BUDGET_HEARTBEAT_USD'],
+    ['tier-1 cron', 'BUDGET_CRON_T1_USD'],
+    ['tier-2 cron', 'BUDGET_CRON_T2_USD'],
+  ] as const;
+
+  console.log();
+  console.log(`  ${BOLD}Clementine budgets${RESET}`);
+  console.log(`  ${DIM}Data home: ${cfg.baseDir}${RESET}`);
+  console.log();
+
+  for (const [label, key] of rows) {
+    const entry = byKey.get(key);
+    const source = entry?.source ?? 'unknown';
+    console.log(`  ${label.padEnd(12)} ${BOLD}${formatBudgetValue(entry?.value).padEnd(8)}${RESET} ${DIM}${key} from ${source}${RESET}`);
+  }
+
+  const oneMModeEntry = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
+  const persistedOneMMode = readPersistedEnvValue('CLEMENTINE_1M_CONTEXT_MODE');
+  const oneMMode = normalizeOneMillionCliMode(persistedOneMMode ?? oneMModeEntry?.value)
+    ?? 'auto';
+  const oneMModeSource = persistedOneMMode !== undefined ? '.env' : oneMModeEntry?.source ?? 'default';
+
+  const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  const persistedOneM = readPersistedEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  const oneMValue = persistedOneM ?? oneM?.value;
+  const oneMSource = persistedOneM !== undefined ? '.env' : oneM?.source ?? 'unknown';
+  const legacyMode = legacyDisableToOneMillionCliMode(oneMValue);
+  console.log();
+  const modeColor = oneMMode === 'off' ? GREEN : oneMMode === 'on' ? YELLOW : BOLD;
+  console.log(`  1M context   ${modeColor}${oneMMode}${RESET} ${DIM}CLEMENTINE_1M_CONTEXT_MODE=${String(persistedOneMMode ?? oneMModeEntry?.value ?? 'auto')} from ${oneMModeSource}${RESET}`);
+  if (legacyMode && oneMModeEntry?.source === 'default') {
+    console.log(`               ${DIM}legacy CLAUDE_CODE_DISABLE_1M_CONTEXT=${String(oneMValue ?? '')} from ${oneMSource} maps to mode=${legacyMode}${RESET}`);
+  }
+  if (oneMMode === 'auto') {
+    console.log(`               ${DIM}allows included Opus 1M on Max/Team/Enterprise; keeps Sonnet on 200K unless mode=on${RESET}`);
+  } else if (oneMMode === 'on') {
+    console.log(`  ${YELLOW}Note:${RESET} forced 1M requires Extra Usage for Sonnet and for Pro subscriptions.`);
+  }
+  console.log();
+  console.log(`  ${DIM}Useful commands:${RESET}`);
+  console.log(`    clementine budgets safe        ${DIM}lower background budgets and force 200K context${RESET}`);
+  console.log(`    clementine budgets 1m auto     ${DIM}allow included Opus 1M, keep Sonnet safe${RESET}`);
+  console.log(`    clementine budgets 1m on       ${DIM}force 1M context for Extra Usage/API users${RESET}`);
+  console.log(`    clementine budgets 1m off      ${DIM}disable 1M context for maximum compatibility${RESET}`);
+  console.log(`    clementine budgets set chat 10 ${DIM}raise one budget cap${RESET}`);
+  console.log();
+}
+
+async function cmdBudgetsSafe(): Promise<void> {
+  const { computeEffectiveConfig } = await import('../config/effective-config.js');
+  const cfg = computeEffectiveConfig(BASE_DIR);
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const YELLOW = '\x1b[0;33m';
+  const GREEN = '\x1b[0;32m';
+  const RESET = '\x1b[0m';
+
+  const writes = [
+    ...SAFE_BACKGROUND_BUDGETS,
+    { key: 'CLEMENTINE_1M_CONTEXT_MODE', value: 'off', label: '1M context mode' },
+    { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', value: '1', label: '1M context disabled' },
+  ];
+
+  for (const item of writes) {
+    upsertEnvValue(item.key, item.value);
+  }
+
+  console.log();
+  console.log(`  ${GREEN}Applied safe budget preset.${RESET}`);
+  for (const item of writes) {
+    const entry = byKey.get(item.key);
+    const runtimeOverride = entry?.source === 'process.env' && String(entry.value) !== item.value
+      ? ` ${YELLOW}(process.env still overrides until unset)${RESET}`
+      : '';
+    console.log(`  ${BOLD}${item.key}${RESET}=${item.value} ${DIM}${item.label}${RESET}${runtimeOverride}`);
+  }
+  console.log(`  ${DIM}Interactive chat budget is left unchanged. Restart Clementine for running daemons to pick this up.${RESET}`);
+  console.log();
+}
+
+function cmdBudgetsOneMillion(mode: string): void {
+  const normalized = mode.trim().toLowerCase();
+  const on = new Set(['on', 'enable', 'enabled', 'yes', 'true', '1']);
+  const off = new Set(['off', 'disable', 'disabled', 'no', 'false', '0']);
+  const auto = new Set(['auto', 'smart', 'default']);
+
+  if (!on.has(normalized) && !off.has(normalized) && !auto.has(normalized)) {
+    console.error('  Usage: clementine budgets 1m <auto|on|off>');
+    process.exitCode = 1;
+    return;
+  }
+
+  if (auto.has(normalized)) {
+    upsertEnvValue('CLEMENTINE_1M_CONTEXT_MODE', 'auto');
+    removeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+    console.log();
+    console.log('  Set Claude 1M context mode to auto.');
+    console.log('  Opus can use included 1M on Max/Team/Enterprise; Sonnet stays on 200K unless you force mode=on. Restart Clementine to apply.');
+    console.log();
+    return;
+  }
+
+  const enable = on.has(normalized);
+  upsertEnvValue('CLEMENTINE_1M_CONTEXT_MODE', enable ? 'on' : 'off');
+  upsertEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', enable ? '0' : '1');
+
+  if (enable) {
+    console.log();
+    console.log('  Forced Claude 1M context on for Clementine.');
+    console.log('  Requires Extra Usage for Sonnet and Pro subscriptions, or API/PAYG billing. Restart Clementine to apply.');
+    console.log();
+  } else {
+    console.log();
+    console.log('  Disabled Claude 1M context for Clementine.');
+    console.log('  This is the safest recovery mode for users hitting 1M entitlement errors. Restart Clementine to apply.');
+    console.log();
+  }
+}
+
+function cmdBudgetsSet(name: string, value: string): void {
+  if (['1m', 'context', 'context1m'].includes(name.trim().toLowerCase())) {
+    cmdBudgetsOneMillion(value);
+    return;
+  }
+
+  const key = normalizeBudgetKey(name);
+  if (!key) {
+    console.error('  Unknown budget. Use: chat, heartbeat, cron1, or cron2.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) {
+    console.error('  Budget value must be a non-negative number, for example: clementine budgets set chat 10');
+    process.exitCode = 1;
+    return;
+  }
+
+  upsertEnvValue(key, String(amount));
+  console.log(`  Set ${key}=${amount}`);
+  console.log('  Restart Clementine to apply this to a running daemon.');
 }
 
 // ── Config show ──────────────────────────────────────────────────────
@@ -1104,12 +1397,13 @@ async function cmdConfigShow(opts: { json?: boolean; group?: string }): Promise<
 
 // ── Config doctor ────────────────────────────────────────────────────
 
-async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
-  const { runDoctor } = await import('../config/config-doctor.js');
+async function cmdConfigDoctor(opts: { json?: boolean; fix?: boolean }): Promise<void> {
+  const { applyDoctorFixes, runDoctor } = await import('../config/config-doctor.js');
+  const fixResult = opts.fix ? applyDoctorFixes(BASE_DIR) : { changed: [], skipped: [] };
   const report = runDoctor(BASE_DIR);
 
   if (opts.json) {
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ ...report, appliedFixes: fixResult }, null, 2));
     process.exit(report.exitCode);
   }
 
@@ -1128,6 +1422,16 @@ async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
   console.log(`  ${BOLD}.env present:${RESET}     ${report.hasEnvFile ? GREEN + 'yes' : DIM + 'no'}${RESET}`);
   console.log(`  ${BOLD}clementine.json:${RESET}  ${report.hasJsonFile ? GREEN + 'present' : DIM + 'missing'}${RESET}`);
   console.log();
+
+  if (opts.fix) {
+    for (const f of fixResult.changed) {
+      console.log(`  ${GREEN}✓${RESET} Set ${BOLD}${f.key}${RESET}=${f.value} ${DIM}— ${f.reason}${RESET}`);
+    }
+    for (const f of fixResult.skipped) {
+      console.log(`  ${YELLOW}⚠${RESET} ${BOLD}${f.key}${RESET} not auto-fixed: ${f.reason}`);
+    }
+    if (fixResult.changed.length > 0 || fixResult.skipped.length > 0) console.log();
+  }
 
   if (report.findings.length === 0) {
     console.log(`  ${GREEN}✓ All checks passed.${RESET}`);
@@ -2233,7 +2537,8 @@ configCmd
   .command('doctor')
   .description('Validate config: stale keychain refs, type errors, missing channel deps')
   .option('--json', 'Emit machine-readable JSON instead of a checklist')
-  .action(async (opts: { json?: boolean }) => {
+  .option('--fix', 'Apply safe local config fixes for common broken overrides')
+  .action(async (opts: { json?: boolean; fix?: boolean }) => {
     await cmdConfigDoctor(opts);
   });
 
@@ -2287,6 +2592,37 @@ configCmd
       console.error(`  Failed to open editor: ${editor}`);
     }
   });
+
+const budgetsCmd = program
+  .command('budgets')
+  .description('View and tune spend budgets and Claude 1M context behavior')
+  .action(async () => {
+    await cmdBudgetsShow();
+  });
+
+budgetsCmd
+  .command('show')
+  .description('Show budget caps, 1M context state, and config provenance')
+  .action(async () => {
+    await cmdBudgetsShow();
+  });
+
+budgetsCmd
+  .command('safe')
+  .description('Apply the stable local-safe preset: lower background budgets and force 200K context')
+  .action(async () => {
+    await cmdBudgetsSafe();
+  });
+
+budgetsCmd
+  .command('1m <mode>')
+  .description('Set Claude 1M context mode for Clementine (auto | on | off)')
+  .action(cmdBudgetsOneMillion);
+
+budgetsCmd
+  .command('set <name> <value>')
+  .description('Set a budget cap: chat, heartbeat, cron1, or cron2')
+  .action(cmdBudgetsSet);
 
 // ── Skills commands ─────────────────────────────────────────────────
 //
@@ -2795,6 +3131,129 @@ memoryCmd
   });
 
 memoryCmd
+  .command('diagnose')
+  .description('Read-only memory diagnostics: core-memory population, retrieval traces, dense coverage, supersession, and match-type signals')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      if (!existsSync(DB_PATH)) {
+        const diagnosis = {
+          generatedAt: new Date().toISOString(),
+          dbPath: DB_PATH,
+          dbExists: false,
+          recommendations: ['Start Clementine or run a vault sync so the memory database is created.'],
+        };
+        if (opts.json) {
+          console.log(JSON.stringify(diagnosis, null, 2));
+        } else {
+          console.log();
+          console.log(`  ${BOLD}Memory diagnostics${RESET}  ${DIM}${DB_PATH}${RESET}`);
+          console.log(`  ${YELLOW}memory database not found${RESET}`);
+          console.log(`  ${DIM}Start Clementine or run a vault sync so the memory database is created.${RESET}`);
+          console.log();
+        }
+        return;
+      }
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const stats = store.getMemoryStats();
+      const health = store.getMemoryHealth({ topCitedLimit: 5 });
+      const graphStats = store.getGraphStats({ topN: 8, lookbackHours: 24 * 7 });
+      const supersedes = store.getSupersedeStats();
+      const denseCoverage = stats.totalChunks > 0 ? stats.chunksWithDenseEmbeddings / stats.totalChunks : 0;
+      const missingDense = health.lastIntegrityReport?.missingEmbeddings ?? Math.max(0, stats.totalChunks - stats.chunksWithDenseEmbeddings);
+      const recommendations: string[] = [];
+      if (stats.totalChunks > 0 && denseCoverage < 0.95) {
+        recommendations.push('Run `clementine memory reembed` or use Brain -> Health backfill to improve dense recall coverage.');
+      }
+      if (health.userModelSlots.populated === 0) {
+        recommendations.push('Seed or edit the User Model so core facts load into every conversation.');
+      }
+      if (health.recentActivity.recallTracesLast7d === 0) {
+        recommendations.push('No recall traces in the last 7 days; verify chat retrieval is enabled and recent turns are logging traces.');
+      }
+      if (!health.lastIntegrityReport) {
+        recommendations.push('No recent integrity report found; run Brain -> Health cleanup or wait for the janitor cycle.');
+      }
+
+      const diagnosis = {
+        generatedAt: new Date().toISOString(),
+        dbPath: DB_PATH,
+        chunks: {
+          total: stats.totalChunks,
+          pinned: stats.pinnedChunks,
+          softDeleted: health.chunks.softDeleted,
+          superseded: supersedes.superseded,
+          avgSalience: stats.avgSalience,
+        },
+        denseEmbeddings: {
+          withDense: stats.chunksWithDenseEmbeddings,
+          total: stats.totalChunks,
+          coverage: denseCoverage,
+          missingDense,
+          models: stats.denseEmbeddingModels,
+          ready: health.denseEmbeddings.ready,
+          currentModel: health.denseEmbeddings.currentModel,
+        },
+        userModel: health.userModelSlots,
+        recallActivity: health.recentActivity,
+        retrievalSignals: {
+          lookbackHours: 24 * 7,
+          tracesAnalyzed: graphStats.tracesAnalyzed,
+          contributionByType: graphStats.recallContributionByType,
+          wikilinkCount: graphStats.wikilinkCount,
+        },
+        integrity: health.lastIntegrityReport,
+        recommendations,
+      };
+
+      if (opts.json) {
+        console.log(JSON.stringify(diagnosis, null, 2));
+        return;
+      }
+
+      const densePct = `${(denseCoverage * 100).toFixed(1)}%`;
+      const denseColor = denseCoverage >= 0.95 ? GREEN : denseCoverage >= 0.5 ? YELLOW : RED;
+      console.log();
+      console.log(`  ${BOLD}Memory diagnostics${RESET}  ${DIM}${DB_PATH}${RESET}`);
+      console.log();
+      console.log(`  Chunks:              ${BOLD}${stats.totalChunks.toLocaleString()}${RESET} total · ${health.chunks.softDeleted} soft-deleted · ${supersedes.superseded} superseded · ${stats.pinnedChunks} pinned`);
+      console.log(`  Dense coverage:      ${denseColor}${densePct}${RESET} ${DIM}(${stats.chunksWithDenseEmbeddings.toLocaleString()}/${stats.totalChunks.toLocaleString()}, missing ${missingDense.toLocaleString()})${RESET}`);
+      console.log(`  Dense model ready:   ${health.denseEmbeddings.ready ? `${GREEN}yes${RESET}` : `${YELLOW}no${RESET}`} ${DIM}${health.denseEmbeddings.currentModel}${RESET}`);
+      console.log(`  User model:          ${health.userModelSlots.populated}/${health.userModelSlots.total} populated ${DIM}(${health.userModelSlots.global} global, ${health.userModelSlots.agentScoped} agent-scoped)${RESET}`);
+      console.log(`  Recall traces:       ${health.recentActivity.recallTracesLast7d} last 7d · ${health.recentActivity.recallTracesLast30d} last 30d`);
+      const contribution = Object.entries(graphStats.recallContributionByType)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k}:${v}`)
+        .join(', ') || 'none yet';
+      console.log(`  Retrieval signals:   ${CYAN}${contribution}${RESET} ${DIM}(${graphStats.tracesAnalyzed} traces analyzed)${RESET}`);
+      if (health.lastIntegrityReport) {
+        console.log(`  Integrity:           ${health.lastIntegrityReport.ftsOk ? `${GREEN}FTS ok${RESET}` : `${RED}FTS issue${RESET}`} · orphans nulled ${health.lastIntegrityReport.orphanRefsNulled} · ran ${health.lastIntegrityReport.ranAt}`);
+      } else {
+        console.log(`  Integrity:           ${YELLOW}no recent report${RESET}`);
+      }
+      if (recommendations.length > 0) {
+        console.log();
+        console.log(`  ${BOLD}Recommendations${RESET}`);
+        for (const r of recommendations) console.log(`    - ${r}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  Error diagnosing memory: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
   .command('pin <chunkId>')
   .description('Pin a chunk — gives its score a 2x boost in recall (use chunk IDs from `memory search`)')
   .action(async (chunkIdStr: string) => {
@@ -2852,12 +3311,129 @@ memoryCmd
     }
   });
 
+const memoryModelCmd = memoryCmd
+  .command('model')
+  .description('Inspect or install the local dense embedding model used for semantic recall');
+
+memoryModelCmd
+  .command('status')
+  .description('Show whether the local dense embedding model is cached and optionally verify it loads')
+  .option('--probe', 'Load the model to verify the cache is usable; first run may download weights')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { probe?: boolean; json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      if (opts.json) process.env.CLEMENTINE_EMBEDDINGS_LOG_LEVEL = process.env.CLEMENTINE_EMBEDDINGS_LOG_LEVEL || 'silent';
+      const embeddings = await import('../memory/embeddings.js');
+      const cacheDir = embeddings.denseModelCacheDir();
+      const cacheBytes = dirSizeBytes(cacheDir);
+      const probeRan = !!opts.probe;
+      let ready = embeddings.isDenseReady();
+      if (opts.probe) {
+        ready = opts.json
+          ? await suppressStdout(() => embeddings.probeDenseReady())
+          : await embeddings.probeDenseReady();
+      }
+      const status = {
+        model: embeddings.currentDenseModel(),
+        dimension: embeddings.denseDimension(),
+        cacheDir,
+        cacheExists: existsSync(cacheDir),
+        cacheBytes,
+        cacheSize: formatBytes(cacheBytes),
+        readyInThisProcess: embeddings.isDenseReady(),
+        verified: probeRan ? ready : false,
+        probeRan,
+      };
+      if (opts.json) {
+        console.log(JSON.stringify(status, null, 2));
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}Local embedding model${RESET}`);
+      console.log(`  Model:       ${status.model}`);
+      console.log(`  Dimension:   ${status.dimension}`);
+      console.log(`  Cache:       ${status.cacheExists ? `${GREEN}${status.cacheSize}${RESET}` : `${YELLOW}missing${RESET}`} ${DIM}${cacheDir}${RESET}`);
+      if (probeRan) {
+        console.log(`  Load check:  ${ready ? `${GREEN}verified${RESET}` : `${RED}failed${RESET}`}`);
+      } else {
+        console.log(`  Load check:  ${DIM}not run (use --probe to verify)${RESET}`);
+      }
+      if (!status.cacheExists || status.cacheBytes < 1024 * 1024) {
+        console.log();
+        console.log(`  ${DIM}Install with: clementine memory model install${RESET}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error reading model status${RESET}: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryModelCmd
+  .command('install')
+  .description('Download/cache and verify the local dense embedding model; optionally backfill memory chunks')
+  .option('--model <id>', 'Override embedding model id (default: Snowflake/snowflake-arctic-embed-m-v1.5)')
+  .option('--backfill', 'After installing, backfill dense embeddings for existing chunks')
+  .option('--limit <n>', 'Backfill at most N chunks when --backfill is used')
+  .action(async (opts: { model?: string; backfill?: boolean; limit?: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      if (opts.model) process.env.EMBEDDING_DENSE_MODEL = opts.model;
+      const embeddings = await import('../memory/embeddings.js');
+      console.log();
+      console.log(`  ${BOLD}Installing local embedding model${RESET}`);
+      console.log(`  Model: ${embeddings.currentDenseModel()}`);
+      console.log(`  Cache: ${embeddings.denseModelCacheDir()}`);
+      console.log(`  ${DIM}First run may download model weights; later runs use the local cache.${RESET}`);
+      const ready = await embeddings.probeDenseReady();
+      if (!ready) {
+        console.error(`  ${RED}Failed to load dense embedding model.${RESET}`);
+        console.error(`  ${DIM}Check network access for the first download, then re-run this command.${RESET}`);
+        process.exit(1);
+      }
+      const cacheBytes = dirSizeBytes(embeddings.denseModelCacheDir());
+      console.log(`  ${GREEN}✓${RESET} Model ready (${embeddings.denseDimension()}-dim, ${formatBytes(cacheBytes)} cached).`);
+
+      if (opts.backfill) {
+        const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+        const { MemoryStore } = await import('../memory/store.js');
+        const VAULT_DIR = path.join(BASE_DIR, 'vault');
+        const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+        const store = new MemoryStore(DB_PATH, VAULT_DIR);
+        store.initialize();
+        console.log();
+        console.log(`  ${BOLD}Backfilling memory chunks${RESET}${limit ? ` ${DIM}(limit ${limit})${RESET}` : ''}`);
+        const result = await store.backfillDenseEmbeddings({ limit });
+        console.log(`  ${GREEN}✓${RESET} Embedded ${result.embedded.toLocaleString()} chunk${result.embedded === 1 ? '' : 's'}.`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Failed ${result.failed.toLocaleString()} chunk${result.failed === 1 ? '' : 's'}.`);
+        }
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error installing model${RESET}: ${err}`);
+      process.exit(1);
+    }
+  });
+
 memoryCmd
   .command('reembed')
-  .description('Backfill dense neural embeddings for all chunks (or all stale chunks if model changed). Default model: Snowflake/snowflake-arctic-embed-m-v1.5 — first run downloads ~440MB to ~/.clementine/models/.')
-  .option('--limit <n>', 'Max chunks to embed in this run (default: all)')
+  .description('Backfill dense neural embeddings for chunks and/or transcripts. Default model: Snowflake/snowflake-arctic-embed-m-v1.5 — first run downloads ~440MB to ~/.clementine/models/.')
+  .option('--limit <n>', 'Max items to embed in this run (default: all)')
   .option('--model <id>', 'Override embedding model id (e.g. Xenova/bge-base-en-v1.5)')
-  .action(async (opts: { limit?: string; model?: string }) => {
+  .option('--target <kind>', 'What to backfill: chunks | transcripts | all', 'all')
+  .action(async (opts: { limit?: string; model?: string; target?: string }) => {
     const BOLD = '\x1b[1m';
     const DIM = '\x1b[0;90m';
     const GREEN = '\x1b[0;32m';
@@ -2868,6 +3444,11 @@ memoryCmd
       if (opts.model) {
         process.env.EMBEDDING_DENSE_MODEL = opts.model;
       }
+      const target = (opts.target ?? 'all').toLowerCase();
+      if (!['chunks', 'transcripts', 'all'].includes(target)) {
+        console.error(`  ${RED}Invalid --target${RESET}: "${opts.target}". Use chunks | transcripts | all.`);
+        process.exit(1);
+      }
       const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
       const { MemoryStore } = await import('../memory/store.js');
       const embeddings = await import('../memory/embeddings.js');
@@ -2877,7 +3458,7 @@ memoryCmd
       store.initialize();
 
       console.log();
-      console.log(`  ${BOLD}Dense embedding backfill${RESET}`);
+      console.log(`  ${BOLD}Dense embedding backfill${RESET} ${DIM}(target: ${target})${RESET}`);
       console.log(`  Model: ${embeddings.currentDenseModel()}`);
       console.log(`  ${DIM}Loading model (first run downloads ~440MB)…${RESET}`);
       const ready = await embeddings.probeDenseReady();
@@ -2889,27 +3470,62 @@ memoryCmd
       console.log(`  ${GREEN}✓${RESET} Model ready (${embeddings.denseDimension()}-dim).`);
       console.log();
 
-      const startTime = Date.now();
-      let lastReport = 0;
-      const result = await store.backfillDenseEmbeddings({
-        limit,
-        onProgress: (done, total) => {
-          // Throttle to avoid spamming
+      const reportProgress = (label: string, startTime: number) => {
+        let lastReport = 0;
+        return (done: number, total: number) => {
           const now = Date.now();
           if (now - lastReport < 500 && done < total) return;
           lastReport = now;
           const pct = total > 0 ? Math.round((done / total) * 100) : 0;
           const elapsed = Math.round((now - startTime) / 1000);
-          process.stdout.write(`\r  Progress: ${BOLD}${done.toLocaleString()}${RESET}/${total.toLocaleString()} (${pct}%) ${DIM}${elapsed}s${RESET}    `);
-        },
-      });
-      process.stdout.write('\n\n');
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} chunks ${DIM}(${elapsed}s elapsed)${RESET}`);
-      if (result.failed > 0) {
-        console.log(`  ${YELLOW}!${RESET} Failed: ${result.failed.toLocaleString()} ${DIM}(model returned null — usually empty or invalid input)${RESET}`);
+          process.stdout.write(`\r  ${label}: ${BOLD}${done.toLocaleString()}${RESET}/${total.toLocaleString()} (${pct}%) ${DIM}${elapsed}s${RESET}    `);
+        };
+      };
+
+      let totalEmbedded = 0;
+      let totalFailed = 0;
+      let lastModel = '';
+
+      if (target === 'chunks' || target === 'all') {
+        const startTime = Date.now();
+        const result = await store.backfillDenseEmbeddings({
+          limit,
+          onProgress: reportProgress('Chunks', startTime),
+        });
+        process.stdout.write('\n');
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} chunks ${DIM}(${elapsed}s elapsed)${RESET}`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Chunk failures: ${result.failed.toLocaleString()}`);
+        }
+        totalEmbedded += result.embedded;
+        totalFailed += result.failed;
+        lastModel = result.model;
       }
-      console.log(`  Model: ${result.model}`);
+
+      if (target === 'transcripts' || target === 'all') {
+        const startTime = Date.now();
+        const result = await store.backfillTranscriptDenseEmbeddings({
+          limit,
+          onProgress: reportProgress('Transcripts', startTime),
+        });
+        process.stdout.write('\n');
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} transcripts ${DIM}(${elapsed}s elapsed)${RESET}`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Transcript failures: ${result.failed.toLocaleString()}`);
+        }
+        totalEmbedded += result.embedded;
+        totalFailed += result.failed;
+        lastModel = result.model;
+      }
+
+      console.log();
+      console.log(`  Total embedded: ${BOLD}${totalEmbedded.toLocaleString()}${RESET}`);
+      if (totalFailed > 0) {
+        console.log(`  ${DIM}(model returned null on ${totalFailed.toLocaleString()} — usually empty or invalid input)${RESET}`);
+      }
+      console.log(`  Model: ${lastModel}`);
       console.log();
       console.log(`  ${DIM}Run \`clementine memory status\` to see updated coverage.${RESET}`);
       console.log();

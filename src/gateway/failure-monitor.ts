@@ -31,6 +31,7 @@ import pino from 'pino';
 import { BASE_DIR, MEMORY_DB_PATH } from '../config.js';
 import type { CronRunEntry } from '../types.js';
 import { logAuditJsonl } from '../agent/hooks.js';
+import { classifyRunHealth, isRunHealthFailure } from './job-health.js';
 
 const logger = pino({ name: 'clementine.failure-monitor' });
 
@@ -113,6 +114,7 @@ function readRunLog(filePath: string): CronRunEntry[] {
 }
 
 function isFailure(entry: CronRunEntry, gradeCache?: Map<string, boolean>): boolean {
+  if (isRunHealthFailure(entry)) return true;
   if (entry.status === 'error' || entry.status === 'retried') return true;
   if (isSemanticFailure(entry)) return true;
   // Outcome grader verdict, if we have one for this (job, time) tuple.
@@ -172,10 +174,14 @@ function isSemanticFailure(entry: CronRunEntry): boolean {
 
   // Match on word boundaries so "BLOCKED" matches "Result: BLOCKED" but
   // "blockedBy" in a stray JSON fragment doesn't.
+  //
+  // __NOTHING__ is the explicit "nothing to report" sentinel from the cron
+  // prompt (assistant.ts runCronJob). It's a successful empty-result, not a
+  // failure — flagging it here made every quiet inbox check look broken to
+  // the proactive insight engine.
   const markerRegexes = [
     /\b(blocked|task_blocked|task_incomplete)\b/,
     /\b(failed|could not|unable to|no local bash|permission denied)\b/,
-    /__nothing__/,
   ];
   for (const re of markerRegexes) {
     if (re.test(previewLower)) return true;
@@ -257,7 +263,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     if (cb.engagedAt) {
       const engagedMs = Date.parse(cb.engagedAt);
       const hasOkSinceBreaker = entries.some(e =>
-        e.status === 'ok' && Date.parse(e.startedAt) > engagedMs,
+        !isRunHealthFailure(e) && Date.parse(e.startedAt) > engagedMs,
       );
       if (hasOkSinceBreaker) {
         cb = { engagedAt: null, lastOpinion: cb.lastOpinion };
@@ -300,7 +306,12 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     const distinctErrors: string[] = [];
     const seen = new Set<string>();
     for (let i = errSource.length - 1; i >= 0 && distinctErrors.length < 3; i--) {
-      const err = (errSource[i]!.error ?? '').trim();
+      const entry = errSource[i]!;
+      const health = classifyRunHealth(entry);
+      const healthEvidence = health.status !== 'healthy' && health.evidence.length > 0
+        ? `${health.status}: ${health.evidence.join('; ')}`
+        : '';
+      const err = (entry.error ?? healthEvidence).trim();
       if (!err) continue;
       const key = err.slice(0, 120);
       if (seen.has(key)) continue;
@@ -352,7 +363,9 @@ function attachCachedDiagnoses(jobs: BrokenJob[], now: number): void {
       const d = cache[j.jobName];
       if (!d) continue;
       const age = now - Date.parse(d.generatedAt);
-      if (Number.isFinite(age) && age < DIAGNOSIS_TTL_MS) {
+      const sameRun = d.lastRunAt === j.lastErrorAt;
+      const hasEvidenceStamp = typeof d.evidenceHash === 'string' && d.evidenceHash.length > 0;
+      if (Number.isFinite(age) && age < DIAGNOSIS_TTL_MS && sameRun && hasEvidenceStamp) {
         j.diagnosis = d;
       }
     }
@@ -480,7 +493,28 @@ function formatReport(jobs: BrokenJob[]): string {
     }
   }
   lines.push('');
+  if (jobs.length === 1) {
+    lines.push(`Reply \`fix ${jobs[0]!.jobName}\` for a bounded diagnosis without running the job.`);
+  } else {
+    lines.push(`Reply \`fix <job name>\` for a bounded diagnosis without running the job.`);
+    lines.push(`Jobs: ${jobs.map(j => `\`${j.jobName}\``).join(', ')}`);
+  }
   lines.push('Open the dashboard → Broken Jobs panel for the full picture.');
+  return lines.join('\n');
+}
+
+function summarizeFailureNotification(jobs: BrokenJob[]): string {
+  const lines: string[] = [];
+  lines.push(`${jobs.length} cron job${jobs.length === 1 ? '' : 's'} repeatedly failing.`);
+  for (const job of jobs.slice(0, 6)) {
+    const parts = [
+      `${job.jobName}: ${job.errorCount48h}/${job.totalRuns48h} recent runs failed`,
+    ];
+    if (job.diagnosis?.rootCause) parts.push(`cause: ${job.diagnosis.rootCause.slice(0, 220)}`);
+    if (job.diagnosis?.proposedFix?.details) parts.push(`proposed fix: ${job.diagnosis.proposedFix.details.slice(0, 220)}`);
+    if (!job.diagnosis && job.lastErrors[0]) parts.push(`last error: ${job.lastErrors[0].split('\n')[0]!.slice(0, 220)}`);
+    lines.push(`- ${parts.join(' | ')}`);
+  }
   return lines.join('\n');
 }
 
@@ -499,6 +533,7 @@ export async function runFailureSweep(
   send: (text: string) => Promise<unknown>,
   gateway?: import('./router.js').Gateway,
   now = Date.now(),
+  options: { replySessionKey?: string } = {},
 ): Promise<BrokenJob[]> {
   // Opportunistically grade suspicious ok runs BEFORE computing broken
   // jobs, so fresh grades feed into this same sweep's detection.
@@ -578,7 +613,19 @@ export async function runFailureSweep(
   }
 
   try {
-    await send(formatReport(fresh));
+    const report = formatReport(fresh);
+    if (gateway && options.replySessionKey) {
+      gateway.recordProactiveEvent({
+        type: 'cron_failure',
+        sessionKey: options.replySessionKey,
+        title: `${fresh.length} cron job${fresh.length === 1 ? '' : 's'} failing`,
+        summary: summarizeFailureNotification(fresh),
+        text: report,
+        jobNames: fresh.map(j => j.jobName),
+        sentAt: new Date(now).toISOString(),
+      });
+    }
+    await send(report);
     const stamp = new Date(now).toISOString();
     for (const job of fresh) {
       state.notified[job.jobName] = { lastNotifiedAt: stamp, lastErrorCount: job.errorCount48h };

@@ -56,6 +56,13 @@ import {
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
+  claudeCodeDisableOneMillionForModel,
+  currentOneMillionContextMode,
+  normalizeClaudeModelForOneMillionContext,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  usesOneMillionContext,
   envSnapshot,
 } from '../config.js';
 import { summarizeIntegrationStatus } from '../config/integrations-registry.js';
@@ -64,10 +71,11 @@ import {
   computeAvailability,
   buildPromptInstruction,
   buildComposioStatusBlock,
+  KNOWN_SERVICES,
 } from '../integrations/tool-preferences.js';
 import { loadClaudeIntegrations } from './mcp-bridge.js';
 import { detectFrustrationSignals, detectRepeatedTopics } from './insight-engine.js';
-import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
+import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, TerminalReason, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
 import {
   enforceToolPermissions,
@@ -84,20 +92,23 @@ import {
   logAuditJsonl,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
-import { agentWorkingMemoryFile, listAllGoals } from '../tools/shared.js';
+import { agentWorkingMemoryFile, capOutput, listAllGoals } from '../tools/shared.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
 import { collectToolCalls, detectContradiction, buildCorrectionPrompt } from './contradiction-validator.js';
 import { recordToolOutcome as recordMcpToolOutcome } from './mcp-circuit-breaker.js';
 import { assembleContext } from '../memory/context-assembler.js';
-import * as embeddingsModule from '../memory/embeddings.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
-import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
-import { decideTurnPolicy, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
+import { applyServiceDedup, routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
+import { isRestrictedToolset, toolsetAllowsLocalWrites, toolsetDisablesAllTools, type ToolsetName } from './toolsets.js';
+import { looksLikeApprovalPrompt } from './local-turn.js';
+import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
+import { loadClementineJson } from '../config/clementine-json.js';
+import { isCreditBalanceError, markBackgroundCreditBlocked } from '../gateway/credit-guard.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -227,6 +238,61 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.3);
 }
 
+export function looksLikeContextThrashText(value: unknown): boolean {
+  const text = String(value ?? '');
+  return /autocompact\s+is\s+thrashing|context\s+refilled\s+to\s+the\s+limit|refilled\s+to\s+the\s+limit\s+within/i.test(text);
+}
+
+function inferTerminalReasonFromFailure(value: unknown): TerminalReason | undefined {
+  const text = String(value ?? '').toLowerCase();
+  if (looksLikeContextThrashText(text) || /rapid_refill_breaker|maximum context|context.?length/.test(text)) {
+    return 'rapid_refill_breaker';
+  }
+  if (/prompt is too long|prompt too long|input is too long|request too large/.test(text)) {
+    return 'prompt_too_long';
+  }
+  if (/maximum number of turns|max_turns/.test(text)) {
+    return 'max_turns';
+  }
+  return undefined;
+}
+
+class UnleashedTaskFailedError extends Error {
+  constructor(message: string, readonly terminalReason?: TerminalReason) {
+    super(message);
+    this.name = 'UnleashedTaskFailedError';
+  }
+}
+
+export function contextThrashRecoveryNotice(): string {
+  return [
+    'I hit a context-size recovery issue while working on that.',
+    'I saved the request and reset the session so I can continue with smaller reads instead of repeating the same large-output path.',
+  ].join(' ');
+}
+
+export function buildContextThrashRecoveryPrompt(userRequest: string, priorFailureText = ''): string {
+  const parts = [
+    '[CONTEXT-THRASH RECOVERY]',
+    '',
+    'The previous interactive attempt failed because tool output filled the context window and SDK autocompact thrashed. Continue the user request, but use a small diagnostic pass.',
+    '',
+    'User request:',
+    userRequest,
+    '',
+    'Recovery rules:',
+    '- Do not repeat broad reads, full log dumps, full JSON dumps, or unbounded API/list commands.',
+    '- Prefer status files, summaries, indexes, `rg`, `tail -80`, `head -80`, and `sed -n` slices.',
+    '- For cron or unleashed jobs, inspect only `status.json`, the tail of `progress.jsonl`, and the latest run preview first. Do not read full run logs unless a short slice identifies the exact file and range.',
+    '- Preserve the user intent. Identify what failed, what you changed or verified, and the next action.',
+    '- Finish with `TASK_COMPLETE:` followed by a concise user-facing summary.',
+  ];
+  if (priorFailureText.trim()) {
+    parts.push('', 'Prior failure excerpt:', priorFailureText.trim().slice(0, 1200));
+  }
+  return parts.join('\n');
+}
+
 /**
  * Strip lone Unicode surrogates (U+D800–U+DFFF) from a string so it can be
  * safely serialized to JSON. Lone surrogates are valid in JS strings but
@@ -318,16 +384,29 @@ const query: typeof rawQuery = ((args: Parameters<typeof rawQuery>[0]) => {
       if (typeof opts.appendSystemPrompt === 'string') {
         newOpts.appendSystemPrompt = stripLoneSurrogates(opts.appendSystemPrompt);
       }
-      cleaned.options = newOpts;
+      cleaned.options = normalizeClaudeSdkOptionsForOneMillionContext(newOpts);
     }
     return rawQuery(cleaned);
   }
   return rawQuery(args);
 }) as typeof rawQuery;
 
+function parseMemoryTimestampMs(value: unknown): number {
+  const text = String(value ?? '').trim();
+  if (!text) return NaN;
+  // SQLite datetime('now') returns UTC as "YYYY-MM-DD HH:mm:ss" with no zone.
+  // Parse it explicitly as UTC so summaries don't appear hours in the future.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) {
+    return Date.parse(`${text.replace(' ', 'T')}Z`);
+  }
+  return Date.parse(text);
+}
+
 /** Format a millisecond duration as a human-friendly "X ago" string. */
-function formatTimeAgo(ms: number): string {
-  const minutes = Math.floor(ms / 60_000);
+export function formatTimeAgo(ms: number): string {
+  const safeMs = Number.isFinite(ms) ? Math.max(0, ms) : 0;
+  if (safeMs < 60_000) return 'just now';
+  const minutes = Math.floor(safeMs / 60_000);
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
@@ -340,6 +419,13 @@ function formatTimeAgo(ms: number): string {
 const CONTEXT_GUARD_MIN_TOKENS = 16_000;
 /** Warn threshold — context is getting tight. */
 const CONTEXT_GUARD_WARN_TOKENS = 32_000;
+const PENDING_CONTEXT_USER_MAX_CHARS = 1000;
+const PENDING_CONTEXT_ASSISTANT_MAX_CHARS = 3000;
+const CRON_PROGRESS_NOTES_MAX_CHARS = 2000;
+const CRON_PROGRESS_PENDING_MAX_ITEMS = 20;
+const CRON_PROGRESS_ITEM_MAX_CHARS = 300;
+/** Rotate SDK sessions before hidden resume history approaches the 200K cap. */
+const SESSION_ROTATE_INPUT_TOKENS = 140_000;
 /** Approximate context window sizes by model family. */
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'haiku': 200_000,
@@ -348,10 +434,59 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 };
 
 function getContextWindow(model: string): number {
+  if (usesOneMillionContext(model)) return 1_000_000;
   for (const [family, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
     if (model.includes(family)) return size;
   }
   return 200_000; // safe default
+}
+
+function capContextBlock(text: unknown, maxChars: number): string {
+  return capOutput(String(text ?? ''), maxChars);
+}
+
+export function scrubInternalContextBlocks(text: string): string {
+  return text
+    .replace(/\[Context governance:[^\]]*\][\s\S]*?\[\/Context governance:[^\]]*\]\s*/gi, '')
+    .replace(/\[Active working set\][\s\S]*?\[\/Active working set\]\s*/gi, '')
+    .replace(/\[Recent proactive notification context\][\s\S]*?\[\/Recent proactive notification context\]\s*/gi, '')
+    .trim();
+}
+
+function capContextItem(text: unknown): string {
+  return capContextBlock(text, CRON_PROGRESS_ITEM_MAX_CHARS).replace(/\s+/g, ' ').trim();
+}
+
+function resultInputTokens(result: SDKResultMessage): number {
+  let total = 0;
+  const modelUsage = (result as { modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }> }).modelUsage;
+  if (!modelUsage) return 0;
+  for (const usage of Object.values(modelUsage)) {
+    total += usage.inputTokens ?? 0;
+    total += usage.cacheReadInputTokens ?? 0;
+    total += usage.cacheCreationInputTokens ?? 0;
+  }
+  return total;
+}
+
+export function looksLikeOneMillionContextError(value: unknown): boolean {
+  return looksLikeClaudeOneMillionContextError(value);
+}
+
+export function oneMillionContextRecoveryMessage(): string {
+  return "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting.";
+}
+
+export function looksLikeProviderApiErrorResponse(value: unknown): boolean {
+  const text = String(value ?? '').trim();
+  return /^api error:/i.test(text)
+    || /^error:\s*api error:/i.test(text)
+    || looksLikeOneMillionContextError(text);
+}
+
+export function looksLikeNoResponseRequested(value: unknown): boolean {
+  const text = String(value ?? '').trim();
+  return /^no response requested\.?$/i.test(text);
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -362,7 +497,17 @@ const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
 const MAX_SESSION_EXCHANGES = 40;
 const SESSION_EXPIRY_MS = 24 * 60 * 60 * 1000;
 const AUTO_MEMORY_MIN_LENGTH = 80;
-const AUTO_MEMORY_MODEL = MODELS.sonnet;
+// Model used by the post-exchange memory extractor + the conversation
+// summarizer. Both are routine "read this exchange, extract facts, call
+// memory_write with structured JSON" tasks — Haiku handles them fine and
+// they fire on EVERY substantive exchange, so the multiplier matters.
+// Override with CLEMENTINE_AUTO_MEMORY_MODEL=sonnet if you observe
+// extraction quality drop.
+const AUTO_MEMORY_MODEL = process.env.CLEMENTINE_AUTO_MEMORY_MODEL?.includes('sonnet')
+  ? MODELS.sonnet
+  : process.env.CLEMENTINE_AUTO_MEMORY_MODEL?.includes('opus')
+    ? MODELS.opus
+    : MODELS.haiku;
 const OWNER = OWNER_NAME || 'the user';
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
 const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
@@ -564,13 +709,6 @@ function buildSafeEnv(): Record<string, string> {
   }
   // When all are absent: HOME lets the subprocess find Keychain OAuth automatically.
 
-  // Preserve trusted Claude Code runtime flags set by config.ts. In
-  // particular, CLAUDE_CODE_DISABLE_1M_CONTEXT defaults on so background
-  // helper queries do not silently re-enable the 1M context beta.
-  if (process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined) {
-    sanitized.CLAUDE_CODE_DISABLE_1M_CONTEXT = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  }
-
   // Step 3: Add trusted markers AFTER sanitization
   sanitized.CLEMENTINE_HOME = BASE_DIR;
 
@@ -761,6 +899,23 @@ interface RetrievedContext {
 
 // ── Cron Output Extraction ──────────────────────────────────────────
 
+/** Autonomous jobs use this sentinel to mean "completed, but do not notify the owner." */
+export function isAutonomousNothingOutput(response: string): boolean {
+  const trimmed = response.trim();
+  if (!trimmed) return false;
+  if (trimmed === '__NOTHING__') return true;
+  if (/^_*NOTHING_*$/i.test(trimmed)) return true;
+  if (/^_*NOTHING_*\s*(\(|$)/im.test(trimmed)) return true;
+  if (/^(_*NOTHING_*\s*)?\[MONITORING\]\s*$/i.test(trimmed)) return true;
+  if (looksLikeNoResponseRequested(trimmed)) return true;
+  if (trimmed.length > 80) return false;
+  const lower = trimmed.toLowerCase();
+  return lower === 'nothing to report'
+    || lower === 'nothing new to report'
+    || lower === 'no updates'
+    || lower === 'all clear';
+}
+
 /** Return the last non-empty text block that came after the last tool call, or '' if nothing/sentinel. */
 function extractDeliverable(trace: TraceEntry[]): string {
   if (trace.length === 0) return '';
@@ -779,7 +934,7 @@ function extractDeliverable(trace: TraceEntry[]): string {
   for (let i = trace.length - 1; i > lastToolIdx; i--) {
     if (trace[i].type === 'text') {
       const text = trace[i].content.trim();
-      if (text === '__NOTHING__') return '';
+      if (isAutonomousNothingOutput(text)) return '';
       if (text.length > 0) return text;
     }
   }
@@ -1033,7 +1188,7 @@ export class PersonalAssistant {
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
   /** Terminal reason from the last SDK query — consumed by cron scheduler for precise error classification. */
-  private _lastTerminalReason?: string;
+  private _lastTerminalReason?: TerminalReason;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
   /** Last contradiction finding per session, consumed by the session transcript writer to splice a correction note. */
@@ -1206,7 +1361,7 @@ export class PersonalAssistant {
     return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
   }
 
-  /** Inject a background work result into the session so the next chat naturally references it. */
+  /** Inject a background work result into the session as silent follow-up context. */
   injectPendingContext(sessionKey: string, userPrompt: string, result: string): void {
     const pending = this.pendingContext.get(sessionKey) ?? [];
     pending.push({ user: userPrompt.slice(0, 500), assistant: result.slice(0, 2000) });
@@ -1397,6 +1552,11 @@ export class PersonalAssistant {
     return this.exchangeCounts.get(sessionKey) ?? 0;
   }
 
+  hasRecentApprovalPrompt(sessionKey: string): boolean {
+    const lastAssistant = this.lastExchanges.get(sessionKey)?.at(-1)?.assistant ?? '';
+    return looksLikeApprovalPrompt(lastAssistant);
+  }
+
   getMemoryChunkCount(): number {
     if (!this.memoryStore) return 0;
     try {
@@ -1482,8 +1642,17 @@ Large tool outputs blow the context window and rotate your session mid-task — 
       if (agentsEntry) parts.push(agentsEntry.content);
     }
 
+    // ── Per-session-volatile content goes to volatileParts (post-cache-boundary) ──
+    // Anthropic's prompt-caching guidance is explicit: cache is a prefix
+    // hash, so anything that changes between turns must sit AFTER the
+    // breakpoint. The blocks below — retrieved context, working memory,
+    // MEMORY.md, today's notes, yesterday's summary, recent conversations —
+    // all change within a single 5-minute cache TTL window during an
+    // active session. Putting them in the stable prefix caused ~80 KB of
+    // cache_creation per session-content change. After this refactor the
+    // stable prefix stays byte-identical across calls.
     if (retrievalContext) {
-      parts.push(
+      volatileParts.push(
         `## Relevant Context (retrieved)\n\n${retrievalContext}\n\n` +
         `*When retrieved context contains information from previous conversations relevant to the current topic, naturally reference it. ` +
         `If the user mentions a person and memory shows their last known status or project, weave that in conversationally. ` +
@@ -1497,7 +1666,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
           const wmContent = fs.readFileSync(_wmFileFallback, 'utf-8').trim();
           if (wmContent) {
             const truncated = isAutonomous ? wmContent.slice(0, 1500) : wmContent;
-            parts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
+            volatileParts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
           }
         } catch { /* non-critical */ }
       }
@@ -1506,9 +1675,9 @@ Large tool outputs blow the context window and rotate your session mid-task — 
         // Autonomous runs get truncated memory — just enough for context
         if (isAutonomous) {
           const truncated = memoryEntry.content.slice(0, 2000);
-          parts.push(`## Current Memory\n\n${truncated}${memoryEntry.content.length > 2000 ? '\n...(truncated)' : ''}`);
+          volatileParts.push(`## Current Memory\n\n${truncated}${memoryEntry.content.length > 2000 ? '\n...(truncated)' : ''}`);
         } else {
-          parts.push(`## Current Memory\n\n${memoryEntry.content}`);
+          volatileParts.push(`## Current Memory\n\n${memoryEntry.content}`);
         }
       }
     }
@@ -1520,13 +1689,13 @@ Large tool outputs blow the context window and rotate your session mid-task — 
       this.promptCache.watch(agentMemPath);
       const agentMemEntry = this.promptCache.get(agentMemPath);
       if (agentMemEntry) {
-        parts.push(`## Agent Memory (${profile.slug})\n\n${agentMemEntry.content}`);
+        volatileParts.push(`## Agent Memory (${profile.slug})\n\n${agentMemEntry.content}`);
       }
     }
 
     const todayEntry = !skipAmbientContext ? this.promptCache.get(todayPath) : null;
     if (todayEntry) {
-      parts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
+      volatileParts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
     }
 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
@@ -1539,7 +1708,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
           const yEntry = this.promptCache.get(yPath);
           if (yEntry && yEntry.content.includes('## Summary')) {
             const summary = yEntry.content.slice(yEntry.content.indexOf('## Summary'));
-            parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
+            volatileParts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
           }
         }
       }
@@ -1554,7 +1723,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
                 return `### ${ts}\n${s.summary}`;
               },
             );
-            parts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
+            volatileParts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
           }
         } catch {
           // Non-fatal
@@ -1563,8 +1732,10 @@ Large tool outputs blow the context window and rotate your session mid-task — 
     }
 
     if (isAutonomous) {
-      // Minimal vault reference for heartbeats/cron — they know their tools
-      parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, ${todayISO()}.md (today), TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
+      // Minimal vault reference for heartbeats/cron — they know their tools.
+      // No date reference here: today's date string in the stable prefix
+      // would invalidate the prompt cache once per day.
+      parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, today's daily note, TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
 
       // Deviation rules — tiered autonomy for handling unexpected work during cron/heartbeat
       parts.push(`## Deviation Rules (Tiered Autonomy)
@@ -1595,7 +1766,7 @@ Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
 **File tools:** Read, Write, Edit, Glob, Grep for direct access.
 
 **Folders:** 00-System (SOUL/MEMORY/AGENTS.md), 01-Daily-Notes (YYYY-MM-DD.md), 02-People, 03-Projects, 04-Topics, 05-Tasks/TASKS.md, 06-Templates, 07-Inbox.
-**Key files:** MEMORY.md (long-term), ${todayISO()}.md (today), TASKS.md (tasks).
+**Key files:** MEMORY.md (long-term), today's daily note, TASKS.md (tasks).
 
 **Task IDs:** \`{T-001}\`, subtasks \`{T-001.1}\`. Recurring tasks auto-create next copy on completion.
 
@@ -1673,22 +1844,20 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
       }
     }
 
-    // Inject hot corrections (explicit behavioral corrections from recent sessions)
+    // Recent Corrections + feedback signals — both refresh as the user
+    // gives feedback during a session. Putting them in volatile keeps the
+    // stable prefix cache-stable across feedback turns. Same per-message
+    // anti-pattern that OpenClaw issue #20894 documented as a 100x cost
+    // amplifier.
     if (this.hotCorrections.length > 0 && !lightweightTurn) {
       const recentCutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24 hours
       const recent = this.hotCorrections.filter(c => new Date(c.timestamp).getTime() > recentCutoff);
       if (recent.length > 0) {
         const lines = recent.map(c => `- [${c.category}] ${c.correction}`);
-        parts.push(`## Recent Corrections (apply immediately)\n\n${lines.join('\n')}`);
+        volatileParts.push(`## Recent Corrections (apply immediately)\n\n${lines.join('\n')}`);
       }
     }
 
-    // Inject recent feedback signals (closes the feedback → behavior loop).
-    // Without this block, user thumbs-down + comments live in the feedback
-    // table and never reach the agent's awareness — only the skill-suppress
-    // filter consumed them. We surface aggregates + the last few commented
-    // negatives so the agent can self-adjust on the next turn. Skipped when
-    // there's nothing to report (no noise).
     if (this.memoryStore?.getRecentFeedbackSignals && !lightweightTurn) {
       try {
         const sig = this.memoryStore.getRecentFeedbackSignals({ days: 14, limit: 3 });
@@ -1704,7 +1873,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
               lines.push(`- (${n.channel}) ${comment}`);
             }
           }
-          parts.push(`## Recent feedback signals\n\n${lines.join('\n')}`);
+          volatileParts.push(`## Recent feedback signals\n\n${lines.join('\n')}`);
         }
       } catch { /* non-fatal */ }
     }
@@ -1755,7 +1924,9 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
             }
           }
 
-          parts.push(skillBlock);
+          // Skill matches depend on the user's last message + the live
+          // suppression list; both refresh per turn. Volatile.
+          volatileParts.push(skillBlock);
         }
       } catch { /* non-fatal — skills dir may not exist */ }
     }
@@ -1779,7 +1950,9 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
         }
       }
 
-      // User Theory of Mind — structured user model
+      // User Theory of Mind — structured user model. The model file
+      // updates as the user's preferences/priorities are learned, so
+      // its content is volatile within a session.
       const userModelFile = path.join(VAULT_DIR, '00-System', 'USER_MODEL.md');
       this.promptCache.watch(userModelFile);
       const userModel = this.promptCache.get(userModelFile);
@@ -1789,7 +1962,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
         const comm = userModel.data.communication ? `Communication: ${Object.entries(userModel.data.communication as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
         const modelParts = [expertise, priorities, comm].filter(Boolean);
         if (modelParts.length > 0) {
-          parts.push(`## User Context\n\n${modelParts.join('\n')}`);
+          volatileParts.push(`## User Context\n\n${modelParts.join('\n')}`);
         }
       }
 
@@ -1799,6 +1972,55 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
 
 When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") or dissatisfaction ("no", "wrong", "that's not right", "ugh"), call \`feedback_log\` with an appropriate rating ('positive' or 'negative') and a brief comment summarizing the context. This helps me learn from interactions.`);
       }
+
+      try {
+        const jsonExperience = loadClementineJson(BASE_DIR).assistant ?? {};
+        const pick = <T extends string>(value: string | undefined, allowed: readonly T[]): T | undefined =>
+          allowed.includes(value as T) ? value as T : undefined;
+        const experience = {
+          proactivity: pick(process.env.ASSISTANT_PROACTIVITY, ['quiet', 'balanced', 'proactive', 'operator'] as const) ?? jsonExperience.proactivity,
+          responseStyle: pick(process.env.ASSISTANT_RESPONSE_STYLE, ['concise', 'balanced', 'detailed'] as const) ?? jsonExperience.responseStyle,
+          progressVisibility: pick(process.env.ASSISTANT_PROGRESS_VISIBILITY, ['quiet', 'normal', 'detailed'] as const) ?? jsonExperience.progressVisibility,
+          autonomy: pick(process.env.ASSISTANT_AUTONOMY, ['ask_first', 'balanced', 'act_when_safe'] as const) ?? jsonExperience.autonomy,
+        };
+        const lines: string[] = [];
+        if (experience.proactivity) {
+          const guidance: Record<string, string> = {
+            quiet: 'Only interrupt for urgent or explicitly requested work. Avoid unsolicited next steps.',
+            balanced: 'Offer useful next steps when natural, but do not create extra work without a clear reason.',
+            proactive: 'Surface likely next actions, risks, and background-work opportunities before the owner has to ask.',
+            operator: 'Operate forward: propose plans, queue safe background work, monitor progress, and keep the owner informed.',
+          };
+          lines.push(`- Proactivity: ${experience.proactivity}. ${guidance[experience.proactivity]}`);
+        }
+        if (experience.responseStyle) {
+          const guidance: Record<string, string> = {
+            concise: 'Default to short, direct answers. Expand only when the task needs it.',
+            balanced: 'Match detail to task complexity.',
+            detailed: 'Include more reasoning, context, and verification detail for substantive work.',
+          };
+          lines.push(`- Response style: ${experience.responseStyle}. ${guidance[experience.responseStyle]}`);
+        }
+        if (experience.progressVisibility) {
+          const guidance: Record<string, string> = {
+            quiet: 'Minimize process narration unless work is slow, blocked, or risky.',
+            normal: 'Share important progress and decision points.',
+            detailed: 'Keep the owner posted during background or multi-tool work, including failures and recoveries.',
+          };
+          lines.push(`- Progress visibility: ${experience.progressVisibility}. ${guidance[experience.progressVisibility]}`);
+        }
+        if (experience.autonomy) {
+          const guidance: Record<string, string> = {
+            ask_first: 'Ask before taking actions that change external systems or user data.',
+            balanced: 'Act on low-risk reversible steps; ask on irreversible, costly, or ambiguous steps.',
+            act_when_safe: 'Use judgment and proceed on safe, reversible, clearly beneficial work.',
+          };
+          lines.push(`- Autonomy: ${experience.autonomy}. ${guidance[experience.autonomy]}`);
+        }
+        if (lines.length > 0) {
+          parts.push(`## Owner Experience Preferences\n\n${lines.join('\n')}`);
+        }
+      } catch { /* config preferences are optional */ }
 
       // Verbose level overrides
       if (verboseLevel === 'quiet') {
@@ -2049,6 +2271,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     intentClassification?: IntentClassification;
     turnPolicy?: TurnPolicy;
     contextRoutingText?: string;
+    toolset?: ToolsetName;
   } = {}): Promise<SDKOptions> {
     const {
       isHeartbeat = false,
@@ -2075,15 +2298,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       intentClassification,
       turnPolicy,
       contextRoutingText,
+      toolset = 'auto',
     } = opts;
 
     const isCron = cronTier !== null;
-    const toolsDisabledForCall = disableAllTools || (isHeartbeat && !isCron);
+    const toolsDisabledForCall = disableAllTools
+      || (isHeartbeat && !isCron)
+      || toolsetDisablesAllTools(toolset);
     const promptScopeText = toolScopeText ?? '';
     const profileScopeText = [profile?.description, profile?.systemPromptBody]
       .filter(Boolean)
       .join('\n');
-    const directScopeText = [promptScopeText, profileScopeText].filter(Boolean).join('\n');
+    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
+    const directScopeText = [promptScopeText, autonomousToolRun ? profileScopeText : ''].filter(Boolean).join('\n');
     const emptyToolRoute = (): ToolRouteDecision => ({
         bundles: [],
         externalMcpServers: [],
@@ -2115,12 +2342,39 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const promptToolRoute = routeToolSurface(promptScopeText);
     const profileToolRoute = routeToolSurface(profileScopeText);
     const contextToolRoute = routeToolSurface(contextRoutingText);
-    const safeProfileToolRoute = profileToolRoute.fullSurface ? emptyToolRoute() : profileToolRoute;
-    const safeContextToolRoute = contextToolRoute.fullSurface ? emptyToolRoute() : contextToolRoute;
-    const toolRoute = mergeToolRoutes(
+    const promptHasToolRoute = promptToolRoute.fullSurface || promptToolRoute.bundles.length > 0;
+    const directFollowupNeedsContextTools = intentClassification?.type === 'followup'
+      || /^(yes|yep|yeah|go|go ahead|do it|continue|pick up|use that|run it|send it|same thing)\b/i.test(promptScopeText.trim());
+    const allowContextToolRoute = autonomousToolRun || (!promptHasToolRoute && directFollowupNeedsContextTools);
+    const safeProfileToolRoute = autonomousToolRun && !profileToolRoute.fullSurface
+      ? profileToolRoute
+      : emptyToolRoute();
+    const safeContextToolRoute = allowContextToolRoute && !contextToolRoute.fullSurface
+      ? contextToolRoute
+      : emptyToolRoute();
+    let toolRoute = mergeToolRoutes(
       promptToolRoute,
       mergeToolRoutes(safeProfileToolRoute, safeContextToolRoute),
     );
+    if (toolset === 'full') {
+      toolRoute = {
+        bundles: [],
+        externalMcpServers: undefined,
+        composioToolkits: undefined,
+        inheritFullClaudeEnv: true,
+        fullSurface: true,
+        reason: 'full_surface',
+      };
+    } else if (isRestrictedToolset(toolset)) {
+      toolRoute = {
+        ...toolRoute,
+        bundles: [],
+        externalMcpServers: [],
+        composioToolkits: [],
+        inheritFullClaudeEnv: false,
+        fullSurface: false,
+      };
+    }
 
     let allowedTools: string[] = [];
     const addAllowed = (...tools: string[]) => {
@@ -2134,17 +2388,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     const scopeText = [
       directScopeText,
-      contextRoutingText,
+      allowContextToolRoute ? contextRoutingText : '',
     ].filter(Boolean).join('\n').toLowerCase();
     const promptScopeLower = promptScopeText.toLowerCase();
-    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
     const taskIntent = intentClassification?.type === 'task' || autonomousToolRun;
     const memoryNeeded = autonomousToolRun
       || retrievalContext.trim().length > 0
       || (turnPolicy?.retrievalTier !== undefined && turnPolicy.retrievalTier !== 'none');
-    const localReadNeeded = taskIntent || /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|read|show|grep|diff|search)\b/i.test(promptScopeLower);
-    const localWriteNeeded = taskIntent || /\b(write|edit|fix|implement|refactor|build|test|run|npm|git|commit|push|pull|deploy|install|configure)\b/i.test(promptScopeLower);
-    const adminNeeded = toolRoute.fullSurface || /\b(self[- ]?update|restart|daemon|doctor|env|credential|integration|setup|set up|configure|npm publish|publish to npm)\b/i.test(promptScopeLower);
+    const localReadNeeded = taskIntent || toolset === 'diagnostic' || /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|read|show|grep|diff|search)\b/i.test(promptScopeLower);
+    const diagnosticCommandNeeded = toolset === 'diagnostic'
+      && /\b(run|test|npm|pnpm|yarn|node|git|logs?|tail|ps|status|diagnos(?:e|tic)|check)\b/i.test(promptScopeLower);
+    const localWriteNeeded = diagnosticCommandNeeded
+      || (toolsetAllowsLocalWrites(toolset) && (taskIntent || /\b(write|edit|fix|implement|refactor|build|test|run|npm|git|commit|push|pull|deploy|install|configure)\b/i.test(promptScopeLower)));
+    const adminNeeded = toolRoute.fullSurface
+      || (toolsetAllowsLocalWrites(toolset) && /\b(self[- ]?update|restart|daemon|doctor|env|credential|integration|setup|set up|configure|npm publish|publish to npm)\b/i.test(promptScopeLower));
 
     if (!toolsDisabledForCall) {
       if (toolRoute.fullSurface) {
@@ -2152,7 +2409,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         addClementineTools(CLEMENTINE_ALL_TOOL_NAMES);
       } else {
         if (localReadNeeded) addAllowed('Read', 'Glob', 'Grep');
-        if (localWriteNeeded) addAllowed('Write', 'Edit', 'Bash');
+        if (localWriteNeeded) {
+          if (toolset === 'diagnostic') addAllowed('Bash');
+          else addAllowed('Write', 'Edit', 'Bash');
+        }
         if (toolRoute.bundles.includes('web_research') || toolRoute.bundles.includes('docs_lookup')) {
           addAllowed('WebSearch', 'WebFetch');
         }
@@ -2161,7 +2421,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           addClementineTools(CLEMENTINE_CORE_TOOL_NAMES);
           addClementineTools(CLEMENTINE_RELATIONSHIP_TOOL_NAMES);
         }
-        if (taskIntent || intentClassification?.type === 'correction') {
+        const clementineMemoryWritesAllowed = toolset === 'auto'
+          || toolset === 'full'
+          || toolset === 'communications'
+          || intentClassification?.type === 'feedback'
+          || intentClassification?.type === 'correction';
+        if ((taskIntent || intentClassification?.type === 'correction') && clementineMemoryWritesAllowed) {
           addClementineTools(CLEMENTINE_MEMORY_WRITE_TOOL_NAMES);
           addClementineTools(CLEMENTINE_WORKSPACE_TOOL_NAMES);
         } else if (memoryNeeded) {
@@ -2177,13 +2442,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           addClementineTools(CLEMENTINE_INTEGRATION_TOOL_NAMES);
           addClementineTools(CLEMENTINE_ADMIN_TOOL_NAMES);
         }
-        if (toolRoute.bundles.includes('email_outlook') || /\b(outlook|email|mailbox|inbox|calendar|follow-?up)\b/i.test(scopeText)) {
+        if ((toolset === 'auto' || toolset === 'full' || toolset === 'communications')
+          && (toolRoute.bundles.includes('email_outlook') || /\b(outlook|email|mailbox|inbox|calendar|follow-?up)\b/i.test(scopeText))) {
           addClementineTools(CLEMENTINE_COMM_TOOL_NAMES);
         }
-        if (toolRoute.bundles.includes('github') || toolRoute.bundles.includes('browser') || toolRoute.bundles.includes('web_research')) {
+        if ((toolset === 'auto' || toolset === 'full')
+          && (toolRoute.bundles.includes('github') || toolRoute.bundles.includes('browser') || toolRoute.bundles.includes('web_research'))) {
           addClementineTools(CLEMENTINE_RESEARCH_TOOL_NAMES);
         }
-        if (enableTeams) {
+        if (enableTeams && (toolset === 'auto' || toolset === 'full')) {
           addAllowed('Task', 'Agent');
           addClementineTools(CLEMENTINE_TEAM_TOOL_NAMES);
           addClementineTools(CLEMENTINE_JOB_TOOL_NAMES);
@@ -2191,7 +2458,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
 
       // Include local user scripts/plugins for task-like or explicit full-surface turns.
-      if (taskIntent || toolRoute.fullSurface || adminNeeded) {
+      if (toolsetAllowsLocalWrites(toolset) && (taskIntent || toolRoute.fullSurface || adminNeeded)) {
         try {
           const toolsDir = path.join(BASE_DIR, 'tools');
           const pluginsDir = path.join(BASE_DIR, 'plugins');
@@ -2265,7 +2532,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       && toolsDisabledForCall
       && turnPolicy?.retrievalTier === 'none'
       && turnPolicy.effort === 'low';
-    const resolvedModel = resolveModel(requestedModel) ?? (lightweightModelEligible ? MODELS.haiku : MODEL);
+    const rawResolvedModel = resolveModel(requestedModel) ?? (lightweightModelEligible ? MODELS.haiku : MODEL);
+    const resolvedModel = normalizeClaudeModelForOneMillionContext(rawResolvedModel);
+    const oneMillionModeValue = currentOneMillionContextMode();
+    const oneMillionDisableValue = claudeCodeDisableOneMillionForModel(resolvedModel);
     const modelRouteReason = model
       ? 'explicit'
       : profile?.model
@@ -2323,6 +2593,27 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const volatileSuffix = volatilePromptPart && volatilePromptPart.trim().length > 0
       ? volatilePromptPart
       : '';
+
+    // Debug-mode: log a short hash of the stable prefix + volatile suffix
+    // per query. When CLEMENTINE_DEBUG_CACHE=1, mismatched stable hashes
+    // across consecutive turns of the same session indicate a regression
+    // where volatile content silently leaked back into the cached prefix.
+    // No-op (no allocation) in normal mode.
+    if (process.env.CLEMENTINE_DEBUG_CACHE === '1') {
+      const { createHash } = await import('node:crypto');
+      const stableHash = createHash('sha1').update(stablePrefixParts.join('\n\n---\n\n')).digest('hex').slice(0, 8);
+      const volatileHash = volatileSuffix
+        ? createHash('sha1').update(volatileSuffix).digest('hex').slice(0, 8)
+        : 'empty';
+      logger.info({
+        sessionKey,
+        stable_prefix_hash: stableHash,
+        volatile_suffix_hash: volatileHash,
+        stable_chars: stablePrefixParts.reduce((n, s) => n + s.length, 0),
+        volatile_chars: volatileSuffix.length,
+        allowed_tool_count: allowedTools.length,
+      }, 'cache_debug: prompt structure for this query');
+    }
 
     // If there is no volatile content, a plain string keeps the call simple
     // and behaves identically for the cache. Only use the array form when
@@ -2468,6 +2759,144 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         whitelist.add(mcpTool('goal_work'));
         allowedTools = allowedTools.filter(t => whitelist.has(t));
       }
+
+      // ── Per-service dedup (intelligent routing) ───────────────────
+      // When a service has BOTH Composio + Claude Desktop sources
+      // connected (e.g. Composio outlook + claude.ai Microsoft 365),
+      // bundles in tool-router list both so either path can route to
+      // whichever is connected. But if BOTH are connected, today's
+      // behavior loaded both — and worse, claude.ai's auto-attach
+      // would pull in every other connector the user authorized
+      // (Drive, Gmail, Calendar, Slack…) via the env path. ~300+ tool
+      // schemas leak in this way and leave Sonnet's autocompact no
+      // room to work.
+      //
+      // Dedup walks each (Composio↔claude.ai) pair, picks ONE per
+      // user preference (default Composio), drops the loser from
+      // mcpServers + allowedTools, and turns inheritFullClaudeEnv off
+      // when no claude.ai service survived (so SAFE_ENV is used and
+      // the SDK can't auto-attach the other connectors).
+      if (!toolsDisabledForCall && !isPlanStep && !toolRoute.fullSurface) {
+        const composioConnected = new Set(Object.keys(composioMcpServers));
+        const cdIntegrationsForDedup = loadClaudeIntegrations();
+        const claudeDesktopActive = new Set(
+          Object.values(cdIntegrationsForDedup).filter(i => i.connected).map(i => i.name),
+        );
+        const prefs = loadToolPreferences();
+
+        const dedupResult = applyServiceDedup(toolRoute, {
+          composioConnected,
+          claudeDesktopActive,
+          preferences: prefs.preferences,
+          knownServices: KNOWN_SERVICES,
+        });
+
+        if (dedupResult.droppedClaudeAi.length > 0 || dedupResult.droppedComposio.length > 0) {
+          const beforeAllowed = allowedTools.length;
+          const beforeInherit = toolRoute.inheritFullClaudeEnv;
+          toolRoute = dedupResult.route;
+
+          for (const name of dedupResult.droppedClaudeAi) {
+            delete externalMcpServers[name];
+          }
+          for (const slug of dedupResult.droppedComposio) {
+            delete composioMcpServers[slug];
+          }
+
+          const droppedServers = new Set<string>([
+            ...dedupResult.droppedClaudeAi,
+            ...dedupResult.droppedComposio,
+          ]);
+          allowedTools = allowedTools.filter(tool => {
+            if (!tool.startsWith('mcp__')) return true;
+            const serverName = tool.slice('mcp__'.length).split('__')[0]!;
+            return !droppedServers.has(serverName);
+          });
+
+          logger.info({
+            sessionKey,
+            droppedClaudeAi: dedupResult.droppedClaudeAi,
+            droppedComposio: dedupResult.droppedComposio,
+            anyClaudeDesktopKept: dedupResult.anyClaudeDesktopKept,
+            inheritFullClaudeEnvBefore: beforeInherit,
+            inheritFullClaudeEnvAfter: toolRoute.inheritFullClaudeEnv,
+            allowedToolCountBefore: beforeAllowed,
+            allowedToolCountAfter: allowedTools.length,
+          }, 'Tool route deduped per user tool-preferences');
+        }
+      }
+
+      // Tool-surface cap. Applies to chat AND to autonomous runs (cron,
+      // unleashed, heartbeat). Without this cap on cron, a single job got
+      // 300+ MCP tool schemas in the system prompt — leaving Sonnet's SDK
+      // autocompact no room to actually compact when tool responses came
+      // back. That manifested as `rapid_refill_breaker` ("context refilled
+      // to the limit within 3 turns"). The SDK's autocompact still works;
+      // we just have to give it room.
+      if (!adminNeeded && allowedTools.length > TOOL_SURFACE_HARD_LIMIT) {
+        const beforeAllowedToolCount = allowedTools.length;
+        const coreSdkTools = new Set(['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch']);
+        const clementineToolPrefixForCap = `mcp__${TOOLS_SERVER}__`;
+
+        // Smart fallback: if the route matched specific bundles, keep
+        // those bundles' explicit servers/toolkits and drop everything
+        // else (including the fullSurface=true expansion to "all
+        // connected MCP servers"). Only fall all the way down to
+        // core+Clementine tools when there are no matched bundles to
+        // restrict to.
+        const matchedExternal = Array.isArray(toolRoute.externalMcpServers)
+          ? new Set(toolRoute.externalMcpServers)
+          : null;
+        const matchedComposio = Array.isArray(toolRoute.composioToolkits)
+          ? new Set(toolRoute.composioToolkits)
+          : null;
+        const hasMatchedBundles = !!matchedExternal && !!matchedComposio
+          && (matchedExternal.size > 0 || matchedComposio.size > 0);
+
+        if (hasMatchedBundles) {
+          const keepServers = new Set<string>([
+            TOOLS_SERVER,
+            ...(matchedExternal ?? []),
+            ...(matchedComposio ?? []),
+          ]);
+          allowedTools = allowedTools.filter(tool => {
+            if (coreSdkTools.has(tool)) return true;
+            if (!tool.startsWith('mcp__')) return true;
+            const serverName = tool.slice('mcp__'.length).split('__')[0]!;
+            return keepServers.has(serverName);
+          });
+          externalMcpServers = Object.fromEntries(
+            Object.entries(externalMcpServers).filter(([name]) => matchedExternal!.has(name)),
+          );
+          composioMcpServers = Object.fromEntries(
+            Object.entries(composioMcpServers).filter(([name]) => matchedComposio!.has(name)),
+          );
+          logger.warn({
+            sessionKey,
+            beforeAllowedToolCount,
+            afterAllowedToolCount: allowedTools.length,
+            hardLimit: TOOL_SURFACE_HARD_LIMIT,
+            bundles: toolRoute.bundles,
+            keptExternal: [...(matchedExternal ?? [])],
+            keptComposio: [...(matchedComposio ?? [])],
+            autonomous: autonomousToolRun,
+          }, 'Tool surface exceeded hard limit; trimmed to matched bundles');
+        } else {
+          allowedTools = allowedTools.filter(tool =>
+            coreSdkTools.has(tool) || tool.startsWith(clementineToolPrefixForCap),
+          );
+          externalMcpServers = {};
+          composioMcpServers = {};
+          logger.warn({
+            sessionKey,
+            beforeAllowedToolCount,
+            afterAllowedToolCount: allowedTools.length,
+            hardLimit: TOOL_SURFACE_HARD_LIMIT,
+            bundles: toolRoute.bundles,
+            autonomous: autonomousToolRun,
+          }, 'Tool surface exceeded hard limit with no matched bundles; falling back to core Clementine tools');
+        }
+      }
     }
 
     // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
@@ -2481,15 +2910,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       && !isPlanStep
       && (toolRoute.inheritFullClaudeEnv || toolRoute.fullSurface);
     const isolateClaudeConfig = !toolRoute.fullSurface;
+    // Sort tool surface for deterministic cache key. The Anthropic prompt
+    // cache hashes the entire tools/system prefix; insertion-order
+    // serialization is fragile if routing logic ever pushes in a
+    // different order between calls — silent cache miss. Sorting also
+    // lets multiple jobs that arrived at the same tool set (via
+    // different routing paths) share a cache entry.
+    if (!toolsDisabledForCall) {
+      allowedTools.sort();
+    }
     const mcpServerNames = toolsDisabledForCall
       ? []
-      : [TOOLS_SERVER, ...Object.keys(externalMcpServers), ...Object.keys(composioMcpServers)];
+      : [TOOLS_SERVER, ...Object.keys(externalMcpServers).sort(), ...Object.keys(composioMcpServers).sort()];
     const clementineToolPrefix = `mcp__${TOOLS_SERVER}__`;
     const clementineToolAllowlist = toolRoute.fullSurface
       ? '*'
       : allowedTools
         .filter(t => t.startsWith(clementineToolPrefix))
         .map(t => t.slice(clementineToolPrefix.length))
+        .sort()
         .join(',');
     const clementineToolAllowlistCount = clementineToolAllowlist === '*'
       ? CLEMENTINE_ALL_TOOL_NAMES.length
@@ -2524,6 +2963,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       isolateClaudeConfig,
       inheritFullClaudeEnv: shouldInheritClaudeEnv,
       maxBudgetUsd: enforcedBudget,
+      toolset,
       isCron,
       cronTier,
       isPlanStep,
@@ -2535,6 +2975,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
+      ...(oneMillionDisableValue === '1' ? { betas: [] } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
       ...(sessionStore ? { sessionStore } : {}),
@@ -2572,6 +3013,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
               CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
               CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
+              CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+              ...(oneMillionDisableValue !== undefined
+                ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
+                : {}),
             },
           },
           ...externalMcpServers,
@@ -2585,7 +3030,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // env only when the prompt/job mentions a connector-backed service.
       // Per-MCP-server env isolation still happens inside each mcpServers
       // entry; this only affects the Claude Code subprocess itself.
-      ...(shouldInheritClaudeEnv ? {} : { env: SAFE_ENV }),
+      env: shouldInheritClaudeEnv
+        ? {
+          ...process.env,
+          CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+          ...(oneMillionDisableValue !== undefined
+            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
+            : {}),
+        }
+        : {
+          ...SAFE_ENV,
+          CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+          ...(oneMillionDisableValue !== undefined
+            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
+            : {}),
+        },
       // Avoid ambient Claude Code user/project/local settings and plugins by
       // default. Those can silently attach hundreds of tools. Explicit MCP
       // servers above still work; "all integrations/full tool surface" keeps
@@ -2659,30 +3118,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const useDense = tier === 'full';
       const useProceduralAndGraph = tier === 'full';
 
-      // Pre-compute dense query embedding if the model is ready. Done outside
-      // searchContext (which is sync) so the dense path doesn't force the
-      // entire call chain to be async. If embedDense fails or isn't available,
-      // searchContext falls back to TF-IDF.
-      let queryDenseVec: Float32Array | undefined;
-      try {
-        if (useDense && embeddingsModule.isDenseReady()) {
-          const v = await embeddingsModule.embedDense(enrichedQuery, true);
-          if (v) queryDenseVec = v;
-        }
-      } catch { /* fallback to sparse */ }
-
+      const searchOpts = {
+        limit: tier === 'full' ? SEARCH_CONTEXT_LIMIT : Math.min(SEARCH_CONTEXT_LIMIT, 4),
+        recencyLimit: tier === 'full' ? SEARCH_RECENCY_LIMIT : Math.min(SEARCH_RECENCY_LIMIT, 2),
+        agentSlug,
+        strict: strictIsolation,
+        sessionKey: sessionKey ?? undefined,
+        useDense,
+      };
       const results = useSearch
-        ? this.memoryStore.searchContext(
-          enrichedQuery,
-          {
-            limit: tier === 'full' ? SEARCH_CONTEXT_LIMIT : Math.min(SEARCH_CONTEXT_LIMIT, 4),
-            recencyLimit: tier === 'full' ? SEARCH_RECENCY_LIMIT : Math.min(SEARCH_RECENCY_LIMIT, 2),
-            agentSlug,
-            strict: strictIsolation,
-            sessionKey: sessionKey ?? undefined,
-            queryDenseVec,
-          },
-        )
+        ? await (this.memoryStore.searchContextAsync
+          ? this.memoryStore.searchContextAsync(enrichedQuery, searchOpts)
+          : Promise.resolve(this.memoryStore.searchContext(enrichedQuery, searchOpts)))
         : [];
 
       if (results?.length > 0) {
@@ -2930,6 +3377,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       projectOverride?: ProjectMeta;
       verboseLevel?: VerboseLevel;
       abortController?: AbortController;
+      toolset?: ToolsetName;
     },
   ): Promise<[string, string]> {
     const onText = options?.onText;
@@ -2941,6 +3389,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const projectOverride = options?.projectOverride;
     const verboseLevel = options?.verboseLevel;
     const abortController = options?.abortController;
+    const toolset = options?.toolset ?? 'auto';
     const key = sessionKey ?? undefined;
     this._lastUserMessage = text;
     let sessionRotated = false;
@@ -2973,9 +3422,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Lone-surrogate sanitization happens at the SDK boundary (see query() wrapper).
     let effectivePrompt = text;
+    const recentExchangesForIntent = key ? this.lastExchanges.get(key) : undefined;
+    const intent = classifyIntent(text, recentExchangesForIntent);
+    const turnDecision = decideTurn({
+      text,
+      intent,
+      hasRecentContext: !!(recentExchangesForIntent?.length || (key && this.sessions.has(key))),
+    });
+    const turnPolicy = turnDecision.policy;
+    const suppressContextInjection = turnPolicy.suppressContextInjection === true;
+
+    if (key && turnPolicy.suppressSessionResume) {
+      this.sessions.delete(key);
+      this.exchangeCounts.set(key, 0);
+      this.restoredSessions.delete(key);
+      this._compactedSessions.delete(key);
+    }
 
     // If session rotated, use instant local summary + handoff + kick off LLM summary in background
-    if (sessionRotated && key) {
+    if (sessionRotated && key && !suppressContextInjection) {
       const summary = this.buildLocalSummary(key);
       const handoff = this.loadHandoff(key);
       const contextParts: string[] = [];
@@ -2995,7 +3460,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Resilience: inject exchange history if no session_id stored
-    if (key && !this.sessions.has(key) && !sessionRotated) {
+    if (key && !suppressContextInjection && !this.sessions.has(key) && !sessionRotated) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length > 0) {
         const historyLines: string[] = [];
@@ -3009,7 +3474,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Inject context on first message after a daemon restart (session restored from disk)
-    if (key && this.restoredSessions.has(key)) {
+    if (key && !suppressContextInjection && this.restoredSessions.has(key)) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length > 0) {
         const olderSummary = this.buildOlderTurnsContext(key, exchanges);
@@ -3033,15 +3498,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Fresh session with no history — inject last conversation context
-    if (key && !sessionRotated && !this.restoredSessions.has(key)) {
+    if (key && !suppressContextInjection && !sessionRotated && !this.restoredSessions.has(key)) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length === 0 && this.memoryStore) {
         try {
-          const recentSummaries = this.memoryStore.getRecentSummaries(1);
+          const recentSummaries = typeof this.memoryStore.getRecentSummariesForSession === 'function'
+            ? this.memoryStore.getRecentSummariesForSession(key, 1)
+            : this.memoryStore.getRecentSummaries(5).filter((s: { sessionKey?: string }) => s.sessionKey === key).slice(0, 1);
           if (recentSummaries.length > 0) {
             const last = recentSummaries[0];
-            const ageMs = Date.now() - new Date(last.createdAt).getTime();
-            if (ageMs < 7 * 24 * 60 * 60 * 1000) { // within 7 days
+            const createdAtMs = parseMemoryTimestampMs(last.createdAt);
+            const ageMs = Date.now() - createdAtMs;
+            if (Number.isFinite(ageMs) && ageMs >= -5 * 60_000 && ageMs < 7 * 24 * 60 * 60 * 1000) { // within 7 days
               const ago = formatTimeAgo(ageMs);
               effectivePrompt =
                 `[Last conversation (${ago}):\n${last.summary.slice(0, 600)}]\n\n` +
@@ -3054,7 +3522,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Time-gap awareness: let the agent know how long it's been
-    if (key && this.sessionTimestamps.has(key)) {
+    if (key && !suppressContextInjection && this.sessionTimestamps.has(key)) {
       const gapMs = Date.now() - this.sessionTimestamps.get(key)!.getTime();
       const gapHours = Math.round(gapMs / 3_600_000);
       if (gapHours >= 8) {
@@ -3067,7 +3535,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // injectContext uses the base session key (e.g. discord:user:123) but
     // chat may use a profile-suffixed key (discord:user:123:sales-agent),
     // so also check any pending key that the current key starts with.
-    if (key) {
+    if (key && !suppressContextInjection) {
       const allPending: Array<{ user: string; assistant: string }> = [];
 
       for (const [pendingKey, pending] of this.pendingContext) {
@@ -3080,15 +3548,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       if (allPending.length > 0) {
         const contextLines: string[] = [];
         for (const ctx of allPending) {
-          contextLines.push(`[${ctx.user}]\n${ctx.assistant}`);
+          const user = capContextBlock(ctx.user, PENDING_CONTEXT_USER_MAX_CHARS);
+          const assistant = capContextBlock(ctx.assistant, PENDING_CONTEXT_ASSISTANT_MAX_CHARS);
+          contextLines.push(`[${user}]\n${assistant}`);
         }
         effectivePrompt =
-          `[Since we last talked, you did some background work. Naturally mention what happened — lead with anything that needs attention, briefly note routine completions. Don't dump raw tool calls or list job names. Be conversational.\nBackground:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
+          `[Background work context — REFERENCE ONLY, not new user input.\n` +
+          `Use this silently to understand follow-ups. Mention it only if the user asks about status, results, fixes, or what changed, or if it is a new urgent blocker. ` +
+          `Do not lead greetings or casual small talk with stale heartbeat, cron, or background-task details.\n` +
+          `Background:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
       }
     }
 
     // Inject stall nudge if the previous query for this session showed stall signals
-    if (key && this.stallNudges.has(key)) {
+    if (key && !suppressContextInjection && this.stallNudges.has(key)) {
       const nudge = this.stallNudges.get(key)!;
       this.stallNudges.delete(key);
       effectivePrompt =
@@ -3098,21 +3571,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
     }
 
-    // ── Intent classification ─────────────────────────────────────
-    // Classify intent before the main query to dynamically tune response
-    // strategy, maxTurns, and effort level
-    const recentExchanges = key ? this.lastExchanges.get(key) : undefined;
-    const intent = classifyIntent(text, recentExchanges);
-    const turnPolicy = decideTurnPolicy({
-      text,
-      intent,
-      hasRecentContext: !!(recentExchanges?.length || (key && this.sessions.has(key))),
-    });
     logger.debug({
       intent: intent.type,
       confidence: intent.confidence,
       strategy: intent.suggestedStrategy,
-      turnPolicy,
+      turnDecision,
     }, 'Intent classified');
 
     // If caller explicitly passed maxTurns (e.g. cron), respect it.
@@ -3125,8 +3588,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy, toolset,
     );
+    responseText = scrubInternalContextBlocks(responseText);
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
     const errLower = responseText.toLowerCase();
@@ -3149,17 +3613,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
           `instead of calling data-heavy tools directly.\n\n${text}`;
       }
-      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController, undefined, CHAT_TIMEOUT_MS, intent, turnPolicy);
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController, undefined, CHAT_TIMEOUT_MS, intent, turnPolicy, toolset);
     }
 
     // Track exchange count, timestamp, and last exchange.
     // Never store API error responses — they poison session history and create
     // a self-reinforcing loop where every subsequent request replays the errors.
-    const isApiError = responseText.startsWith('Error:') && responseText.includes('API Error:');
+    const isApiError = looksLikeProviderApiErrorResponse(responseText);
     if (key && !isApiError) {
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
-      const history = this.lastExchanges.get(key) ?? [];
+      const history = turnPolicy.suppressContextInjection ? [] : (this.lastExchanges.get(key) ?? []);
       history.push({ user: text, assistant: responseText });
       if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
         this.lastExchanges.set(key, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
@@ -3264,16 +3728,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     timeoutMs?: number,
     intentClassification?: IntentClassification,
     turnPolicy?: TurnPolicy,
+    toolset: ToolsetName = 'auto',
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
     const effectiveTurnPolicy = turnPolicy ?? (intentClassification
-      ? decideTurnPolicy({
+      ? decideTurn({
         text: prompt,
         intent: intentClassification,
         hasRecentContext: hasActiveSession || ((sessionKey ? this.lastExchanges.get(sessionKey)?.length : 0) ?? 0) > 0,
-      })
+      }).policy
       : undefined);
     const retrievalTier = effectiveTurnPolicy?.retrievalTier ?? 'full';
     const [rawContext, autoMatchedProject, linkContexts] = await Promise.all([
@@ -3350,6 +3815,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Flipped true on the first intervention; subsequent replies go through
     // un-validated (but still logged).
     let contradictionRetried = false;
+    let contextRecoveryRetries = 0;
+    let noResponseRetried = false;
+    let rotateSessionAfterTurn = false;
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
@@ -3368,6 +3836,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           intentClassification,
           turnPolicy: effectiveTurnPolicy,
           effort: effectiveTurnPolicy?.effort ?? intentClassification?.suggestedEffort,
+          toolset,
           // Route destructive/admin/local write decisions from the direct user
           // request only. Retrieved memory may still contribute integration
           // continuity via contextRoutingText, but stale memories should not
@@ -3382,7 +3851,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
 
         // Set resume session if available
-        if (sessionKey && this.sessions.has(sessionKey)) {
+        if (sessionKey && this.sessions.has(sessionKey) && !effectiveTurnPolicy?.suppressSessionResume) {
           sdkOptions.resume = this.sessions.get(sessionKey);
         }
 
@@ -3573,6 +4042,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               sessionId = result.session_id;
               this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
               this.logQueryResult(result, 'chat', sessionKey ?? 'unknown', undefined, profile?.slug);
+              const hiddenSessionTokens = resultInputTokens(result);
+              if (sessionKey && hiddenSessionTokens >= SESSION_ROTATE_INPUT_TOKENS) {
+                rotateSessionAfterTurn = true;
+                logger.warn({
+                  sessionKey,
+                  inputTokens: hiddenSessionTokens,
+                  threshold: SESSION_ROTATE_INPUT_TOKENS,
+                }, 'SDK session near context ceiling — will rotate after this turn');
+              }
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
@@ -3590,6 +4068,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       `• Reply "deep mode" to queue this as a background task with a bigger budget\n` +
                       `• Raise the cap permanently: \`clementine config set BUDGET_CHAT_USD 10\` then \`clementine restart\``
                     );
+                  } else if (isCreditBalanceError(errorText)) {
+                    markBackgroundCreditBlocked(errorText);
+                    responseText = responseText || (
+                      'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
+                    );
+                  } else if (looksLikeOneMillionContextError(errorText)) {
+                    applyOneMillionContextRecovery();
+                    if (sessionKey) {
+                      this.sessions.delete(sessionKey);
+                      this.exchangeCounts.set(sessionKey, 0);
+                      this._compactedSessions.delete(sessionKey);
+                    }
+                    responseText = responseText || (
+                      oneMillionContextRecoveryMessage()
+                    );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
                   } else if (lower.includes('maximum number of turns') || lower.includes('max_turns')) {
@@ -3598,7 +4091,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
                     // Auth errors — throw so the gateway circuit breaker catches it
                     throw new Error(errorText);
-                  } else if (lower.includes('autocompact') || lower.includes('thrash') || lower.includes('context refilled to the limit')) {
+                  } else if (looksLikeContextThrashText(errorText)) {
                     // Autocompact thrashing — treat like the exception path
                     logger.warn({ sessionKey }, 'Autocompact thrashing (result error) — will rotate session');
                     // Capture mid-task state BEFORE rotating, so the retry
@@ -3632,6 +4125,32 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               } else if ('result' in result && (result as any).result) {
                 // Success: use SDK result text if streaming didn't capture a substantive response
                 const sdkResult = (result as any).result as string;
+                if (looksLikeOneMillionContextError(sdkResult)) {
+                  logger.warn({ sessionKey }, '1M context error surfaced as SDK result text — forcing recovery');
+                  applyOneMillionContextRecovery();
+                  if (sessionKey) {
+                    this.sessions.delete(sessionKey);
+                    this.exchangeCounts.set(sessionKey, 0);
+                    this._compactedSessions.delete(sessionKey);
+                  }
+                  responseText = oneMillionContextRecoveryMessage();
+                  if (onText) await onText(responseText);
+                } else if (looksLikeContextThrashText(sdkResult)) {
+                  logger.warn({ sessionKey }, 'Autocompact thrashing surfaced as SDK result text — rotating session');
+                  preRotationSnapshot = {
+                    toolCalls: stallGuard?.getToolCalls() ?? [],
+                    partialText: responseText.slice(-1000),
+                  };
+                  if (sessionKey) {
+                    try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+                    this.sessions.delete(sessionKey);
+                    this.exchangeCounts.set(sessionKey, 0);
+                    this._compactedSessions.delete(sessionKey);
+                  }
+                  staleSession = true;
+                  contextRecovery = true;
+                  break;
+                }
                 logger.info({ sessionKey, streamedLen: responseText.length, resultLen: sdkResult.length }, 'SDK result text available');
                 if (!responseText.trim()) {
                   responseText = sdkResult;
@@ -3673,6 +4192,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             } else {
               responseText += '\n\nI ran out of time but here\'s what I have so far. Want me to continue?';
             }
+          } else if (isCreditBalanceError(e)) {
+            markBackgroundCreditBlocked(e);
+            responseText = responseText || (
+              'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
+            );
+          } else if (looksLikeOneMillionContextError(e)) {
+            applyOneMillionContextRecovery();
+            if (sessionKey) {
+              this.sessions.delete(sessionKey);
+              this.exchangeCounts.set(sessionKey, 0);
+              this._compactedSessions.delete(sessionKey);
+            }
+            responseText = responseText || (
+              oneMillionContextRecoveryMessage()
+            );
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
             // Try to respect any retry hint the server surfaced in the error text.
@@ -3685,7 +4219,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 rateLimitRetryAfterMs = unit.startsWith('ms') || unit.startsWith('milli') ? n : n * 1000;
               }
             }
-          } else if (errStr.includes('autocompact') || errStr.includes('thrash') || errStr.includes('context refilled to the limit')) {
+          } else if (looksLikeContextThrashText(e)) {
             // SDK autocompact thrashing — tool outputs are too large for the context window.
             // Rotate session and retry with a fresh context so the agent can continue.
             logger.warn({ sessionKey }, 'Autocompact thrashing — rotating session and retrying');
@@ -3701,13 +4235,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               this.exchangeCounts.set(sessionKey, 0);
               this._compactedSessions.delete(sessionKey);
             }
-            if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+            if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && contextRecoveryRetries < 1) {
+              contextRecoveryRetries++;
               prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
               preRotationSnapshot = null;
               responseText = '';
               continue;
             }
-            responseText = responseText || 'The conversation context filled up from large tool outputs. I\'ve reset the session — please try again, and I\'ll keep query results smaller this time.';
+            responseText = responseText || contextThrashRecoveryNotice();
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || (
               'The conversation got too large to process (tool responses filled the context window). ' +
@@ -3750,11 +4285,23 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (staleSession && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
           responseText = '';
           if (contextRecovery) {
-            prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
-            preRotationSnapshot = null;
-            contextRecovery = false;
+            if (contextRecoveryRetries >= 1) {
+              responseText = contextThrashRecoveryNotice();
+              staleSession = false;
+              contextRecovery = false;
+            } else {
+              contextRecoveryRetries++;
+              prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+              preRotationSnapshot = null;
+              contextRecovery = false;
+              continue;
+            }
+          } else {
+            continue;
           }
-          continue;
+        }
+        if (staleSession && contextRecovery && !responseText.trim()) {
+          responseText = contextThrashRecoveryNotice();
         }
 
         if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
@@ -3773,6 +4320,46 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
         if (hitRateLimit && !responseText) {
           responseText = "I'm being rate limited right now. Give me a minute and try again.";
+        }
+
+        if (looksLikeContextThrashText(responseText)) {
+          logger.warn({ sessionKey }, 'Autocompact thrashing escaped into response text — rotating session before reply');
+          if (sessionKey) {
+            try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+            this.sessions.delete(sessionKey);
+            this.exchangeCounts.set(sessionKey, 0);
+            this._compactedSessions.delete(sessionKey);
+          }
+          if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && contextRecoveryRetries < 1) {
+            contextRecoveryRetries++;
+            prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+            preRotationSnapshot = null;
+            responseText = '';
+            continue;
+          }
+          responseText = contextThrashRecoveryNotice();
+        }
+
+        if (looksLikeNoResponseRequested(responseText)) {
+          logger.warn({ sessionKey, attempt }, 'SDK/model returned no-response sentinel during interactive chat');
+          if (!noResponseRetried && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+            noResponseRetried = true;
+            if (sessionKey) {
+              this.sessions.delete(sessionKey);
+              this.exchangeCounts.set(sessionKey, 0);
+              this._compactedSessions.delete(sessionKey);
+            }
+            prompt =
+              `[RESPONSE REQUIRED]\n` +
+              `This is an interactive user message. The previous attempt returned "No response requested", which is invalid for a direct chat turn.\n\n` +
+              `Answer the user's message directly and briefly. If you need more information, ask one clear question.\n\n` +
+              `User message:\n${prompt}`;
+            responseText = '';
+            sessionId = '';
+            rotateSessionAfterTurn = false;
+            continue;
+          }
+          responseText = "I'm here. What would you like me to do?";
         }
 
         // ── Response guarantee ─────────────────────────────────────────
@@ -3797,8 +4384,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
 
-        if (sessionKey && sessionId) {
+        if (sessionKey && sessionId && !rotateSessionAfterTurn) {
           this.sessions.set(sessionKey, sessionId);
+        } else if (sessionKey && rotateSessionAfterTurn) {
+          this.sessions.delete(sessionKey);
+          this.exchangeCounts.set(sessionKey, 0);
+          this._compactedSessions.delete(sessionKey);
+          logger.info({ sessionKey }, 'Rotated SDK session after high-token turn');
         }
 
         // Log tool calls to transcript for audit trail
@@ -4006,18 +4598,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    *
    * No LLM call — uses buildLocalSummary for instant summarization.
    */
-  private compactContext(sessionKey: string): void {
-    const summary = this.buildLocalSummary(sessionKey);
-    if (!summary) return;
+  private compactContext(sessionKey: string, reason: string = 'context_guard'): string | null {
+    const summary = this.buildStructuredCompactionSummary(sessionKey);
+    if (!summary) return null;
 
     // Build compaction block for working memory
     const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const parentSessionId = this.sessions.get(sessionKey) ?? null;
     const COMPACTION_START = '<!-- COMPACTION_START -->';
     const COMPACTION_END = '<!-- COMPACTION_END -->';
     const compactionBlock = [
       COMPACTION_START,
       `## Session Compaction (auto-generated)`,
       `Session ${sessionKey} compacted at ${exchangeCount} exchanges.`,
+      `Reason: ${reason}.`,
       ``,
       summary,
       ``,
@@ -4057,6 +4651,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // If working memory write fails, still rotate — better than hitting the hard limit
     }
 
+    try {
+      this.memoryStore?.saveSessionSummary?.(sessionKey, summary, exchangeCount);
+      this.memoryStore?.recordSessionLineage?.({
+        sessionKey,
+        parentSessionId,
+        childSessionId: null,
+        reason,
+        summary,
+        exchangeCount,
+      });
+    } catch {
+      // Durable lineage is helpful, not required for compaction safety.
+    }
+
     // Rotate session — clear the session ID so next query starts fresh
     // The working memory summary will provide continuity
     this.sessions.delete(sessionKey);
@@ -4065,6 +4673,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     this.sessionTimestamps.delete(sessionKey);
     this.stallNudges.delete(sessionKey);
     this.saveSessions();
+    return summary;
+  }
+
+  compactSessionForGateway(sessionKey: string, reason: string = 'gateway_preflight'): {
+    compacted: boolean;
+    exchangeCount: number;
+    summary?: string;
+    reason: string;
+  } {
+    const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const summary = this.compactContext(sessionKey, reason);
+    return summary
+      ? { compacted: true, exchangeCount, summary, reason }
+      : { compacted: false, exchangeCount, reason };
   }
 
   /**
@@ -4089,7 +4711,44 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * to avoid blocking the user's query.
    */
   private buildLocalSummary(sessionKey: string): string {
-    return this.buildLocalSummaryFromTurns(this.lastExchanges.get(sessionKey) ?? []);
+    let exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    if (exchanges.length === 0 && this.memoryStore && typeof this.memoryStore.getTranscriptTail === 'function') {
+      try {
+        const recent = this.memoryStore.getTranscriptTail(
+          sessionKey,
+          0,
+          SESSION_EXCHANGE_HISTORY_SIZE * 2,
+        ) as Array<{ role: string; content: string }>;
+        exchanges = this.pairTranscriptTurns(recent ?? []);
+      } catch {
+        exchanges = [];
+      }
+    }
+    return this.buildLocalSummaryFromTurns(exchanges);
+  }
+
+  private buildStructuredCompactionSummary(sessionKey: string): string {
+    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    const summary = this.buildLocalSummary(sessionKey);
+    if (!summary) return '';
+
+    const latest = exchanges.at(-1);
+    const lastUser = latest?.user
+      ? latest.user.slice(0, 400).replace(/\s+/g, ' ')
+      : '';
+    const continuity = [
+      '- Exact details remain in transcripts; use transcript_search before relying on this handoff for names, dates, IDs, files, or sent-message status.',
+      '- Keep tool outputs bounded and prefer targeted reads over full log dumps.',
+      lastUser ? `- Last visible user request: ${lastUser}` : '',
+    ].filter(Boolean);
+
+    return [
+      '### Recent Conversation',
+      summary,
+      '',
+      '### Continuity Notes',
+      continuity.join('\n'),
+    ].join('\n');
   }
 
   private buildLocalSummaryFromTurns(
@@ -4364,6 +5023,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           summaryText += extractText(blocks);
+        } else if (message.type === 'result') {
+          // Make session-summarization cost visible in usage_log. Without
+          // this, every session rotation spawned a Sonnet summarize call
+          // that didn't appear in any metric.
+          this.logQueryResult(message as SDKResultMessage, 'summarize', `summarize:${sessionKey}`);
         }
       }
 
@@ -4776,6 +5440,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       const collectedText: string[] = [];
       for await (const message of stream) {
+        if (message.type === 'result') {
+          // Auto-memory extraction fires after every substantive
+          // exchange. Before this log call, its cost was invisible in
+          // usage_log — a per-user-message Sonnet pass running silently.
+          this.logQueryResult(
+            message as SDKResultMessage,
+            'auto_memory',
+            `auto-memory:${sessionKey ?? 'unknown'}`,
+            undefined,
+            profile?.slug,
+          );
+          continue;
+        }
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           for (const block of blocks) {
@@ -4932,7 +5609,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
       } else if (message.type === 'result') {
-        this.logQueryResult(message as SDKResultMessage, 'heartbeat', 'heartbeat');
+        const result = message as SDKResultMessage;
+        if (result.is_error) {
+          const errText = 'errors' in result
+            ? result.errors.join('; ')
+            : String((result as any).result ?? '');
+          if (isCreditBalanceError(errText)) {
+            markBackgroundCreditBlocked(errText);
+            throw new Error(errText);
+          }
+          if (looksLikeOneMillionContextError(errText)) {
+            applyOneMillionContextRecovery();
+            throw new Error(errText);
+          }
+        }
+        this.logQueryResult(result, 'heartbeat', 'heartbeat');
       } else if (message.type === 'system') {
         this.captureMcpStatus(message);
       } else if (message.type === 'stream_event') {
@@ -4948,9 +5639,33 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
   async runPlanStep(
     stepId: string,
     prompt: string,
-    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }; delegateProfile?: AgentProfile; abortSignal?: AbortSignal } = {},
+    opts: {
+      tier?: number;
+      maxTurns?: number;
+      model?: string;
+      disableTools?: boolean;
+      outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
+      delegateProfile?: AgentProfile;
+      abortSignal?: AbortSignal;
+      usageSource?: string;
+      usageSessionKey?: string;
+      usageLabel?: string;
+      usageAgentSlug?: string;
+    } = {},
   ): Promise<string> {
-    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat, delegateProfile, abortSignal } = opts;
+    const {
+      tier = 2,
+      maxTurns = 15,
+      model,
+      disableTools = false,
+      outputFormat,
+      delegateProfile,
+      abortSignal,
+      usageSource = 'plan_step',
+      usageSessionKey,
+      usageLabel,
+      usageAgentSlug,
+    } = opts;
 
     // Don't mutate the global — pass source through the closure instead
     // Per-step stall guard so concurrent steps don't cross-contaminate
@@ -4996,7 +5711,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
       } else if (message.type === 'result') {
-        this.logQueryResult(message as SDKResultMessage, 'plan_step', `plan:${stepId}`, stepId);
+        this.logQueryResult(
+          message as SDKResultMessage,
+          usageSource,
+          usageSessionKey ?? `plan:${stepId}`,
+          usageLabel ?? stepId,
+          usageAgentSlug,
+        );
       }
     }
 
@@ -5081,13 +5802,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
         const parts: string[] = [`## Previous Progress (run #${progress.runCount}, ${progress.lastRunAt})`];
         if (progress.completedItems?.length > 0) {
-          parts.push(`Completed: ${progress.completedItems.slice(-10).join(', ')}`);
+          parts.push(`Completed: ${progress.completedItems.slice(-10).map(capContextItem).join(', ')}`);
         }
         if (progress.pendingItems?.length > 0) {
-          parts.push(`Pending: ${progress.pendingItems.join(', ')}`);
+          const pendingItems = progress.pendingItems.slice(0, CRON_PROGRESS_PENDING_MAX_ITEMS).map(capContextItem);
+          const suffix = progress.pendingItems.length > CRON_PROGRESS_PENDING_MAX_ITEMS
+            ? ` (${progress.pendingItems.length - CRON_PROGRESS_PENDING_MAX_ITEMS} more omitted)`
+            : '';
+          parts.push(`Pending: ${pendingItems.join(', ')}${suffix}`);
         }
         if (progress.notes) {
-          parts.push(`Notes: ${progress.notes}`);
+          parts.push(`Notes: ${capContextBlock(progress.notes, CRON_PROGRESS_NOTES_MAX_CHARS)}`);
         }
         progressContext = parts.join('\n') + '\n\n' +
           'Continue from where you left off. Use `cron_progress_write` at the end to save what you completed and what\'s pending.\n\n';
@@ -5227,8 +5952,26 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     } catch { /* non-fatal — run without skills */ }
 
+    // ── Sub-agent fan-out directive (Vision 2) ──────────────────────
+    // Detect multi-item / broad-scope signals in the job spec and
+    // prepend a hard-line fan-out mandate when found. This is what
+    // keeps the parent context clean on long jobs: each slice of work
+    // runs in an Agent sub-agent (its own context window, big tool
+    // responses contained), and the parent only sees compact summaries.
+    const { buildAlwaysOnParallelizationHint, buildFanoutDirectiveForText } = await import('./fanout-policy.js');
+    const fanoutScope = `${jobName}\n${jobPrompt}\n${cronProfile?.description ?? ''}\n${cronProfile?.systemPromptBody ?? ''}`;
+    const { directive: fanoutDirective, report: fanoutReport } = buildFanoutDirectiveForText(fanoutScope);
+    if (fanoutReport.needsFanout) {
+      logger.info({
+        job: jobName,
+        signals: fanoutReport.signals.map(s => s.pattern),
+      }, 'Fanout policy: directive injected for cron job');
+    }
+
     const prompt =
       `[Scheduled task: ${jobName}]\n\n` +
+      (fanoutDirective ? fanoutDirective + '\n\n' : '') +
+      buildAlwaysOnParallelizationHint() + '\n\n' +
       progressContext +
       goalContext +
       skillContext +
@@ -5283,11 +6026,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             // "budget" was catching Anthropic's unrelated "does not support
             // user-configurable task budgets" error and pinning perfectly
             // healthy Haiku jobs as permanent failures.
-            if (result.is_error && 'result' in result) {
-              const exitText = String((result as any).result ?? '');
+            if (result.is_error) {
+              const exitText = 'errors' in result
+                ? result.errors.join('; ')
+                : String((result as any).result ?? '');
               if (exitText.includes('max_budget_usd')) {
                 logger.warn({ job: jobName }, 'Cron job hit dollar budget cap — treating as permanent error');
                 throw new Error(`Budget exceeded for cron job '${jobName}'`);
+              }
+              if (isCreditBalanceError(exitText)) {
+                markBackgroundCreditBlocked(exitText);
+                throw new Error(exitText);
+              }
+              if (looksLikeOneMillionContextError(exitText)) {
+                applyOneMillionContextRecovery();
+                throw new Error(exitText);
               }
             }
             this.logQueryResult(result, 'cron', `cron:${jobName}`, jobName, sdkOptions.env?.CLEMENTINE_TEAM_AGENT || undefined);
@@ -5325,7 +6078,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       if (cronGuard) {
         const summary = cronGuard.getSummary();
         const mc = summary.metacognition;
-        if (mc.confidenceFinal === 'low' && deliverable && deliverable !== '__NOTHING__') {
+        if (mc.confidenceFinal === 'low' && deliverable && !isAutonomousNothingOutput(deliverable)) {
           try {
             const escalationsFile = path.join(BASE_DIR, 'escalations.json');
             const escalations: Array<Record<string, unknown>> = fs.existsSync(escalationsFile)
@@ -5421,6 +6174,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           responseText += extractText(blocks);
+        } else if (message.type === 'result') {
+          // Cron reflection (post-task quality check) fires after every
+          // cron run. Cheap (Haiku, 1 turn, ~1KB) but should be visible.
+          this.logQueryResult(message as SDKResultMessage, 'cron_reflection', `reflection:${jobName}`, jobName);
         }
       }
 
@@ -5518,6 +6275,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     let lastOutput = '';
     let consecutiveErrors = 0;
     const MAX_CONSECUTIVE_ERRORS = 3;
+    const unleashedContextSafety = [
+      'CONTEXT SAFETY:',
+      '- Keep each phase bounded. Do not read full run logs, full CRON.md, raw exports, or large integration responses.',
+      '- Pull records in small batches, summarize IDs/counts/statuses, and write bulky intermediate data to files instead of pasting it into the conversation.',
+      '- If the task looks too broad for the remaining context, stop with a compact status summary and pending list rather than retrying broader reads.',
+    ].join('\n');
 
     while (phase < UNLEASHED_MAX_PHASES) {
       // Check cancellation
@@ -5628,21 +6391,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       let prompt: string;
       if (phase === 1) {
+        const { buildAlwaysOnParallelizationHint, buildFanoutDirectiveForText } = await import('./fanout-policy.js');
+        const unleashedFanoutScope = `${jobName}\n${jobPrompt}\n${unleashedProfile?.description ?? ''}\n${unleashedProfile?.systemPromptBody ?? ''}`;
+        const { directive: unleashedFanoutDirective, report: unleashedFanoutReport } = buildFanoutDirectiveForText(unleashedFanoutScope);
+        if (unleashedFanoutReport.needsFanout) {
+          logger.info({
+            job: jobName,
+            phase,
+            signals: unleashedFanoutReport.signals.map(s => s.pattern),
+          }, 'Fanout policy: directive injected for unleashed phase 1');
+        }
+
         prompt =
           `[UNLEASHED TASK: ${jobName} — Phase ${phase} — ${timestamp}]\n\n` +
           `You are running in unleashed mode — a long-running autonomous task.\n` +
           `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns per phase.\n` +
           `After each phase completes, your session will be resumed with fresh context.\n\n` +
+          (unleashedFanoutDirective ? unleashedFanoutDirective + '\n\n' : '') +
+          buildAlwaysOnParallelizationHint() + '\n\n' +
           `TASK:\n${jobPrompt}\n\n` +
           unleashedSkillContext +
+          `${unleashedContextSafety}\n\n` +
           `IMPORTANT:\n` +
           `- Work methodically through the task in phases\n` +
           `- At the end of this phase, output a STATUS SUMMARY of what you accomplished and what remains\n` +
-          `- Save important intermediate results to files so they persist across phases\n\n` +
-          `PARALLELIZATION: When processing multiple items (prospects, accounts, emails, analyses), ` +
-          `use the Agent tool to spawn sub-agents that work in parallel. For example, if you need to ` +
-          `research 10 prospects, spawn 3-5 sub-agents that each handle a batch — don't process them ` +
-          `one at a time. Each sub-agent should receive specific items and return structured results.`;
+          `- Save important intermediate results to files so they persist across phases`;
       } else {
         // Phase 2+ — inject structured checkpoint from previous phase if available
         let checkpointContext = '';
@@ -5660,6 +6433,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         } catch { /* fall back to no checkpoint */ }
 
+        const { buildAlwaysOnParallelizationHint: hintFn } = await import('./fanout-policy.js');
+        const phaseParallelHint = hintFn();
+
         if (sessionId) {
           // Resuming existing session — agent has conversation history + structured checkpoint
           prompt =
@@ -5667,6 +6443,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Continuing unleashed task. This is phase ${phase}.\n` +
             `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
             checkpointContext +
+            `\n${unleashedContextSafety}\n` +
+            `\n${phaseParallelHint}\n` +
             `\nContinue working on the task. Pick up where you left off.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
@@ -5679,6 +6457,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Previous phases encountered an error and the session was reset.\n\n` +
             `TASK:\n${jobPrompt}\n` +
             checkpointContext +
+            `\n${unleashedContextSafety}\n` +
+            `\n${phaseParallelHint}\n` +
             `\nCheck any files or progress from prior phases, then continue the work.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
@@ -5803,8 +6583,49 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch (err) {
         clearTimeout(phaseTimer);
         clearInterval(beaconTimer);
+        const terminalReason = inferTerminalReasonFromFailure(err);
+        if (terminalReason && !this._lastTerminalReason) {
+          this._lastTerminalReason = terminalReason;
+        }
         logger.error({ err, jobName, phase }, `Unleashed task phase ${phase} error`);
-        appendProgress({ event: 'phase_error', phase, error: String(err) });
+        appendProgress({ event: 'phase_error', phase, error: String(err), terminalReason });
+
+        if (isCreditBalanceError(err)) {
+          markBackgroundCreditBlocked(err);
+          appendProgress({ event: 'aborted', phase, reason: 'account_usage_limit' });
+          writeStatus({
+            jobName,
+            status: 'error',
+            phase,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+          });
+          const message = (
+            `Task "${jobName}" stopped because Claude account usage or billing is blocked: ${String(err).slice(0, 500)}. ` +
+            'Background jobs have been paused so Clementine does not keep retrying against the same account limit.'
+          );
+          logger.error({ jobName, phase }, 'Unleashed task aborted on Claude account usage limit');
+          throw new UnleashedTaskFailedError(message, this._lastTerminalReason);
+        }
+
+        if (terminalReason === 'rapid_refill_breaker' || terminalReason === 'prompt_too_long') {
+          appendProgress({ event: 'aborted', phase, reason: terminalReason });
+          writeStatus({
+            jobName,
+            status: 'error',
+            phase,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            terminalReason,
+          });
+          const message = (
+            `Task "${jobName}" aborted in phase ${phase}: ${terminalReason}. ` +
+            `The phase exceeded the context window, so Clementine stopped instead of retrying the same broad task shape.`
+          );
+          logger.error({ jobName, phase, terminalReason }, 'Unleashed task aborted on context-size failure');
+          throw new UnleashedTaskFailedError(message, terminalReason);
+        }
+
         consecutiveErrors++;
 
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -5816,10 +6637,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Check \`clementine cron runs ${jobName}\` for the failing phase, or retry with ` +
             `\`clementine cron run ${jobName}\`.`
           );
-          if (this.onUnleashedComplete) {
-            try { this.onUnleashedComplete(jobName, errorResult); } catch { /* non-fatal */ }
-          }
-          return errorResult;
+          throw new UnleashedTaskFailedError(errorResult, this._lastTerminalReason);
         }
 
         // On error, try to continue with a fresh session
@@ -5872,6 +6690,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       logger.info(`Unleashed task ${jobName}: phase ${phase} complete (${(phaseDurationMs / 1000).toFixed(0)}s)`);
 
+      // The job explicitly says there is nothing to report. Treat that as a
+      // clean terminal state instead of resuming the same no-op phase until
+      // the max-phase guard fires.
+      if (isAutonomousNothingOutput(lastOutput)) {
+        appendProgress({ event: 'completed_silent', phase });
+        writeStatus({ jobName, status: 'completed', phase, startedAt, finishedAt: new Date().toISOString(), silent: true });
+        logger.info(`Unleashed task ${jobName} completed silently at phase ${phase}`);
+        if (this.onUnleashedComplete) {
+          try { this.onUnleashedComplete(jobName, '__NOTHING__'); } catch { /* non-fatal */ }
+        }
+        return '__NOTHING__';
+      }
+
       // Notify phase progress callback
       if (this.onPhaseComplete) {
         try { this.onPhaseComplete(jobName, phase, UNLEASHED_MAX_PHASES, lastOutput); } catch { /* non-fatal */ }
@@ -5897,10 +6728,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     writeStatus({ jobName, status: 'max_phases', phase, startedAt, finishedAt: new Date().toISOString() });
     logger.warn(`Unleashed task ${jobName} hit max phases (${UNLEASHED_MAX_PHASES})`);
     const maxPhasesResult = lastOutput || `Task "${jobName}" reached maximum phase limit (${UNLEASHED_MAX_PHASES}).`;
-    if (this.onUnleashedComplete) {
-      try { this.onUnleashedComplete(jobName, maxPhasesResult); } catch { /* non-fatal */ }
-    }
-    return maxPhasesResult;
+    throw new UnleashedTaskFailedError(maxPhasesResult, this._lastTerminalReason);
   }
 
   // ── Team Task Execution (Unleashed for Team Messages) ────────────
@@ -6110,9 +6938,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * a query.  Used to give the DM session visibility of cron/heartbeat outputs
    * so follow-up conversation has context.
    */
-  injectContext(sessionKey: string, userText: string, assistantText: string): void {
-    const trimmedUser = userText.slice(0, INJECTED_CONTEXT_MAX_CHARS);
-    const trimmedAssistant = assistantText.slice(0, INJECTED_CONTEXT_MAX_CHARS);
+  injectContext(
+    sessionKey: string,
+    userText: string,
+    assistantText: string,
+    opts: { pending?: boolean } = {},
+  ): void {
+    const trimmedUser = capContextBlock(userText, INJECTED_CONTEXT_MAX_CHARS);
+    const trimmedAssistant = capContextBlock(assistantText, INJECTED_CONTEXT_MAX_CHARS);
 
     // Add to in-memory exchange history
     const history = this.lastExchanges.get(sessionKey) ?? [];
@@ -6126,11 +6959,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Queue as pending context so the next chat() prepends it even
     // when an active SDK session exists (session recovery alone won't
     // help because the SDK session has no knowledge of this exchange).
-    const pending = this.pendingContext.get(sessionKey) ?? [];
-    pending.push({ user: trimmedUser, assistant: trimmedAssistant });
-    // Keep at most 3 pending to avoid bloating the next prompt
-    if (pending.length > 3) pending.shift();
-    this.pendingContext.set(sessionKey, pending);
+    if (opts.pending !== false) {
+      const pending = this.pendingContext.get(sessionKey) ?? [];
+      pending.push({ user: trimmedUser, assistant: trimmedAssistant });
+      // Keep at most 3 pending to avoid bloating the next prompt
+      if (pending.length > 3) pending.shift();
+      this.pendingContext.set(sessionKey, pending);
+    }
 
     this.sessionTimestamps.set(sessionKey, new Date());
     this.saveSessions();

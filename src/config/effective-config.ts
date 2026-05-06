@@ -58,20 +58,27 @@ const SPECS: KeySpec[] = [
   { key: 'ASSISTANT_NICKNAME', group: 'identity', default: 'Clemmy' },
   { key: 'TIMEZONE', group: 'identity', jsonPath: 'timezone', systemDefault: () => Intl.DateTimeFormat().resolvedOptions().timeZone },
 
+  // Assistant experience
+  { key: 'ASSISTANT_PROACTIVITY', group: 'assistant', jsonPath: 'assistant.proactivity', default: 'balanced' },
+  { key: 'ASSISTANT_RESPONSE_STYLE', group: 'assistant', jsonPath: 'assistant.responseStyle', default: 'balanced' },
+  { key: 'ASSISTANT_PROGRESS_VISIBILITY', group: 'assistant', jsonPath: 'assistant.progressVisibility', default: 'normal' },
+  { key: 'ASSISTANT_AUTONOMY', group: 'assistant', jsonPath: 'assistant.autonomy', default: 'balanced' },
+
   // Models
   { key: 'DEFAULT_MODEL_TIER', group: 'models', jsonPath: 'models.default', default: 'sonnet' },
   { key: 'HAIKU_MODEL', group: 'models', jsonPath: 'models.haiku', default: 'claude-haiku-4-5-20251001' },
   { key: 'SONNET_MODEL', group: 'models', jsonPath: 'models.sonnet', default: 'claude-sonnet-4-6' },
   { key: 'OPUS_MODEL', group: 'models', jsonPath: 'models.opus', default: 'claude-opus-4-7' },
-  { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', group: 'models', default: true },
+  { key: 'CLEMENTINE_1M_CONTEXT_MODE', group: 'models', default: 'auto' },
+  { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', group: 'models', default: '' },
 
   // Team routing
   { key: 'AUTO_DELEGATE_ENABLED', group: 'team', default: false },
 
   // Budgets
-  { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.50 },
-  { key: 'BUDGET_CRON_T1_USD', group: 'budgets', jsonPath: 'budgets.cronT1', default: 2.00 },
-  { key: 'BUDGET_CRON_T2_USD', group: 'budgets', jsonPath: 'budgets.cronT2', default: 5.00 },
+  { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.25 },
+  { key: 'BUDGET_CRON_T1_USD', group: 'budgets', jsonPath: 'budgets.cronT1', default: 0.75 },
+  { key: 'BUDGET_CRON_T2_USD', group: 'budgets', jsonPath: 'budgets.cronT2', default: 1.50 },
   { key: 'BUDGET_CHAT_USD', group: 'budgets', jsonPath: 'budgets.chat', default: 5.00 },
 
   // Heartbeat

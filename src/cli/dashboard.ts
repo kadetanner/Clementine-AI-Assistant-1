@@ -29,16 +29,25 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig, SessionRecord } from '../types.js';
+import type { RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
-import { AGENTS_DIR, SESSIONS_FILE } from '../config.js';
+import {
+  AGENTS_DIR,
+  SESSIONS_FILE,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 import { parseTasks } from '../tools/shared.js';
 import { todayISO } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
 import { digestRouter } from './routes/digest.js';
+import { loadClementineJson, updateClementineJson } from '../config/clementine-json.js';
+import { annotateUnleashedStatus } from '../gateway/unleashed-status.js';
+import { buildOperationsSnapshot, type BuildUsageTask } from '../dashboard/build-operations.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,9 +58,12 @@ const DIST_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js');
 const ENV_PATH = path.join(BASE_DIR, '.env');
 const VAULT_DIR = path.join(BASE_DIR, 'vault');
 const CRON_FILE = path.join(VAULT_DIR, '00-System', 'CRON.md');
+const HEARTBEAT_FILE = path.join(VAULT_DIR, '00-System', 'HEARTBEAT.md');
+const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
 const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
+const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
 
 /**
  * Kill all existing dashboard processes before starting a new one.
@@ -299,6 +311,254 @@ async function searchMemory(query: string, limit = 20, filters: SearchFilters = 
   } finally {
     db.close();
   }
+}
+
+type BrainLibraryScope = 'all' | 'memory' | 'files' | 'artifacts';
+
+type BrainLibraryResult = {
+  id: string;
+  kind: 'memory' | 'file' | 'artifact';
+  title: string;
+  subtitle: string;
+  preview: string;
+  timestamp?: string | null;
+  score?: number;
+  badges?: string[];
+  chunkId?: number;
+  artifactId?: number;
+  relPath?: string;
+  source?: string;
+};
+
+function quotedFtsQuery(query: string): string {
+  return query
+    .split(/\s+/)
+    .map((w) => w.replace(/"/g, '').trim())
+    .filter((w) => w.length > 0)
+    .map((w) => `"${w}"`)
+    .join(' OR ');
+}
+
+function textPreview(raw: string, query = '', max = 520): string {
+  const compact = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  const q = query.trim().toLowerCase();
+  if (!q) return compact.slice(0, max);
+  const idx = compact.toLowerCase().indexOf(q);
+  if (idx < 0) return compact.slice(0, max);
+  const start = Math.max(0, idx - 120);
+  const end = Math.min(compact.length, start + max);
+  return (start > 0 ? '…' : '') + compact.slice(start, end) + (end < compact.length ? '…' : '');
+}
+
+function classifyVaultOrigin(relPath: string): string {
+  if (relPath.startsWith('04-Ingest/')) return 'Seeded';
+  if (relPath.startsWith('00-System/skills/') || relPath.startsWith('00-System/workflows/') || relPath.startsWith('00-System/agents/')) {
+    return 'Agent-created';
+  }
+  if (relPath.startsWith('01-Daily/')) return 'Conversation';
+  return 'Vault';
+}
+
+async function searchBrainLibrary(query: string, limit = 30, scope: BrainLibraryScope = 'all'): Promise<{
+  results: BrainLibraryResult[];
+  totalByType: Record<string, number>;
+  dbExists: boolean;
+}> {
+  const trimmed = query.trim();
+  const lowered = trimmed.toLowerCase();
+  const qWords = lowered.split(/\s+/).filter(Boolean);
+  const perTypeLimit = Math.max(8, Math.ceil(limit / 2));
+  const results: BrainLibraryResult[] = [];
+  const totalByType: Record<string, number> = { memory: 0, files: 0, artifacts: 0 };
+  const include = (kind: BrainLibraryScope) => scope === 'all' || scope === kind;
+  const dbExists = existsSync(MEMORY_DB_PATH);
+
+  if (include('memory') && dbExists) {
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      let rows: Array<Record<string, unknown>> = [];
+      if (trimmed) {
+        const ftsQuery = quotedFtsQuery(trimmed);
+        if (ftsQuery) {
+          rows = db.prepare(
+            `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                    c.updated_at, c.source_slug, c.source_type, c.agent_slug, c.pinned,
+                    bm25(chunks_fts) AS score
+             FROM chunks_fts f
+             JOIN chunks c ON c.id = f.rowid
+             LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+             WHERE chunks_fts MATCH ? AND sd.chunk_id IS NULL
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?`,
+          ).all(ftsQuery, perTypeLimit) as Array<Record<string, unknown>>;
+        }
+      } else {
+        rows = db.prepare(
+          `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                  c.updated_at, c.source_slug, c.source_type, c.agent_slug, c.pinned,
+                  0 AS score
+           FROM chunks c
+           LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+           WHERE sd.chunk_id IS NULL
+           ORDER BY c.updated_at DESC, c.id DESC
+           LIMIT ?`,
+        ).all(perTypeLimit) as Array<Record<string, unknown>>;
+      }
+      totalByType.memory = rows.length;
+      for (const row of rows) {
+        const sourceFile = String(row.source_file ?? '');
+        const sourceSlug = row.source_slug ? String(row.source_slug) : '';
+        const section = String(row.section ?? '');
+        const score = Number(row.score ?? 0);
+        const badges = [
+          row.chunk_type ? String(row.chunk_type) : 'chunk',
+          sourceSlug ? `source:${sourceSlug}` : classifyVaultOrigin(sourceFile),
+          row.pinned ? 'pinned' : '',
+        ].filter(Boolean);
+        results.push({
+          id: `memory:${row.id}`,
+          kind: 'memory',
+          title: section || path.basename(sourceFile) || `Chunk #${row.id}`,
+          subtitle: sourceFile,
+          preview: textPreview(String(row.content ?? ''), trimmed),
+          timestamp: row.updated_at ? String(row.updated_at) : null,
+          score: trimmed ? 100 - Math.abs(score) : 0,
+          badges,
+          chunkId: Number(row.id),
+          source: sourceSlug || sourceFile,
+        });
+      }
+    } catch {
+      // Missing legacy tables should not break dashboard search.
+    } finally {
+      db.close();
+    }
+  }
+
+  if (include('artifacts') && dbExists) {
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      let rows: Array<Record<string, unknown>> = [];
+      if (trimmed) {
+        const ftsQuery = quotedFtsQuery(trimmed);
+        if (ftsQuery) {
+          rows = db.prepare(
+            `SELECT a.id, a.tool_name, a.summary, substr(a.content, 1, 900) AS preview,
+                    a.tags, a.stored_at, a.session_key, a.agent_slug, bm25(tool_artifacts_fts) AS score
+             FROM tool_artifacts_fts f
+             JOIN tool_artifacts a ON a.id = f.rowid
+             WHERE tool_artifacts_fts MATCH ?
+             ORDER BY bm25(tool_artifacts_fts)
+             LIMIT ?`,
+          ).all(ftsQuery, perTypeLimit) as Array<Record<string, unknown>>;
+        }
+      } else {
+        rows = db.prepare(
+          `SELECT id, tool_name, summary, substr(content, 1, 900) AS preview,
+                  tags, stored_at, session_key, agent_slug, 0 AS score
+           FROM tool_artifacts
+           ORDER BY stored_at DESC, id DESC
+           LIMIT ?`,
+        ).all(perTypeLimit) as Array<Record<string, unknown>>;
+      }
+      totalByType.artifacts = rows.length;
+      for (const row of rows) {
+        const tags = String(row.tags ?? '').split(',').map((t) => t.trim()).filter(Boolean).slice(0, 4);
+        results.push({
+          id: `artifact:${row.id}`,
+          kind: 'artifact',
+          title: String(row.summary ?? '').trim() || String(row.tool_name ?? 'Tool artifact'),
+          subtitle: `Tool output · ${String(row.tool_name ?? 'unknown')}`,
+          preview: textPreview(`${row.summary ?? ''}\n${row.preview ?? ''}`, trimmed),
+          timestamp: row.stored_at ? String(row.stored_at) : null,
+          score: trimmed ? 100 - Math.abs(Number(row.score ?? 0)) : 0,
+          badges: ['artifact', ...tags],
+          artifactId: Number(row.id),
+          source: row.session_key ? String(row.session_key) : undefined,
+        });
+      }
+    } catch {
+      // Artifact memory may not exist on older DBs.
+    } finally {
+      db.close();
+    }
+  }
+
+  if (include('files')) {
+    const vaultRoot = VAULT_DIR;
+    const files: BrainLibraryResult[] = [];
+    const maxScan = trimmed ? 5000 : 500;
+    let scanned = 0;
+    function walk(dir: string): void {
+      if (scanned >= maxScan) return;
+      let entries: string[] = [];
+      try { entries = readdirSync(dir); } catch { return; }
+      for (const entry of entries) {
+        if (scanned >= maxScan) break;
+        if (entry.startsWith('.')) continue;
+        const full = path.join(dir, entry);
+        let stat;
+        try { stat = statSync(full); } catch { continue; }
+        if (stat.isDirectory()) {
+          if (entry === 'node_modules' || entry === '.git') continue;
+          walk(full);
+          continue;
+        }
+        if (!entry.endsWith('.md') || entry.endsWith('.md.bak')) continue;
+        scanned += 1;
+        const relPath = path.relative(vaultRoot, full);
+        let raw = '';
+        try { raw = readFileSync(full, 'utf-8'); } catch { continue; }
+        let title = path.basename(entry, '.md');
+        let typeTag = '';
+        let content = raw;
+        try {
+          const parsed = matter(raw.slice(0, 80_000));
+          content = parsed.content || raw;
+          const data = parsed.data as Record<string, unknown>;
+          if (typeof data.title === 'string') title = data.title;
+          else if (typeof data.name === 'string') title = data.name;
+          else {
+            const h1 = content.match(/^#\s+(.+)$/m);
+            if (h1) title = h1[1].trim();
+          }
+          if (typeof data.type === 'string') typeTag = data.type;
+        } catch { /* keep filename */ }
+        const hay = `${title}\n${relPath}\n${content.slice(0, 80_000)}`.toLowerCase();
+        const match = !trimmed || qWords.every((word) => hay.includes(word)) || hay.includes(lowered);
+        if (!match) continue;
+        const titleHit = lowered && title.toLowerCase().includes(lowered) ? 30 : 0;
+        const pathHit = lowered && relPath.toLowerCase().includes(lowered) ? 18 : 0;
+        const contentHit = lowered && content.toLowerCase().includes(lowered) ? 10 : 0;
+        files.push({
+          id: `file:${relPath}`,
+          kind: 'file',
+          title,
+          subtitle: relPath,
+          preview: textPreview(content, trimmed),
+          timestamp: stat.mtime.toISOString(),
+          score: trimmed ? titleHit + pathHit + contentHit : stat.mtimeMs / 1_000_000_000,
+          badges: [typeTag || 'note', classifyVaultOrigin(relPath)].filter(Boolean),
+          relPath,
+          source: relPath,
+        });
+      }
+    }
+    if (existsSync(vaultRoot)) walk(vaultRoot);
+    files.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    totalByType.files = files.length;
+    results.push(...files.slice(0, perTypeLimit));
+  }
+
+  results.sort((a, b) => {
+    if (trimmed) return (b.score ?? 0) - (a.score ?? 0);
+    return String(b.timestamp ?? '').localeCompare(String(a.timestamp ?? ''));
+  });
+
+  return { results: results.slice(0, limit), totalByType, dbExists };
 }
 
 // ── Remote access config ────────────────────────────────────────────
@@ -1081,6 +1341,201 @@ function getCronJobs(): Record<string, unknown> {
   return { jobs: enriched };
 }
 
+function getUnleashedTasksForDashboard(): Array<Record<string, unknown>> {
+  const unleashedDir = path.join(BASE_DIR, 'unleashed');
+  if (!existsSync(unleashedDir)) return [];
+  const tasks: Array<Record<string, unknown>> = [];
+  try {
+    for (const dir of readdirSync(unleashedDir)) {
+      const dirPath = path.join(unleashedDir, dir);
+      if (!statSync(dirPath).isDirectory()) continue;
+      const statusFile = path.join(dirPath, 'status.json');
+      if (!existsSync(statusFile)) continue;
+      try {
+        const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
+        tasks.push(annotateUnleashedStatus(status, dir));
+      } catch { /* skip corrupt status */ }
+    }
+  } catch {
+    return [];
+  }
+  return tasks.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+function classifyBuildUsageSession(sessionKey: string, source: string, agentSlug?: string | null) {
+  let kind = source || 'chat';
+  let label = sessionKey || '(unknown)';
+  let taskKey = sessionKey || '(unknown)';
+  let controllable = false;
+  let targetTab: 'crons' | 'workflows' | 'sessions' = 'sessions';
+
+  if (sessionKey.startsWith('cron:')) {
+    const name = sessionKey.slice('cron:'.length);
+    kind = name.startsWith('goal:') ? 'goal task' : 'scheduled task';
+    label = name;
+    taskKey = name;
+    controllable = true;
+    targetTab = 'crons';
+  } else if (sessionKey.startsWith('unleashed:')) {
+    const name = sessionKey.slice('unleashed:'.length);
+    kind = name.startsWith('bg:') ? 'background task' : 'long-running task';
+    label = name.startsWith('bg:') ? `Deep task ${name.slice(3)}` : name;
+    taskKey = name;
+    controllable = true;
+    targetTab = 'crons';
+  } else if (sessionKey.startsWith('workflow:')) {
+    const rest = sessionKey.slice('workflow:'.length);
+    const splitAt = rest.lastIndexOf(':');
+    const workflowName = splitAt > 0 ? rest.slice(0, splitAt) : rest;
+    const stepName = splitAt > 0 ? rest.slice(splitAt + 1) : '';
+    kind = 'workflow step';
+    label = stepName ? `${workflowName} · ${stepName}` : workflowName;
+    taskKey = workflowName;
+    controllable = true;
+    targetTab = 'workflows';
+  } else if (sessionKey.startsWith('plan:')) {
+    const step = sessionKey.slice('plan:'.length);
+    kind = source === 'workflow_step' ? 'workflow step' : 'plan step';
+    label = step;
+    taskKey = step;
+    targetTab = 'workflows';
+  } else if (sessionKey.startsWith('discord:') || sessionKey.startsWith('chat:') || source === 'chat') {
+    kind = 'chat session';
+    targetTab = 'sessions';
+  }
+
+  return { kind, label, taskKey, controllable, targetTab, agentSlug: agentSlug || null };
+}
+
+async function getBuildUsageForOperations(hoursInput: unknown = 168, limitInput: unknown = 50): Promise<{
+  ok: boolean;
+  hours: number;
+  sinceIso: string;
+  totalTokens: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCostCents: number;
+  tasks: BuildUsageTask[];
+  taskTotals: { totalTokens: number; totalInput: number; totalOutput: number; costCents: number; queries: number };
+  error?: string;
+}> {
+  const hoursRaw = parseInt(String(hoursInput ?? '168'), 10);
+  const hours = Math.max(1, Math.min(Number.isFinite(hoursRaw) ? hoursRaw : 168, 24 * 90));
+  const limitRaw = parseInt(String(limitInput ?? '50'), 10);
+  const limit = Math.max(5, Math.min(Number.isFinite(limitRaw) ? limitRaw : 50, 50));
+  const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const empty = {
+    ok: true,
+    hours,
+    sinceIso,
+    totalTokens: 0,
+    totalInput: 0,
+    totalOutput: 0,
+    totalCostCents: 0,
+    tasks: [] as BuildUsageTask[],
+    taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 },
+  };
+
+  if (!existsSync(MEMORY_DB_PATH)) return empty;
+
+  const Database = (await import('better-sqlite3')).default;
+  const db = new Database(MEMORY_DB_PATH, { readonly: true });
+  try {
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+    ).get();
+    if (!tableExists) return empty;
+
+    const columns = new Set((db.prepare('PRAGMA table_info(usage_log)').all() as Array<{ name: string }>).map(c => c.name));
+    const costExpr = columns.has('cost_cents') ? 'COALESCE(SUM(cost_cents), 0)' : '0';
+    const agentExpr = columns.has('agent_slug') ? 'COALESCE(agent_slug, \'\')' : '\'\'';
+
+    const totals = db.prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) as ti,
+              COALESCE(SUM(output_tokens), 0) as to_,
+              ${costExpr} as cost
+       FROM usage_log
+       WHERE datetime(created_at) >= datetime(?)`,
+    ).get(sinceIso) as { ti: number; to_: number; cost: number };
+
+    const sessionRows = db.prepare(
+      `SELECT session_key as sessionKey,
+              source,
+              ${agentExpr} as agentSlug,
+              COUNT(*) as queries,
+              COALESCE(SUM(input_tokens), 0) as totalInput,
+              COALESCE(SUM(output_tokens), 0) as totalOutput,
+              ${costExpr} as costCents,
+              MAX(created_at) as lastAt
+       FROM usage_log
+       WHERE datetime(created_at) >= datetime(?)
+       GROUP BY session_key, source, ${agentExpr}
+       ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+    ).all(sinceIso) as Array<{
+      sessionKey: string;
+      source: string;
+      agentSlug: string;
+      queries: number;
+      totalInput: number;
+      totalOutput: number;
+      costCents: number;
+      lastAt: string;
+    }>;
+
+    const taskMap = new Map<string, BuildUsageTask>();
+    for (const row of sessionRows) {
+      const identity = classifyBuildUsageSession(row.sessionKey, row.source, row.agentSlug);
+      if (identity.kind === 'chat session') continue;
+      const mapKey = `${identity.kind}:${identity.taskKey}:${identity.agentSlug || ''}`;
+      const existing = taskMap.get(mapKey);
+      if (existing) {
+        existing.totalInput = (existing.totalInput || 0) + row.totalInput;
+        existing.totalOutput = (existing.totalOutput || 0) + row.totalOutput;
+        existing.totalTokens = (existing.totalTokens || 0) + row.totalInput + row.totalOutput;
+        existing.costCents = (existing.costCents || 0) + (row.costCents || 0);
+        existing.queries = (existing.queries || 0) + row.queries;
+        if ((row.lastAt || '') > (existing.lastAt || '')) existing.lastAt = row.lastAt;
+      } else {
+        taskMap.set(mapKey, {
+          ...identity,
+          totalInput: row.totalInput,
+          totalOutput: row.totalOutput,
+          totalTokens: row.totalInput + row.totalOutput,
+          costCents: row.costCents || 0,
+          queries: row.queries,
+          lastAt: row.lastAt,
+        });
+      }
+    }
+
+    const allTasks = Array.from(taskMap.values()).sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0));
+    const taskTotals = allTasks.reduce((acc, t) => {
+      acc.totalTokens += t.totalTokens || 0;
+      acc.totalInput += t.totalInput || 0;
+      acc.totalOutput += t.totalOutput || 0;
+      acc.costCents += t.costCents || 0;
+      acc.queries += t.queries || 0;
+      return acc;
+    }, { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 });
+
+    return {
+      ok: true,
+      hours,
+      sinceIso,
+      totalInput: totals.ti,
+      totalOutput: totals.to_,
+      totalCostCents: totals.cost,
+      totalTokens: totals.ti + totals.to_,
+      tasks: allTasks.slice(0, limit),
+      taskTotals,
+    };
+  } catch (err) {
+    return { ...empty, ok: false, error: String(err) };
+  } finally {
+    db.close();
+  }
+}
+
 function getTimers(): unknown[] {
   const timersFile = path.join(BASE_DIR, '.timers.json');
   if (!existsSync(timersFile)) return [];
@@ -1099,6 +1554,68 @@ function getHeartbeat(): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function readHeartbeatWorkQueue(): Array<Record<string, unknown>> {
+  if (!existsSync(HEARTBEAT_WORK_QUEUE_FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
+    return Array.isArray(parsed) ? parsed as Array<Record<string, unknown>> : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseHeartbeatActiveHours(value: unknown): { start: number; end: number } {
+  if (typeof value !== 'string') return { start: 8, end: 22 };
+  const match = value.match(/(\d{1,2})(?::\d{2})?\s*-\s*(\d{1,2})(?::\d{2})?/);
+  if (!match) return { start: 8, end: 22 };
+  const start = Math.max(0, Math.min(23, Number(match[1])));
+  const end = Math.max(0, Math.min(23, Number(match[2])));
+  return { start, end };
+}
+
+function getHeartbeatControl(): Record<string, unknown> {
+  let parsed: ReturnType<typeof matter> | null = null;
+  if (existsSync(HEARTBEAT_FILE)) {
+    try {
+      parsed = matter(readFileSync(HEARTBEAT_FILE, 'utf-8'));
+    } catch { /* malformed file still gets surfaced below */ }
+  }
+
+  const json = loadClementineJson(BASE_DIR);
+  const frontmatter = parsed?.data ?? {};
+  const frontHours = parseHeartbeatActiveHours(frontmatter.active_hours);
+  const interval = Number(json.heartbeat?.intervalMinutes ?? frontmatter.interval ?? 30);
+  const activeStart = Number(json.heartbeat?.activeStart ?? frontHours.start);
+  const activeEnd = Number(json.heartbeat?.activeEnd ?? frontHours.end);
+  const state = getHeartbeat();
+  const queue = readHeartbeatWorkQueue();
+  const agents = getAgentHeartbeats();
+
+  return {
+    filePath: HEARTBEAT_FILE,
+    exists: existsSync(HEARTBEAT_FILE),
+    settings: {
+      intervalMinutes: Number.isFinite(interval) ? interval : 30,
+      activeStart: Number.isFinite(activeStart) ? activeStart : 8,
+      activeEnd: Number.isFinite(activeEnd) ? activeEnd : 22,
+      allowTier2: Boolean(frontmatter.allow_tier2),
+      webAllowed: frontmatter.web_allowed !== false,
+      restartRequired: true,
+    },
+    instructions: parsed?.content.trimStart() ?? '',
+    frontmatter,
+    state,
+    workQueue: {
+      items: queue,
+      pending: queue.filter((i) => i.status === 'pending').length,
+      running: queue.filter((i) => i.status === 'running').length,
+      completed: queue.filter((i) => i.status === 'completed').length,
+      failed: queue.filter((i) => i.status === 'failed').length,
+    },
+    agents,
+  };
 }
 
 /**
@@ -1837,7 +2354,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
     // Response timeout — prevent hung handlers from blocking the connection pool.
     // Brain routes drive LLM calls + multi-file writes and need a longer budget.
-    const isLongRunning = req.path.startsWith('/brain/');
+    // SSE streaming endpoints (path ends in `/stream`) and the chat endpoints
+    // also drive LLM calls and would otherwise be killed mid-stream.
+    const isLongRunning = req.path.startsWith('/brain/')
+      || req.path.endsWith('/stream')
+      || req.path === '/chat'
+      || req.path === '/builder/chat';
     const timeoutMs = isLongRunning ? 10 * 60 * 1000 : 8000;
     const timeout = setTimeout(() => {
       if (!res.headersSent) {
@@ -1974,7 +2496,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const { query: sdkQuery } = await import('@anthropic-ai/claude-agent-sdk');
       // Close any previous auth query
       if (oauthQuery) { try { oauthQuery.close(); } catch { /* ignore */ } }
-      oauthQuery = sdkQuery({ prompt: '', options: { permissionMode: 'bypassPermissions' as any, allowDangerouslySkipPermissions: true, maxTurns: 0 } });
+      oauthQuery = sdkQuery({
+        prompt: '',
+        options: normalizeClaudeSdkOptionsForOneMillionContext({
+          permissionMode: 'bypassPermissions' as any,
+          allowDangerouslySkipPermissions: true,
+          maxTurns: 0,
+        }),
+      });
       const result = await (oauthQuery as any).claudeAuthenticate(true);
       res.json({ ok: true, result });
     } catch (err) {
@@ -2175,6 +2704,73 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getHeartbeat());
   });
 
+  app.get('/api/heartbeat/control', (_req, res) => {
+    try {
+      res.json(getHeartbeatControl());
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
+  app.put('/api/heartbeat/control', (req, res) => {
+    try {
+      const intervalMinutes = Math.max(5, Math.min(240, Math.floor(Number(req.body.intervalMinutes ?? 30))));
+      const activeStart = Math.max(0, Math.min(23, Math.floor(Number(req.body.activeStart ?? 8))));
+      const activeEnd = Math.max(0, Math.min(23, Math.floor(Number(req.body.activeEnd ?? 22))));
+      const allowTier2 = Boolean(req.body.allowTier2);
+      const webAllowed = req.body.webAllowed !== false;
+      const instructions = typeof req.body.instructions === 'string' ? req.body.instructions.trim() : '';
+      if (!instructions) {
+        res.status(400).json({ error: 'instructions are required' });
+        return;
+      }
+      if (instructions.length > 40_000) {
+        res.status(400).json({ error: 'instructions are too long' });
+        return;
+      }
+
+      const existing = existsSync(HEARTBEAT_FILE)
+        ? matter(readFileSync(HEARTBEAT_FILE, 'utf-8'))
+        : { data: {}, content: '' };
+      const existingData = (existing.data ?? {}) as Record<string, unknown>;
+      const data = {
+        ...existingData,
+        type: existingData.type ?? 'core-system',
+        role: existingData.role ?? 'heartbeat-config',
+        interval: intervalMinutes,
+        active_hours: `${String(activeStart).padStart(2, '0')}:00-${String(activeEnd).padStart(2, '0')}:00`,
+        allow_tier2: allowTier2,
+        web_allowed: webAllowed,
+        tags: Array.isArray(existingData.tags) ? existingData.tags : ['system', 'heartbeat'],
+      };
+      mkdirSync(path.dirname(HEARTBEAT_FILE), { recursive: true });
+      writeFileSync(HEARTBEAT_FILE, matter.stringify(instructions + '\n', data));
+
+      const next = updateClementineJson(BASE_DIR, (current) => ({
+        ...current,
+        heartbeat: {
+          ...(current.heartbeat ?? {}),
+          intervalMinutes,
+          activeStart,
+          activeEnd,
+        },
+      }));
+      process.env.HEARTBEAT_INTERVAL_MINUTES = String(intervalMinutes);
+      process.env.HEARTBEAT_ACTIVE_START = String(activeStart);
+      process.env.HEARTBEAT_ACTIVE_END = String(activeEnd);
+      responseCache.clear();
+
+      res.json({
+        ok: true,
+        message: 'Heartbeat controls saved. Restart the daemon for timing changes to apply.',
+        heartbeat: next.heartbeat,
+        control: getHeartbeatControl(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
   app.get('/api/agent-heartbeats', (_req, res) => {
     res.json(getAgentHeartbeats());
   });
@@ -2230,6 +2826,69 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.post('/api/background-tasks/:id/cancel', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bg-[a-z0-9]+-[a-f0-9]{6}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background task id' });
+        return;
+      }
+      const { loadBackgroundTask, markFailed } = await import('../agent/background-tasks.js');
+      const task = loadBackgroundTask(id);
+      if (!task) {
+        res.status(404).json({ error: 'Background task not found' });
+        return;
+      }
+      if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') {
+        res.json({ ok: true, message: `Background task ${id} is already ${task.status}` });
+        return;
+      }
+
+      const cancelled = markFailed(id, 'cancelled from dashboard', 'aborted');
+      if (!cancelled || cancelled.status !== 'aborted') {
+        res.json({ ok: true, message: `Background task ${id} is already ${cancelled?.status ?? 'not available'}` });
+        return;
+      }
+
+      // If the task is already running in unleashed mode, this is the cancel
+      // signal that runUnleashedTask checks at phase boundaries.
+      const safeJob = `bg:${id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const taskDir = path.join(BASE_DIR, 'unleashed', safeJob);
+      try {
+        mkdirSync(taskDir, { recursive: true });
+        writeFileSync(path.join(taskDir, 'CANCEL'), new Date().toISOString());
+      } catch { /* best-effort; the persisted abort still prevents pending pickup */ }
+
+      res.json({ ok: true, message: `Cancelled background task ${id}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
+  app.delete('/api/background-tasks/:id', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bg-[a-z0-9]+-[a-f0-9]{6}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background task id' });
+        return;
+      }
+      const { deleteBackgroundTask, loadBackgroundTask } = await import('../agent/background-tasks.js');
+      const task = loadBackgroundTask(id);
+      if (!task) {
+        res.status(404).json({ error: 'Background task not found' });
+        return;
+      }
+      if (task.status === 'pending' || task.status === 'running') {
+        res.status(409).json({ error: 'Cancel the task before clearing it.' });
+        return;
+      }
+      deleteBackgroundTask(id);
+      res.json({ ok: true, message: `Cleared background task ${id}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
   app.get('/api/autonomy', async (req, res) => {
     try {
       const { getStore } = await import('../tools/shared.js');
@@ -2252,15 +2911,18 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     const state = getHeartbeat() as Record<string, unknown>;
     const reportedTopics = (state.reportedTopics ?? []) as Array<Record<string, unknown>>;
     const topics = reportedTopics.filter(
-      (t) => t.agentSlug === slug || (typeof t.topic === 'string' && t.topic.startsWith(slug + ':')),
+      (t) => slug === '__clementine__'
+        ? !t.agentSlug
+        : (t.agentSlug === slug || (typeof t.topic === 'string' && t.topic.startsWith(slug + ':'))),
     );
 
-    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
     let queue: Array<Record<string, unknown>> = [];
     try {
-      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+      if (existsSync(HEARTBEAT_WORK_QUEUE_FILE)) queue = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
     } catch { /* empty */ }
-    const agentQueue = queue.filter((i) => i.agentSlug === slug);
+    const agentQueue = slug === '__clementine__'
+      ? queue.filter((i) => !i.agentSlug)
+      : queue.filter((i) => i.agentSlug === slug);
 
     res.json({
       topics,
@@ -2284,13 +2946,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     if (!description || !prompt) {
       return res.status(400).json({ error: 'description and prompt are required' });
     }
-    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
-    const queueDir = path.dirname(queueFile);
+    const queueDir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);
     mkdirSync(queueDir, { recursive: true });
 
     let queue: Array<Record<string, unknown>> = [];
     try {
-      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+      if (existsSync(HEARTBEAT_WORK_QUEUE_FILE)) queue = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
     } catch { /* start fresh */ }
 
     const id = randomBytes(4).toString('hex');
@@ -2307,7 +2968,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     };
     if (agentSlug) item.agentSlug = agentSlug;
     queue.push(item);
-    writeFileSync(queueFile, JSON.stringify(queue, null, 2));
+    writeFileSync(HEARTBEAT_WORK_QUEUE_FILE, JSON.stringify(queue, null, 2));
     res.json({ ok: true, id });
   });
 
@@ -2362,6 +3023,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         timeSavedMinutes: 0,
         pendingApprovals: 0,
         overdueTasks: 0,
+        tokens7d: 0,
       };
 
       // active unleashed runs
@@ -2374,7 +3036,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             if (existsSync(statusFile)) {
               try {
                 const s = JSON.parse(readFileSync(statusFile, 'utf-8'));
-                if (s.status === 'running') kpis.activeRuns++;
+                if (annotateUnleashedStatus(s, d.name).live) kpis.activeRuns++;
               } catch { /* */ }
             }
           }
@@ -2441,6 +3103,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           for (const line of lines) {
             const m = line.match(/@(\d{4}-\d{2}-\d{2})/);
             if (m && m[1] < todayStr) kpis.overdueTasks++;
+          }
+        }
+      } catch { /* */ }
+
+      // token usage this week
+      try {
+        if (existsSync(MEMORY_DB_PATH)) {
+          const Database = (await import('better-sqlite3')).default;
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          try {
+            const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'").get();
+            if (tableExists) {
+              const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+              const row = db.prepare(
+                `SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) as total
+                 FROM usage_log WHERE datetime(created_at) >= datetime(?)`,
+              ).get(sinceIso) as { total: number };
+              kpis.tokens7d = row.total || 0;
+            }
+          } finally {
+            db.close();
           }
         }
       } catch { /* */ }
@@ -2596,7 +3279,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (kpis.activeRuns > 0) {
         briefing.needsReview.push({
           text: kpis.activeRuns + ' unleashed task' + (kpis.activeRuns === 1 ? '' : 's') + ' running',
-          href: '#build/workflows',
+          href: '#build/crons',
         });
       }
       // Broken jobs (consecutive failures)
@@ -2639,12 +3322,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const folderFilter = typeof req.query.folder === 'string' ? req.query.folder : '';
       const search = typeof req.query.q === 'string' ? req.query.q.toLowerCase() : '';
       const includeAuto = req.query.includeAuto === '1';
+      const typeFilter = typeof req.query.type === 'string' ? req.query.type : '';
+      const tagFilter = typeof req.query.tag === 'string' ? req.query.tag : '';
       const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
       const vaultRoot = path.join(BASE_DIR, 'vault');
       const matter = (await import('gray-matter')).default;
       const files: Array<{
         path: string; relPath: string; title: string; folder: string;
-        agentSlug: string | null; mtime: string; sizeBytes: number; type: string | null;
+        agentSlug: string | null; mtime: string; sizeBytes: number;
+        type: string | null; category: string | null; tags: string[];
       }> = [];
       function walk(dir: string) {
         let entries: string[] = [];
@@ -2675,6 +3361,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           // Skip system housekeeping files (their author will surface via mtime in agent's own dir)
           let title = path.basename(rel, '.md');
           let typeTag: string | null = null;
+          let categoryTag: string | null = null;
+          let tags: string[] = [];
           try {
             const head = readFileSync(full, 'utf-8').slice(0, 4000);
             const parsed = matter(head);
@@ -2686,6 +3374,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
               if (h1) title = h1[1].trim();
             }
             if (typeof data.type === 'string') typeTag = data.type;
+            if (typeof data.category === 'string') categoryTag = data.category;
+            if (Array.isArray(data.tags)) {
+              tags = data.tags.filter((t): t is string => typeof t === 'string');
+            } else if (typeof data.tags === 'string') {
+              tags = data.tags.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+            }
           } catch { /* */ }
           files.push({
             path: full,
@@ -2696,6 +3390,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             mtime: new Date(stat.mtimeMs).toISOString(),
             sizeBytes: stat.size,
             type: typeTag,
+            category: categoryTag,
+            tags,
           });
         }
       }
@@ -2706,17 +3402,30 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           if (agentFilter === '__shared__' && f.agentSlug != null) return false;
           if (agentFilter && agentFilter !== '__shared__' && f.agentSlug !== agentFilter) return false;
           if (folderFilter && f.folder !== folderFilter) return false;
+          if (typeFilter && f.type !== typeFilter) return false;
+          if (tagFilter && !f.tags.includes(tagFilter)) return false;
           if (search) {
-            const hay = (f.title + ' ' + f.relPath).toLowerCase();
+            const hay = (
+              f.title + ' ' + f.relPath + ' ' +
+              (f.type || '') + ' ' + (f.category || '') + ' ' +
+              f.tags.join(' ')
+            ).toLowerCase();
             if (!hay.includes(search)) return false;
           }
           return true;
         })
         .slice(0, limit);
-      // Compute folder counts for filter chips
+      // Facet counts reflect the unfiltered set so the rail keeps the full
+      // vocabulary visible after a filter is applied.
       const folderCounts: Record<string, number> = {};
-      for (const f of files) folderCounts[f.folder] = (folderCounts[f.folder] || 0) + 1;
-      res.json({ files: filtered, total: files.length, folderCounts });
+      const typeCounts: Record<string, number> = {};
+      const tagCounts: Record<string, number> = {};
+      for (const f of files) {
+        folderCounts[f.folder] = (folderCounts[f.folder] || 0) + 1;
+        if (f.type) typeCounts[f.type] = (typeCounts[f.type] || 0) + 1;
+        for (const t of f.tags) tagCounts[t] = (tagCounts[t] || 0) + 1;
+      }
+      res.json({ files: filtered, total: files.length, folderCounts, typeCounts, tagCounts });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -2728,6 +3437,22 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (!relPath || relPath.includes('..')) { res.status(400).json({ error: 'Bad path' }); return; }
       const full = path.join(BASE_DIR, 'vault', relPath);
       if (!existsSync(full)) { res.status(404).json({ error: 'Not found' }); return; }
+      const headOnly = req.query.head === '1';
+      if (headOnly) {
+        const stat = statSync(full);
+        const head = readFileSync(full, 'utf-8').slice(0, 4000);
+        const matter = (await import('gray-matter')).default;
+        const parsed = matter(head);
+        const snippet = (parsed.content || '').replace(/^#+\s.*$/m, '').trim().slice(0, 400);
+        res.json({
+          path: relPath,
+          frontmatter: parsed.data,
+          snippet,
+          sizeBytes: stat.size,
+          mtime: new Date(stat.mtimeMs).toISOString(),
+        });
+        return;
+      }
       const content = readFileSync(full, 'utf-8');
       res.json({ path: relPath, content });
     } catch (err) {
@@ -2987,6 +3712,46 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.post('/api/builder/workflows/:id/run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const body = (req.body ?? {}) as { inputs?: Record<string, string>; approvedSideEffects?: boolean };
+      const sideEffects = wf.steps
+        .filter(step => {
+          const kind = step.kind ?? 'prompt';
+          if (kind === 'channel' || kind === 'mcp') return true;
+          return /\b(send|post|publish|email|webhook|delete|write|update|create)\b/i.test(step.prompt || '');
+        })
+        .map(step => ({
+          id: step.id,
+          kind: step.kind ?? 'prompt',
+          label: step.channel ? `${step.channel.channel}:${step.channel.target}` : step.mcp ? `${step.mcp.server}.${step.mcp.tool}` : step.prompt.slice(0, 80),
+        }));
+      if (sideEffects.length > 0 && body.approvedSideEffects !== true) {
+        res.status(409).json({
+          ok: false,
+          error: 'approval_required',
+          message: 'This workflow may send, write, post, or call external tools. Approve side effects before running it.',
+          sideEffects,
+        });
+        return;
+      }
+      res.json({ ok: true, message: `Workflow "${wf.name}" triggered` });
+      broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
+
+      getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
+      }).catch(err => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'error', error: String(err) } });
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to trigger workflow', detail: String(err) });
+    }
+  });
+
   app.get('/api/builder/mcp-discovery', async (_req, res) => {
     try {
       const { discoverMcpServers, loadToolInventory } = await import('../agent/mcp-bridge.js');
@@ -3153,6 +3918,351 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.json({ ok: true, id });
     } catch (err) {
       res.status(500).json({ error: 'Create failed', detail: String(err) });
+    }
+  });
+
+  // ── Routines API (canonical surface for the Build tab) ─────────
+  // The "Routines" UI uses this surface exclusively. Workflows + cron
+  // jobs both flow through here as a single Routine concept; legacy
+  // /api/builder/* and /api/cron/* endpoints remain for one minor
+  // version, then are removed.
+
+  app.get('/api/routines', async (_req, res) => {
+    try {
+      const { listAllForBuilder } = await import('../dashboard/builder/serializer.js');
+      res.json({ routines: listAllForBuilder() });
+    } catch (err) {
+      res.status(500).json({ error: 'list failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/mcp-tools', async (_req, res) => {
+    try {
+      const { discoverMcpServers, loadToolInventory } = await import('../agent/mcp-bridge.js');
+      const servers = discoverMcpServers();
+      const inv = loadToolInventory();
+      const allTools = inv?.tools ?? [];
+      // Group flat tool names of shape `mcp__<server>__<tool>` (server may
+      // contain underscores — split on the first `__` after the prefix).
+      const grouped: Record<string, { name: string; enabled: boolean; tools: string[] }> = {};
+      for (const s of servers) {
+        grouped[s.name] = { name: s.name, enabled: s.enabled !== false, tools: [] };
+      }
+      for (const t of allTools) {
+        if (!t.startsWith('mcp__')) continue;
+        const rest = t.slice(5);
+        const idx = rest.indexOf('__');
+        if (idx < 0) continue;
+        const server = rest.slice(0, idx);
+        const tool = rest.slice(idx + 2);
+        if (!grouped[server]) grouped[server] = { name: server, enabled: true, tools: [] };
+        if (!grouped[server].tools.includes(tool)) grouped[server].tools.push(tool);
+      }
+      const out = Object.values(grouped)
+        .filter(s => s.tools.length > 0 || s.enabled)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json({ servers: out });
+    } catch (err) {
+      res.status(500).json({ error: 'mcp-tools failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/cli-tools', async (_req, res) => {
+    try {
+      // Reuse discoverCliTools() defined elsewhere in this file.
+      const tools = discoverCliTools().filter(t => t.installed && !t.blocked);
+      res.json({ tools: tools.map(t => ({ cmd: t.name, description: t.description, userDefined: !!t.userDefined })) });
+    } catch (err) {
+      res.status(500).json({ error: 'cli-tools failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const { validateWorkflow } = await import('../dashboard/builder/validation.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json({ id, routine: wf, validation: validateWorkflow(wf) });
+    } catch (err) {
+      res.status(500).json({ error: 'read failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines', async (req, res) => {
+    try {
+      const body = req.body as {
+        name?: string;
+        description?: string;
+        schedule?: string;
+        initialPrompt?: string;
+        agent?: string;
+        model?: string;
+        // Chat-first builder may pass the agent's drafted steps as a YAML-ish
+        // string (top-level keys are step ids, values have prompt/dependsOn/etc).
+        draftYaml?: string;
+      };
+      if (!body || !body.name) { res.status(400).json({ error: 'name required' }); return; }
+      const [{ saveWorkflow, workflowId: makeId }, { emitBuilderEvent }, yamlMod] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+        import('js-yaml'),
+      ]);
+      const slug = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'routine';
+      const agentSlug = body.agent ? (String(body.agent).trim() || undefined) : undefined;
+
+      // Parse the agent's draft if present; on any parse error fall back to the
+      // single-step stub so the user lands in the editor with something usable.
+      let steps: Array<Record<string, unknown>> | null = null;
+      if (body.draftYaml && typeof body.draftYaml === 'string') {
+        try {
+          const parsed = yamlMod.load(body.draftYaml) as Record<string, unknown> | null;
+          if (parsed && typeof parsed === 'object') {
+            steps = Object.entries(parsed).map(([id, raw]) => {
+              const r = (raw && typeof raw === 'object') ? raw as Record<string, unknown> : {};
+              const dependsOn = Array.isArray(r.dependsOn)
+                ? r.dependsOn.map(String)
+                : (typeof r.dependsOn === 'string' ? r.dependsOn.split(',').map(s => s.trim()).filter(Boolean) : []);
+              return {
+                id: String(id),
+                prompt: String(r.prompt ?? ''),
+                dependsOn,
+                tier: typeof r.tier === 'number' ? r.tier : 1,
+                maxTurns: typeof r.maxTurns === 'number' ? r.maxTurns : 15,
+                ...(typeof r.model === 'string' ? { model: r.model } : {}),
+                ...(typeof r.workDir === 'string' ? { workDir: r.workDir } : {}),
+                ...(typeof r.kind === 'string' && r.kind !== 'prompt' ? { kind: r.kind } : {}),
+              };
+            }).filter(s => s.id);
+            if (steps.length === 0) steps = null;
+          }
+        } catch {
+          steps = null;
+        }
+      }
+      const wf = {
+        name: body.name,
+        description: body.description ?? '',
+        enabled: true,
+        trigger: body.schedule ? { schedule: body.schedule, manual: false } : { manual: true },
+        inputs: {},
+        steps: (steps ?? [{
+          id: 's1',
+          prompt: body.initialPrompt ?? 'Describe what this trick should do.',
+          dependsOn: [],
+          tier: 1,
+          maxTurns: 15,
+        }]) as unknown as WorkflowDefinition['steps'],
+        sourceFile: '',
+        agentSlug,
+        ...(body.model ? { model: body.model } : {}),
+      } as WorkflowDefinition;
+      const id = makeId(slug, agentSlug);
+      const result = saveWorkflow(id, wf);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:created', workflowId: id, payload: { workflow: wf } });
+      res.json({ ok: true, id });
+    } catch (err) {
+      res.status(500).json({ error: 'create failed', detail: String(err) });
+    }
+  });
+
+  app.put('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = req.body as { routine?: unknown; force?: boolean };
+      if (!body || typeof body.routine !== 'object') { res.status(400).json({ error: 'Missing routine body' }); return; }
+      const [{ readWorkflow, saveWorkflow }, { validateWorkflow }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const existing = readWorkflow(id);
+      if (!existing) { res.status(404).json({ error: 'Not found' }); return; }
+      const incoming = body.routine as Record<string, unknown>;
+      const next = { ...(incoming as object), sourceFile: existing.sourceFile } as typeof existing;
+      const v = validateWorkflow(next);
+      if (!v.ok && !body.force) { res.status(400).json({ error: 'validation', validation: v }); return; }
+      const result = saveWorkflow(id, next);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { workflow: next } });
+      res.json({ ok: true, validation: v });
+    } catch (err) {
+      res.status(500).json({ error: 'save failed', detail: String(err) });
+    }
+  });
+
+  app.delete('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow, parseBuilderId }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const parsed = parseBuilderId(id);
+      if (!parsed) { res.status(400).json({ error: 'Bad id' }); return; }
+      if (parsed.origin === 'cron') {
+        res.status(400).json({ error: 'This trick came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
+        return;
+      }
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      if (wf.sourceFile && existsSync(wf.sourceFile)) unlinkSync(wf.sourceFile);
+      emitBuilderEvent({ type: 'workflow:deleted', workflowId: id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/toggle', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow, saveWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      wf.enabled = !wf.enabled;
+      const result = saveWorkflow(id, wf);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      res.json({ ok: true, enabled: wf.enabled });
+    } catch (err) {
+      res.status(500).json({ error: 'toggle failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow, parseBuilderId } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const parsed = parseBuilderId(id);
+      const body = (req.body ?? {}) as { inputs?: Record<string, string>; approvedSideEffects?: boolean };
+
+      // Cron-origin routines: spawn the cli `cron run <name>` (single-step prompt path).
+      if (parsed?.origin === 'cron') {
+        const child = spawn('node', [DIST_ENTRY, 'cron', 'run', wf.name], {
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: BASE_DIR,
+          env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+        });
+        child.on('exit', (code) => {
+          broadcastEvent({ type: 'cron_complete', data: { job: wf.name, code } });
+          responseCache.delete('activity:');
+        });
+        child.unref();
+        broadcastEvent({ type: 'cron_triggered', data: { job: wf.name } });
+        res.json({ ok: true, message: `Triggered trick: ${wf.name}` });
+        return;
+      }
+
+      // Workflow-origin routines: side-effect approval gate, then route through gateway.handleWorkflow.
+      const sideEffects = wf.steps
+        .filter(step => {
+          const kind = step.kind ?? 'prompt';
+          if (kind === 'channel' || kind === 'mcp' || kind === 'cli') return true;
+          return /\b(send|post|publish|email|webhook|delete|write|update|create)\b/i.test(step.prompt || '');
+        })
+        .map(step => ({
+          id: step.id,
+          kind: step.kind ?? 'prompt',
+          label: step.channel
+            ? `${step.channel.channel}:${step.channel.target}`
+            : step.mcp
+              ? `${step.mcp.server}.${step.mcp.tool}`
+              : step.cli
+                ? `${step.cli.cmd}${step.cli.args?.length ? ' ' + step.cli.args.join(' ') : ''}`
+                : step.prompt.slice(0, 80),
+        }));
+      if (sideEffects.length > 0 && body.approvedSideEffects !== true) {
+        res.status(409).json({
+          ok: false,
+          error: 'approval_required',
+          message: 'This trick may send, write, post, or call external tools. Approve side effects before running it.',
+          sideEffects,
+        });
+        return;
+      }
+      res.json({ ok: true, message: `Trick "${wf.name}" triggered` });
+      broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
+      getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
+      }).catch(err => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'error', error: String(err) } });
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'run failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/dry-run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow }, { dryRunWorkflow }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/dry-run.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json(dryRunWorkflow(wf));
+    } catch (err) {
+      res.status(500).json({ error: 'dry-run failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/test', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = (req.body ?? {}) as { mode?: 'mock' | 'real'; perStepTimeoutMs?: number; totalBudgetMs?: number };
+      const [{ readWorkflow }, { runWorkflowTest }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/runner.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const runId = (await import('node:crypto')).randomUUID();
+      res.json({ ok: true, runId });
+      runWorkflowTest(wf, {
+        workflowId: id,
+        runId,
+        mode: body.mode ?? 'mock',
+        perStepTimeoutMs: body.perStepTimeoutMs,
+        totalBudgetMs: body.totalBudgetMs,
+      }).catch(() => { /* errors already streamed via events */ });
+    } catch (err) {
+      res.status(500).json({ error: 'test failed to start', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/:id/runs', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const safe = wf.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const cronLogPath = path.join(BASE_DIR, 'cron-logs', `${safe}.jsonl`);
+      const workflowLogPath = path.join(BASE_DIR, 'workflows', 'runs', `${safe}.jsonl`);
+      const runs: Record<string, unknown>[] = [];
+      for (const file of [cronLogPath, workflowLogPath]) {
+        if (!existsSync(file)) continue;
+        try {
+          const lines = readFileSync(file, 'utf-8').split('\n').filter(l => l.trim());
+          for (const line of lines.slice(-50)) {
+            try { runs.push(JSON.parse(line) as Record<string, unknown>); } catch { /* skip malformed */ }
+          }
+        } catch { /* skip unreadable */ }
+      }
+      runs.sort((a, b) => {
+        const at = String((a.startedAt as string) || (a.timestamp as string) || '');
+        const bt = String((b.startedAt as string) || (b.timestamp as string) || '');
+        return bt.localeCompare(at);
+      });
+      res.json({ runs: runs.slice(0, 50) });
+    } catch (err) {
+      res.status(500).json({ error: 'runs read failed', detail: String(err) });
     }
   });
 
@@ -3537,14 +4647,22 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // a source-registry row pointing at the feed's target folder. Feeds are
   // built from recipes in src/brain/connector-recipes.ts — the wizard in
   // the Intelligence → Sources tab composes recipe + field values + schedule
-  // into a cron prompt that uses the user's authenticated Claude Desktop
-  // connectors (Google Drive, Gmail, Outlook, etc.) to pull records and
-  // calls brain_ingest_folder to commit them.
+  // into a cron prompt that uses the user's authenticated tool source
+  // (Claude Desktop connector, Composio toolkit, or local MCP server) to pull
+  // records, compare them with memory, and call brain_ingest_folder to commit
+  // distilled notes.
 
   app.get('/api/brain/connectors', async (_req, res) => {
     try {
       const { getClaudeIntegrations, loadToolInventory } = await import('../agent/mcp-bridge.js');
       const { RECIPES } = await import('../brain/connector-recipes.js');
+      const { KNOWN_SERVICES } = await import('../integrations/tool-preferences.js');
+      const serviceLabelByComposioSlug = new Map(
+        KNOWN_SERVICES
+          .filter((s) => s.composioSlug)
+          .map((s) => [s.composioSlug!, s.label]),
+      );
+      const recipeIntegrations = new Set(RECIPES.map((r) => r.integration));
 
       // Claude Desktop integrations carry richer metadata (label, connected
       // state, firstSeen/lastUsed). Everything else we infer from the SDK
@@ -3568,7 +4686,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const integrations: Array<{
         name: string;
         label: string;
-        kind: 'claude-desktop' | 'mcp-server';
+        kind: 'claude-desktop' | 'composio' | 'mcp-server';
         tools: string[];
         connected: boolean;
         hasFeedReadyTools: boolean;
@@ -3589,10 +4707,47 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         });
       }
 
+      // Composio toolkits are mounted in-process at agent runtime, so they do
+      // not necessarily appear in the cached SDK inventory. Pull the connected
+      // toolkit/tool list directly from Composio so feed recipes like
+      // googlesheets can be offered even before a full inventory refresh.
+      try {
+        const composio = await import('../integrations/composio/client.js');
+        if (composio.isComposioEnabled()) {
+          const connected = await composio.listConnectedToolkits();
+          const activeSlugs = [...new Set(
+            connected
+              .filter((c) => c.status === 'ACTIVE')
+              .filter((c) => recipeIntegrations.has('*') || recipeIntegrations.has(c.slug))
+              .map((c) => c.slug),
+          )];
+          if (activeSlugs.length) {
+            const { listComposioToolkitTools } = await import('../integrations/composio/mcp-bridge.js');
+            const toolMap = await listComposioToolkitTools(activeSlugs);
+            for (const slug of activeSlugs) {
+              const tools = toolMap[slug] ?? [];
+              const label = serviceLabelByComposioSlug.get(slug)
+                ?? slug.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+              integrations.push({
+                name: slug,
+                label,
+                kind: 'composio',
+                tools,
+                connected: true,
+                hasFeedReadyTools: tools.length > 0,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[feeds] Composio connector listing failed, continuing:', err);
+      }
+
       // Then, every other MCP server. These are directly reachable through
       // the Agent SDK because probeAvailableTools() saw them in init.tools.
       for (const [server, tools] of mcpByServer.entries()) {
         if (server.startsWith('claude_ai_')) continue;
+        if (integrations.some((i) => i.name === server)) continue;
         integrations.push({
           name: server,
           label: server.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
@@ -3656,6 +4811,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       // Without this the SDK only sees built-in + claude_ai_* tools
       // and every Extension tool call is silently rejected at runtime.
       const mcpServers = getMcpServersForAgent();
+      try {
+        const match = tool.match(/^mcp__([^_]+(?:_[^_]+)*)__/);
+        const serverName = match?.[1];
+        if (serverName && !serverName.startsWith('claude_ai_')) {
+          const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
+          Object.assign(mcpServers, await buildComposioMcpServers([serverName]));
+        }
+      } catch (err) {
+        console.warn('[feeds] Composio probe server unavailable, continuing:', err);
+      }
 
       // Strict prompt: force JSON-only output. The tool lookup goes through
       // the SDK so claude_ai_* and regular MCP servers work uniformly.
@@ -3664,15 +4829,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 Return ONLY a JSON array. Each element must be an object with shape \`{"id": string, "label": string, "sublabel"?: string}\`. Use the source system's stable id for \`id\` (so the feed can reference it later). Use a short human-readable title for \`label\`. Optional \`sublabel\` can include path, email, date, or any disambiguating detail.
 Do NOT include prose, markdown, code fences, or explanation. Just the JSON array.
 If the tool returns nothing or errors, return an empty array \`[]\`.`,
-        options: {
+        options: normalizeClaudeSdkOptionsForOneMillionContext({
           model: MODELS.haiku,
           maxTurns: 3,
           systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
           allowedTools: [tool],
           mcpServers,
-          permissionMode: 'bypassPermissions',
+          permissionMode: 'bypassPermissions' as const,
           settingSources: [],
-        },
+        }),
       });
 
       let text = '';
@@ -3683,6 +4848,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             if (block.type === 'text' && typeof block.text === 'string') text += block.text;
           }
         } else if ((msg as any).type === 'result') {
+          if ((msg as any).is_error) {
+            const errorText = Array.isArray((msg as any).errors)
+              ? (msg as any).errors.join('; ')
+              : String((msg as any).result ?? '');
+            if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+          }
           break;
         }
       }
@@ -3700,6 +4871,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // returned nothing matching, agent refused in prose).
       res.json({ items, cached: false, rawPreview: text.slice(0, 400) });
     } catch (err) {
+      if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
@@ -3744,6 +4916,26 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.status(400).json({ error: `missing required field(s): ${missing.join(', ')}` });
         return;
       }
+      if (recipe.id === 'tool-backed-memory-seed') {
+        const toolName = String(values.toolName ?? '').trim();
+        if (!/^mcp__.+__.+$/.test(toolName)) {
+          res.status(400).json({ error: 'toolName must be an exact MCP tool name like mcp__server__tool' });
+          return;
+        }
+        const rawVariables = String(values.variablesJson ?? '').trim();
+        if (rawVariables) {
+          try {
+            const parsedVariables = JSON.parse(rawVariables);
+            if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) {
+              res.status(400).json({ error: 'Tool variables must be a JSON object, for example {}' });
+              return;
+            }
+          } catch {
+            res.status(400).json({ error: 'Tool variables must be valid JSON, for example {}' });
+            return;
+          }
+        }
+      }
       const schedule = (body.schedule || recipe.defaultSchedule).trim();
       if (!cron.validate(schedule)) {
         res.status(400).json({ error: `invalid cron expression: ${schedule}` });
@@ -3782,7 +4974,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             managed: 'connector-feed',
             recipeId: recipe.id,
             fields: values,
-            inputPath: path.join(VAULT_DIR, spec.targetFolder),
+            mode: 'direct-records',
           }),
           targetFolder: spec.targetFolder,
           intelligence: 'auto',
@@ -3965,7 +5157,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const { getStore } = await import('../tools/shared.js');
       const store = await getStore();
       const slug = typeof req.query.slug === 'string' ? req.query.slug : undefined;
-      const runs = store.listIngestionRuns(slug, 50);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const runs = store.listIngestionRuns(slug, limit);
       res.json({ runs });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -5050,26 +6243,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // ── Unleashed status/cancel routes ─────────────────────────────────
 
   app.get('/api/unleashed', (_req, res) => {
-    const unleashedDir = path.join(BASE_DIR, 'unleashed');
-    if (!existsSync(unleashedDir)) {
-      res.json({ tasks: [] });
-      return;
-    }
     try {
-      const tasks: Array<Record<string, unknown>> = [];
-      for (const dir of readdirSync(unleashedDir)) {
-        const dirPath = path.join(unleashedDir, dir);
-        if (!statSync(dirPath).isDirectory()) continue;
-        const statusFile = path.join(dirPath, 'status.json');
-        if (existsSync(statusFile)) {
-          try {
-            const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
-            tasks.push(status);
-          } catch { /* skip corrupt */ }
-        }
-      }
-      tasks.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-      res.json({ tasks });
+      res.json({ tasks: getUnleashedTasksForDashboard() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -5091,6 +6266,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  app.delete('/api/unleashed/:name', (req, res) => {
+    const taskName = req.params.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const taskDir = path.join(BASE_DIR, 'unleashed', taskName);
+    if (!existsSync(taskDir)) {
+      res.status(404).json({ error: 'Unleashed task not found' });
+      return;
+    }
+    try {
+      rmSync(taskDir, { recursive: true, force: true });
+      res.json({ ok: true, message: `Removed runtime record "${req.params.name}"` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Settings / env config routes ────────────────────────────────────
 
   const SENSITIVE_PATTERNS = ['TOKEN', 'SECRET', 'API_KEY', 'AUTH_TOKEN', 'SID', 'PASSWORD'];
@@ -5102,18 +6292,20 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   }
 
   const CONFIG_GROUPS: Array<{ label: string; keys: Array<{ key: string; label: string; hint?: string; type?: string }> }> = [
+	    {
+	      label: 'Assistant Identity',
+	      keys: [
+	        { key: 'ASSISTANT_NAME', label: 'Name', hint: 'Display name for the assistant' },
+	        { key: 'ASSISTANT_NICKNAME', label: 'Nickname', hint: 'Short name / alias' },
+	        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
+	      ],
+	    },
     {
-      label: 'Assistant Identity',
-      keys: [
-        { key: 'ASSISTANT_NAME', label: 'Name', hint: 'Display name for the assistant' },
-        { key: 'ASSISTANT_NICKNAME', label: 'Nickname', hint: 'Short name / alias' },
-        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
-      ],
-    },
-    {
-      label: 'Model',
+	      label: 'Model',
       keys: [
         { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
+        { key: 'CLEMENTINE_1M_CONTEXT_MODE', label: '1M Context Mode', hint: 'auto allows included Opus 1M where available; off forces 200K; on forces 1M', type: 'select:auto,off,on' },
+        { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', label: 'Legacy 1M Disable', hint: 'Backward-compatible Claude Code switch. Prefer CLEMENTINE_1M_CONTEXT_MODE.', type: 'select:,1,0,true,false' },
       ],
     },
     {
@@ -5239,6 +6431,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   }
 
   function writeEnvValue(key: string, value: string): void {
+    mkdirSync(BASE_DIR, { recursive: true });
     let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
     const re = new RegExp(`^${key}=.*$`, 'm');
     if (re.test(content)) {
@@ -5246,10 +6439,343 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     } else {
       content = content.trimEnd() + `\n${key}=${value}\n`;
     }
-    writeFileSync(ENV_PATH, content);
+    writeFileSync(ENV_PATH, content, { mode: 0o600 });
   }
 
-  app.get('/api/settings', (_req, res) => {
+  function deleteEnvValue(key: string): void {
+    if (!existsSync(ENV_PATH)) return;
+    const re = new RegExp(`^${key}=.*\n?`, 'm');
+    const content = readFileSync(ENV_PATH, 'utf-8').replace(re, '');
+    writeFileSync(ENV_PATH, content, { mode: 0o600 });
+  }
+
+  const DASHBOARD_BUDGET_ROWS = [
+    { key: 'BUDGET_CHAT_USD', value: '5', label: 'Chat', hint: 'Per interactive chat turn' },
+    { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'Heartbeat', hint: 'Per proactive heartbeat tick' },
+    { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'Tier 1 cron', hint: 'Per lightweight scheduled job' },
+    { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'Tier 2 cron', hint: 'Per deeper scheduled job' },
+  ] as const;
+
+  const SAFE_DASHBOARD_BUDGETS = [
+    { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'Heartbeat' },
+    { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'Tier 1 cron' },
+    { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'Tier 2 cron' },
+  ] as const;
+
+  const DASHBOARD_BUDGET_KEYS = new Set(DASHBOARD_BUDGET_ROWS.map(row => row.key));
+
+  type DashboardOneMillionMode = 'auto' | 'off' | 'on';
+
+  function normalizeDashboardOneMillionMode(value: unknown): DashboardOneMillionMode | null {
+    const v = String(value ?? '').trim().toLowerCase();
+    if (!v) return null;
+    if (v === 'auto') return 'auto';
+    if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+    if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+    return null;
+  }
+
+  function legacyDisableToDashboardMode(value: unknown): DashboardOneMillionMode | null {
+    const v = String(value ?? '').trim().toLowerCase();
+    if (!v) return null;
+    if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+    if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+    return null;
+  }
+
+  function formatDashboardBudgetValue(value: unknown): string {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return String(value ?? '');
+    if (n === 0) return 'No cap';
+    return `$${n.toFixed(2)}`;
+  }
+
+  function writeDashboardBudgetCap(key: string, value: unknown): { ok: true; value: string } | { ok: false; error: string } {
+    if (!DASHBOARD_BUDGET_KEYS.has(key as typeof DASHBOARD_BUDGET_ROWS[number]['key'])) {
+      return { ok: false, error: 'Unknown budget key' };
+    }
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) {
+      return { ok: false, error: 'Budget must be a non-negative dollar amount. Use 0 for no cap.' };
+    }
+    if (n > 1000) {
+      return { ok: false, error: 'Budget cap is too high for the dashboard. Use the CLI if you really need a cap above $1000.' };
+    }
+    const normalized = n === 0 ? '0' : String(Math.round(n * 100) / 100);
+    writeEnvValue(key, normalized);
+    process.env[key] = normalized;
+    return { ok: true, value: normalized };
+  }
+
+  function readRecentDashboardChatFailures(limit = 5): Array<Record<string, string>> {
+    try {
+      if (!existsSync(INTERACTIVE_FAILURE_LOG)) return [];
+      const lines = readFileSync(INTERACTIVE_FAILURE_LOG, 'utf-8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .slice(-80)
+        .reverse();
+      const out: Array<Record<string, string>> = [];
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line) as Record<string, unknown>;
+          const error = String(item.error ?? '');
+          const stage = String(item.stage ?? '');
+          const haystack = `${stage} ${error}`;
+          if (!/1m|context|budget|credit|api error|rate.?limit/i.test(haystack)) continue;
+          out.push({
+            createdAt: String(item.createdAt ?? ''),
+            stage,
+            sessionKey: String(item.sessionKey ?? ''),
+            textPreview: String(item.textPreview ?? '').slice(0, 220),
+            error: error.slice(0, 500),
+          });
+          if (out.length >= limit) break;
+        } catch { /* skip malformed lines */ }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+	  const ASSISTANT_PREF_OPTIONS = {
+	    proactivity: ['quiet', 'balanced', 'proactive', 'operator'],
+	    responseStyle: ['concise', 'balanced', 'detailed'],
+	    progressVisibility: ['quiet', 'normal', 'detailed'],
+	    autonomy: ['ask_first', 'balanced', 'act_when_safe'],
+	  } as const;
+
+	  app.get('/api/assistant-preferences', (_req, res) => {
+	    try {
+	      const assistant = loadClementineJson(BASE_DIR).assistant ?? {};
+	      res.json({
+	        ok: true,
+	        preferences: {
+	          proactivity: assistant.proactivity ?? 'balanced',
+	          responseStyle: assistant.responseStyle ?? 'balanced',
+	          progressVisibility: assistant.progressVisibility ?? 'normal',
+	          autonomy: assistant.autonomy ?? 'balanced',
+	        },
+	      });
+	    } catch (err) {
+	      res.status(500).json({ error: String(err) });
+	    }
+	  });
+
+	  app.put('/api/assistant-preferences', (req, res) => {
+	    try {
+	      const body = req.body as Record<string, unknown>;
+	      const nextPrefs: Record<string, string> = {};
+	      for (const [key, allowed] of Object.entries(ASSISTANT_PREF_OPTIONS)) {
+	        const value = body?.[key];
+	        if (value === undefined || value === '') continue;
+	        if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) {
+	          res.status(400).json({ error: `Invalid ${key}` });
+	          return;
+	        }
+	        nextPrefs[key] = value;
+	      }
+	      const next = updateClementineJson(BASE_DIR, (current) => ({
+	        ...current,
+	        assistant: {
+	          ...(current.assistant ?? {}),
+	          ...nextPrefs,
+	        },
+	      }));
+	      if (next.assistant?.proactivity) process.env.ASSISTANT_PROACTIVITY = next.assistant.proactivity;
+	      if (next.assistant?.responseStyle) process.env.ASSISTANT_RESPONSE_STYLE = next.assistant.responseStyle;
+	      if (next.assistant?.progressVisibility) process.env.ASSISTANT_PROGRESS_VISIBILITY = next.assistant.progressVisibility;
+	      if (next.assistant?.autonomy) process.env.ASSISTANT_AUTONOMY = next.assistant.autonomy;
+	      res.json({ ok: true, preferences: next.assistant });
+	    } catch (err) {
+	      res.status(500).json({ error: String(err) });
+	    }
+	  });
+
+  app.get('/api/budgets', async (_req, res) => {
+    try {
+      const [{ computeEffectiveConfig }, { runDoctor }] = await Promise.all([
+        import('../config/effective-config.js'),
+        import('../config/config-doctor.js'),
+      ]);
+      const cfg = computeEffectiveConfig(BASE_DIR);
+      const doctor = runDoctor(BASE_DIR);
+      const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+      const oneMModeEntry = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
+      const legacyEntry = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+      const legacyMode = legacyDisableToDashboardMode(legacyEntry?.value);
+      const mode = normalizeDashboardOneMillionMode(oneMModeEntry?.value)
+        ?? legacyMode
+        ?? 'auto';
+      const source = oneMModeEntry?.source !== 'default'
+        ? oneMModeEntry?.source
+        : legacyMode
+          ? legacyEntry?.source ?? 'default'
+          : oneMModeEntry?.source ?? 'default';
+      const summary = mode === 'off'
+        ? 'Recovery mode: all models stay on standard 200K context.'
+        : mode === 'on'
+          ? 'Forced 1M: Sonnet and Pro subscriptions may require Claude Extra Usage.'
+          : 'Smart auto: Opus can use included 1M on eligible Max/Team/Enterprise accounts; Sonnet stays on 200K.';
+      const relevantKeys = new Set([
+        'BUDGET_CHAT_USD',
+        'BUDGET_HEARTBEAT_USD',
+        'BUDGET_CRON_T1_USD',
+        'BUDGET_CRON_T2_USD',
+        'CLEMENTINE_1M_CONTEXT_MODE',
+        'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+      ]);
+      const findings = doctor.findings
+        .filter(f => (f.key && relevantKeys.has(f.key)) || /budget|credit|1m|context/i.test(f.message))
+        .slice(0, 8);
+
+      res.json({
+        ok: true,
+        baseDir: cfg.baseDir,
+        budgets: DASHBOARD_BUDGET_ROWS.map(row => {
+          const entry = byKey.get(row.key);
+          return {
+            label: row.label,
+            hint: row.hint,
+            key: row.key,
+            value: entry?.value ?? '',
+            displayValue: formatDashboardBudgetValue(entry?.value),
+            source: entry?.source ?? 'unknown',
+          };
+        }),
+        context: {
+          mode,
+          source,
+          summary,
+          modeValue: oneMModeEntry?.value ?? 'auto',
+          legacyValue: legacyEntry?.value ?? '',
+          legacySource: legacyEntry?.source ?? 'default',
+          legacyMode,
+        },
+        findings,
+        recentFailures: readRecentDashboardChatFailures(),
+        counts: doctor.counts,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/set', (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown>;
+      const key = String(body?.key ?? '');
+      const result = writeDashboardBudgetCap(key, body?.value);
+      if (!result.ok) {
+        res.status(400).json({ error: result.error });
+        return;
+      }
+      res.json({
+        ok: true,
+        message: `${key} set to ${formatDashboardBudgetValue(result.value)}. Restart Clementine to apply to running workers.`,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/preset', (req, res) => {
+    try {
+      const preset = String((req.body as Record<string, unknown>)?.preset ?? '').trim().toLowerCase();
+      let writes: Array<{ key: string; value: string }>;
+      let message: string;
+      if (preset === 'defaults' || preset === 'standard') {
+        writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: row.value }));
+        message = 'Restored the standard spend caps. Restart Clementine to apply to running workers.';
+      } else if (preset === 'uncapped' || preset === 'off' || preset === 'none') {
+        writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: '0' }));
+        message = 'Removed spend caps by setting all budget values to 0. This does not change 1M context mode; use Force 200K or Safe Recovery for 1M errors. Restart Clementine to apply to running workers.';
+      } else {
+        res.status(400).json({ error: 'preset must be defaults or uncapped' });
+        return;
+      }
+      for (const item of writes) {
+        const result = writeDashboardBudgetCap(item.key, item.value);
+        if (!result.ok) {
+          res.status(400).json({ error: result.error });
+          return;
+        }
+      }
+      res.json({ ok: true, message });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/safe', (_req, res) => {
+    try {
+      for (const item of SAFE_DASHBOARD_BUDGETS) {
+        const result = writeDashboardBudgetCap(item.key, item.value);
+        if (!result.ok) {
+          res.status(400).json({ error: result.error });
+          return;
+        }
+      }
+      writeEnvValue('CLEMENTINE_1M_CONTEXT_MODE', 'off');
+      writeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', '1');
+      process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
+      process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+      res.json({
+        ok: true,
+        message: 'Applied safe budgets and 200K recovery mode. Restart Clementine to apply to running chat workers.',
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/1m', (req, res) => {
+    try {
+      const mode = normalizeDashboardOneMillionMode((req.body as Record<string, unknown>)?.mode);
+      if (!mode) {
+        res.status(400).json({ error: 'mode must be auto, off, or on' });
+        return;
+      }
+      writeEnvValue('CLEMENTINE_1M_CONTEXT_MODE', mode);
+      process.env.CLEMENTINE_1M_CONTEXT_MODE = mode;
+      if (mode === 'auto') {
+        deleteEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+        delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+      } else {
+        const legacyValue = mode === 'on' ? '0' : '1';
+        writeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', legacyValue);
+        process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = legacyValue;
+      }
+      const message = mode === 'auto'
+        ? 'Set 1M context to smart auto. Restart Clementine to apply everywhere.'
+        : mode === 'off'
+          ? 'Disabled 1M context for recovery. Restart Clementine to apply everywhere.'
+          : 'Forced 1M context on. Sonnet and Pro subscriptions may require Claude Extra Usage.';
+      res.json({ ok: true, message });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/doctor-fix', async (_req, res) => {
+    try {
+      const { applyDoctorFixes } = await import('../config/config-doctor.js');
+      const result = applyDoctorFixes(BASE_DIR);
+      for (const item of result.changed) {
+        process.env[item.key] = item.value;
+      }
+      const message = result.changed.length
+        ? `Applied ${result.changed.length} config fix${result.changed.length === 1 ? '' : 'es'}. Restart Clementine to apply everywhere.`
+        : 'No budget or context fixes were needed.';
+      res.json({ ok: true, message, result });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+	  app.get('/api/settings', (_req, res) => {
     try {
       const env = parseEnvFile();
       const groups = CONFIG_GROUPS.map(g => ({
@@ -5317,11 +6843,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // next /api/composio/* call picks up the new key without a daemon
       // restart. Without this, "Save key → Connect Gmail" would 503 until
       // the user restarted, which defeats the dashboard-config UX.
-      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
-        process.env[key] = value;
-        const { resetComposioClient } = await import('../integrations/composio/client.js');
-        resetComposioClient();
-      }
+	      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+	        process.env[key] = value;
+	        const { resetComposioClient } = await import('../integrations/composio/client.js');
+	        resetComposioClient();
+	      }
+	      if (key.startsWith('ASSISTANT_')) {
+	        process.env[key] = value;
+	      }
 
       res.json({ ok: true, message: `Updated ${key}` });
     } catch (err) {
@@ -5336,20 +6865,20 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.status(404).json({ error: '.env file not found' });
         return;
       }
-      let content = readFileSync(ENV_PATH, 'utf-8');
-      const re = new RegExp(`^${key}=.*\n?`, 'm');
-      content = content.replace(re, '');
-      writeFileSync(ENV_PATH, content);
+      deleteEnvValue(key);
 
       // Hot-reload mirror of the PUT handler — drop process.env entry +
       // reset Composio client so removal takes effect without a restart.
-      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
-        delete process.env[key];
-        const { resetComposioClient } = await import('../integrations/composio/client.js');
-        resetComposioClient();
-      }
+	      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+	        delete process.env[key];
+	        const { resetComposioClient } = await import('../integrations/composio/client.js');
+	        resetComposioClient();
+	      }
+	      if (key.startsWith('ASSISTANT_')) {
+	        delete process.env[key];
+	      }
 
-      res.json({ ok: true, message: `Removed ${key}` });
+	      res.json({ ok: true, message: `Removed ${key}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -5385,7 +6914,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         ? Math.max(0, Math.round(status.maxHours * 60 - elapsed))
         : null;
 
-      res.json({ ...status, elapsed, remaining, progress: progressEntries });
+      res.json({ ...annotateUnleashedStatus(status, taskName), elapsed, remaining, progress: progressEntries });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -5473,6 +7002,86 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: true, response: redacted, trace });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/chat/stream', async (req, res) => {
+    const { message } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    let closed = false;
+    // res.on('close') fires only on actual client disconnect or response
+    // teardown. req.on('close') fires once the request body finishes
+    // parsing, which would silently drop every event after the first.
+    res.on('close', () => { closed = true; });
+    const writeEvent = (type: string, data: Record<string, unknown> = {}) => {
+      if (closed || res.writableEnded) return;
+      try {
+        res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+      } catch {
+        closed = true;
+      }
+    };
+
+    try {
+      writeEvent('progress', { status: 'connecting...' });
+      const gateway = await getGateway();
+      const { redactSecrets } = await import('../security/redact.js');
+      let lastText = '';
+      const response = await gateway.handleMessage(
+        'dashboard:web',
+        message,
+        async (text) => {
+          const { text: redacted } = redactSecrets(text ?? '');
+          lastText = redacted;
+          writeEvent('text', { text: redacted });
+        },
+        undefined,
+        undefined,
+        async (toolName) => {
+          writeEvent('tool', { name: toolName });
+        },
+        async (status) => {
+          writeEvent('progress', { status });
+        },
+      );
+      const { text: redactedFinal } = redactSecrets(response ?? lastText ?? '');
+
+      let trace: {
+        id: number;
+        query: string;
+        retrievedAt: string;
+        chunkCount: number;
+      } | null = null;
+      try {
+        const store = (gateway as any).assistant?.memoryStore;
+        if (store?.getRecentRecallTraces) {
+          const traces = store.getRecentRecallTraces('dashboard:web', 1);
+          if (traces.length > 0) {
+            trace = {
+              id: traces[0].id,
+              query: traces[0].query,
+              retrievedAt: traces[0].retrievedAt,
+              chunkCount: traces[0].chunkIds.length,
+            };
+          }
+        }
+      } catch { /* trace is optional */ }
+
+      writeEvent('done', { response: redactedFinal, trace });
+      if (!closed) res.end();
+    } catch (err) {
+      writeEvent('error', { error: String(err) });
+      if (!closed) res.end();
     }
   });
 
@@ -5602,8 +7211,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // proposed values for each slot; the dashboard UI shows them in an
   // editable review panel before applying. Nothing is written to
   // user_model_blocks until the user clicks "Apply" on a slot.
-  app.post('/api/user-model/seed', async (_req, res) => {
+  app.post('/api/user-model/seed', async (req, res) => {
     try {
+      const agentSlug = req.body?.agentSlug ? String(req.body.agentSlug) : null;
       const gateway = await getGateway();
       const store = (gateway as any).assistant?.memoryStore;
       if (!store) {
@@ -5618,25 +7228,33 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           let result = '';
           const stream = query({
             prompt,
-            options: {
+            options: normalizeClaudeSdkOptionsForOneMillionContext({
               model: 'claude-haiku-4-5-20251001',
               maxTurns: 1,
               systemPrompt: 'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
-            },
+            }),
           });
           for await (const msg of stream) {
             if ((msg as { type?: string }).type === 'result') {
+              if ((msg as { is_error?: boolean }).is_error) {
+                const errorText = Array.isArray((msg as { errors?: string[] }).errors)
+                  ? ((msg as { errors?: string[] }).errors ?? []).join('; ')
+                  : String((msg as { result?: string }).result ?? '');
+                if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+                return '';
+              }
               result = (msg as { result?: string }).result ?? '';
             }
           }
           return result;
-        } catch {
+        } catch (err) {
+          if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
           return '';
         }
       };
 
       const { seedUserModelFromMemory } = await import('../memory/seed-user-model.js');
-      const proposals = await seedUserModelFromMemory(store, llmCall);
+      const proposals = await seedUserModelFromMemory(store, llmCall, { agentSlug });
       res.json({ ok: true, proposals });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -5724,6 +7342,148 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Learned facts — durable cross-session beliefs with supersession lineage.
+  app.get('/api/memory/learnings', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listAllLearnedFacts !== 'function') {
+        res.status(503).json({ error: 'Learnings store not available' });
+        return;
+      }
+      const limit = Math.min(parseInt(String(req.query.limit ?? '100'), 10) || 100, 1000);
+      const showAll = String(req.query.all ?? '') === '1';
+      const facts = showAll
+        ? store.listAllLearnedFacts({ limit })
+        : store.listActiveLearnedFacts({ limit });
+      res.json({ ok: true, facts });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/learnings/action', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.setLearnedFactStatus !== 'function') {
+        res.status(503).json({ error: 'Learnings store not available' });
+        return;
+      }
+      const id = Number(req.body?.id);
+      const action = String(req.body?.action ?? '');
+      if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'id required' }); return; }
+      let updated = false;
+      if (action === 'cancel') updated = store.setLearnedFactStatus(id, 'cancelled');
+      else if (action === 'reinstate') updated = store.setLearnedFactStatus(id, 'active');
+      else { res.status(400).json({ error: 'invalid action' }); return; }
+      res.json({ ok: updated });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Commitments — durable promises tracked across sessions.
+  app.get('/api/memory/commitments', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listCommitments !== 'function') {
+        res.status(503).json({ error: 'Commitments store not available' });
+        return;
+      }
+      const status = req.query.status ? String(req.query.status) : 'open';
+      const owner = req.query.owner ? String(req.query.owner) : undefined;
+      const overdueOnly = String(req.query.overdueOnly ?? '') === '1';
+      const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10) || 50, 500);
+      const commitments = store.listCommitments({
+        status: ['open', 'done', 'cancelled'].includes(status) ? status : 'open',
+        owner: owner === 'user' || owner === 'clementine' ? owner : undefined,
+        overdueOnly,
+        limit,
+      });
+      res.json({ ok: true, commitments });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/commitments/action', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.updateCommitmentStatus !== 'function') {
+        res.status(503).json({ error: 'Commitments store not available' });
+        return;
+      }
+      const id = Number(req.body?.id);
+      const action = String(req.body?.action ?? '');
+      if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'id required' }); return; }
+      let updated = false;
+      if (action === 'done' || action === 'cancelled' || action === 'reopen') {
+        updated = store.updateCommitmentStatus(id, { status: action === 'reopen' ? 'open' : action });
+      } else if (action === 'snooze') {
+        const hours = Number(req.body?.hours ?? 24);
+        const until = new Date(Date.now() + Math.max(1, hours) * 3600_000).toISOString();
+        updated = store.updateCommitmentStatus(id, { snoozeUntilIso: until });
+      } else {
+        res.status(400).json({ error: 'invalid action' });
+        return;
+      }
+      res.json({ ok: updated });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Recent episodes — durable consolidated session summaries.
+  app.get('/api/memory/episodes', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listRecentEpisodes !== 'function') {
+        res.status(503).json({ error: 'Episodes store not available' });
+        return;
+      }
+      const limit = Math.min(parseInt(String(req.query.limit ?? '30'), 10) || 30, 200);
+      const sessionKey = req.query.session ? String(req.query.session) : undefined;
+      const sinceParam = req.query.since ? String(req.query.since) : '';
+      // since: '24h' | '7d' | '30d' | '' (all) | ISO string
+      let sinceIso: string | undefined;
+      if (sinceParam === '24h') sinceIso = new Date(Date.now() - 24 * 3600_000).toISOString();
+      else if (sinceParam === '7d') sinceIso = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
+      else if (sinceParam === '30d') sinceIso = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+      else if (sinceParam) sinceIso = sinceParam;
+      const episodes = store.listRecentEpisodes({ limit, sessionKey, sinceIso });
+      res.json({ ok: true, episodes });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Coverage + recall telemetry for both chunks and transcripts. Powers the
+  // Memory Coverage card showing whether dense recall is actually earning its
+  // keep on the current corpus.
+  app.get('/api/memory/coverage', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const transcripts = typeof store.getTranscriptDenseCoverage === 'function'
+        ? store.getTranscriptDenseCoverage()
+        : { embedded: 0, total: 0, model: null };
+      const recall = typeof store.getRecallTelemetrySummary === 'function'
+        ? store.getRecallTelemetrySummary(7)
+        : { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+      res.json({ ok: true, transcripts, recall });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // Quick-add: append a sentence to today's daily note from the dashboard.
   // Mirrors the agent's memory_write({action:'append_daily'}) path so the
   // note gets indexed identically.
@@ -5786,6 +7546,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         const { runIntegrityProbes } = await import('../memory/integrity.js');
         const report = runIntegrityProbes(store);
         res.json({ ok: true, action, report });
+        return;
+      }
+      if (action === 'install-dense-model') {
+        const embeddings = await import('../memory/embeddings.js');
+        const ready = await embeddings.probeDenseReady();
+        if (!ready) {
+          res.status(503).json({ error: 'Dense embedding model failed to load' });
+          return;
+        }
+        res.json({
+          ok: true,
+          action,
+          model: embeddings.currentDenseModel(),
+          dimension: embeddings.denseDimension(),
+          cacheDir: embeddings.denseModelCacheDir(),
+        });
         return;
       }
       if (action === 'reembed-dense') {
@@ -5953,6 +7729,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  app.get('/api/brain/artifacts/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid artifact id' });
+        return;
+      }
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      if (!store?.getArtifact) {
+        res.status(503).json({ error: 'Artifact memory not available' });
+        return;
+      }
+      const artifact = store.getArtifact(id);
+      if (!artifact) {
+        res.status(404).json({ error: 'artifact not found' });
+        return;
+      }
+      res.json({ ok: true, artifact });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Cron training chat endpoint ─────────────────────────────────────
 
   app.post('/api/cron/train', async (req, res) => {
@@ -6068,11 +7868,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
           `When the user says "save" or approves, output the final artifact block.]\n\n`
         : type === 'workflow'
-        ? `[BUILDER MODE: You are helping build a multi-step workflow pipeline. As you develop the workflow, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-          `Update this block in EVERY response as the workflow evolves. Ask about: what the workflow should accomplish, what steps are needed, which agents should run each step, dependencies between steps, and whether it should be triggered on a schedule or manually.\n` +
-          `Workflows are defined as markdown files with YAML frontmatter. Each step has an id, prompt, optional agent, and optional dependsOn array.\n` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
+          `\n` +
+          `Hard rules:\n` +
+          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
+          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
+          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
+          `\n` +
+          `As you develop the trick, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+          `Ask about (in roughly this order, one at a time):\n` +
+          `  1. The goal (one sentence is fine — confirm it back).\n` +
+          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
+          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
+          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
+          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
+          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
         : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
 
       enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
@@ -6084,6 +7895,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
     try {
       const gateway = await getGateway();
+      // Builder generates JSON artifacts — no tool calls. Pin the session
+      // toolset to 'none' so buildOptions strips all MCP servers and tool
+      // schemas from the system prompt. Without this, every tiny builder
+      // turn writes 60–280 KB of cache_creation for tool schemas the
+      // model never uses.
+      gateway.setSessionToolset(sessionKey, 'none');
       const response = await gateway.handleMessage(sessionKey, enrichedMessage);
 
       // Parse any json-artifact blocks from the response
@@ -6099,6 +7916,155 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: true, response: cleanResponse, artifact });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Streaming variant of /api/builder/chat. Same enrichment, SSE response.
+  // Emits `text` events for token chunks and a final `done` event with the
+  // cleaned response and parsed artifact. Mirrors /api/chat/stream's shape.
+  app.post('/api/builder/chat/stream', async (req, res) => {
+    const { message, artifactType, agentSlug, currentArtifact, attachments, linkedTools } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    let closed = false;
+    // Use res.on('close') for client-disconnect detection. The req-level
+    // close event in Express fires once the request body has been read, even
+    // while the response is still open — using it to gate writes silently
+    // drops every event after the first.
+    res.on('close', () => { closed = true; });
+    const writeEvent = (eventType: string, data: Record<string, unknown> = {}) => {
+      if (closed || res.writableEnded) return;
+      try { res.write(`data: ${JSON.stringify({ type: eventType, ...data })}\n\n`); }
+      catch { closed = true; }
+    };
+    // Flush headers immediately so the client sees the connection open even
+    // before the gateway warms up (otherwise some HTTP intermediaries hold
+    // the response until first body byte).
+    writeEvent('progress', { status: 'connecting…' });
+
+    // ── Same enrichment as /api/builder/chat (system prefix on first turn,
+    //    artifact + files + tools on every turn). Inlined to keep the diff
+    //    contained; refactor into a helper if a third endpoint shows up.
+    const type = artifactType || 'skill';
+    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
+    const isFirstMessage = !builderSessionInited.has(sessionKey);
+
+    const artifactContext = currentArtifact
+      ? `\n[CURRENT ARTIFACT STATE]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact)}\n\`\`\`\n`
+      : '';
+
+    let fileContext = '';
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      const fileParts: string[] = [];
+      for (const att of attachments) {
+        if (att.filename && att.content) {
+          try {
+            const decoded = Buffer.from(att.content, 'base64').toString('utf-8');
+            const trimmed = decoded.length > 4000 ? decoded.slice(0, 4000) + '\n... (truncated)' : decoded;
+            fileParts.push(`### ${att.filename}\n\`\`\`\n${trimmed}\n\`\`\``);
+          } catch { /* skip binary files */ }
+        }
+      }
+      if (fileParts.length > 0) {
+        fileContext = `\n[REFERENCE FILES — the user attached these for context]\n${fileParts.join('\n\n')}\n`;
+      }
+    }
+
+    let toolContext = '';
+    if (Array.isArray(linkedTools) && linkedTools.length > 0) {
+      toolContext = `\n[LINKED TOOLS — this skill should use these tools: ${linkedTools.join(', ')}]\n`;
+    }
+
+    let enrichedMessage: string;
+    if (isFirstMessage) {
+      const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
+      const builderPrefix = type === 'skill'
+        ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
+          `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'cron'
+        ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
+          `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'agent'
+        ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
+          `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use, its personality/system prompt, which channel it should operate in, and its security tier.\n` +
+          `Keep it conversational — one question at a time. When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'workflow'
+        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
+          `\n` +
+          `Hard rules:\n` +
+          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
+          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
+          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
+          `\n` +
+          `As you develop the trick, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+          `Ask about (in roughly this order, one at a time):\n` +
+          `  1. The goal (one sentence is fine — confirm it back).\n` +
+          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
+          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
+          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
+          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
+          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
+        : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
+      enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
+      builderSessionInited.add(sessionKey);
+    } else {
+      enrichedMessage = fileContext + toolContext + artifactContext + message;
+    }
+
+    try {
+      writeEvent('progress', { status: 'thinking…' });
+      const gateway = await getGateway();
+      // Builder generates JSON artifacts — no tool calls. Pin to 'none'
+      // toolset so the SDK system prompt drops the tool inventory.
+      gateway.setSessionToolset(sessionKey, 'none');
+      let lastText = '';
+      const response = await gateway.handleMessage(
+        sessionKey,
+        enrichedMessage,
+        async (text) => {
+          lastText = text ?? '';
+          // Strip any in-progress json-artifact fence from the streamed token
+          // chunk so users don't see raw JSON scrolling past in the UI. The
+          // final artifact arrives in the `done` event.
+          const visible = lastText.replace(/```json-artifact[\s\S]*?(```|$)/g, '');
+          writeEvent('text', { text: visible });
+        },
+        undefined,
+        undefined,
+        async (toolName) => {
+          writeEvent('tool', { name: toolName });
+        },
+        async (status) => {
+          writeEvent('progress', { status });
+        },
+      );
+      const finalText = response ?? lastText ?? '';
+      let artifact = null;
+      const artifactMatch = finalText.match(/```json-artifact\s*\n([\s\S]*?)```/);
+      if (artifactMatch) {
+        try { artifact = JSON.parse(artifactMatch[1]); } catch { /* malformed */ }
+      }
+      const cleanResponse = finalText.replace(/```json-artifact\s*\n[\s\S]*?```/g, '').trim();
+      writeEvent('done', { response: cleanResponse, artifact });
+      if (!closed) res.end();
+    } catch (err) {
+      writeEvent('error', { error: String(err) });
+      if (!closed) res.end();
     }
   });
 
@@ -6328,6 +8294,19 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  app.get('/api/brain/library/search', async (req, res) => {
+    try {
+      const q = String(req.query.q ?? '');
+      const rawScope = String(req.query.scope ?? 'all') as BrainLibraryScope;
+      const scope: BrainLibraryScope = ['all', 'memory', 'files', 'artifacts'].includes(rawScope) ? rawScope : 'all';
+      const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 80);
+      const data = await searchBrainLibrary(q, limit, scope);
+      res.json({ ok: true, query: q, scope, ...data });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err), results: [] });
+    }
+  });
+
   // ── Metrics route ─────────────────────────────────────────────────
 
   app.get('/api/metrics', (_req, res) => {
@@ -6411,6 +8390,325 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ error: String(err), totalTokens: 0, byModel: [], bySource: [], byDay: [] });
     } finally {
       db.close();
+    }
+  });
+
+  app.get('/api/build/usage', async (req, res) => {
+    const hoursRaw = parseInt(String(req.query.hours ?? '168'), 10);
+    const hours = Math.max(1, Math.min(Number.isFinite(hoursRaw) ? hoursRaw : 168, 24 * 90));
+    const limitRaw = parseInt(String(req.query.limit ?? '12'), 10);
+    const limit = Math.max(5, Math.min(Number.isFinite(limitRaw) ? limitRaw : 12, 50));
+    const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const classifySession = (sessionKey: string, source: string, agentSlug?: string | null) => {
+      let kind = source || 'chat';
+      let label = sessionKey || '(unknown)';
+      let taskKey = sessionKey || '(unknown)';
+      let controllable = false;
+      let targetTab: 'crons' | 'workflows' | 'sessions' = 'sessions';
+
+      if (sessionKey.startsWith('cron:')) {
+        const name = sessionKey.slice('cron:'.length);
+        kind = name.startsWith('goal:') ? 'goal task' : 'scheduled task';
+        label = name;
+        taskKey = name;
+        controllable = true;
+        targetTab = 'crons';
+      } else if (sessionKey.startsWith('unleashed:')) {
+        const name = sessionKey.slice('unleashed:'.length);
+        kind = name.startsWith('bg:') ? 'background task' : 'long-running task';
+        label = name.startsWith('bg:') ? `Deep task ${name.slice(3)}` : name;
+        taskKey = name;
+        controllable = true;
+        targetTab = 'crons';
+      } else if (sessionKey.startsWith('workflow:')) {
+        const rest = sessionKey.slice('workflow:'.length);
+        const splitAt = rest.lastIndexOf(':');
+        const workflowName = splitAt > 0 ? rest.slice(0, splitAt) : rest;
+        const stepName = splitAt > 0 ? rest.slice(splitAt + 1) : '';
+        kind = 'workflow step';
+        label = stepName ? `${workflowName} · ${stepName}` : workflowName;
+        taskKey = workflowName;
+        controllable = true;
+        targetTab = 'workflows';
+      } else if (sessionKey.startsWith('plan:')) {
+        const step = sessionKey.slice('plan:'.length);
+        kind = source === 'workflow_step' ? 'workflow step' : 'plan step';
+        label = step;
+        taskKey = step;
+        targetTab = 'workflows';
+      } else if (sessionKey.startsWith('discord:') || sessionKey.startsWith('chat:') || source === 'chat') {
+        kind = 'chat session';
+        targetTab = 'sessions';
+      }
+
+      return { kind, label, taskKey, controllable, targetTab, agentSlug: agentSlug || null };
+    };
+
+    if (!existsSync(MEMORY_DB_PATH)) {
+      res.json({
+        ok: true,
+        hours,
+        sinceIso,
+        totalTokens: 0,
+        totalInput: 0,
+        totalOutput: 0,
+        totalCacheRead: 0,
+        totalCacheCreation: 0,
+        totalCostCents: 0,
+        sessions: [],
+        tasks: [],
+        taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 },
+        taskAgents: [],
+        agents: [],
+        sources: [],
+      });
+      return;
+    }
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+      ).get();
+      if (!tableExists) {
+        res.json({ ok: true, hours, sinceIso, totalTokens: 0, totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheCreation: 0, totalCostCents: 0, sessions: [], tasks: [], taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 }, taskAgents: [], agents: [], sources: [] });
+        return;
+      }
+
+      const columns = new Set((db.prepare('PRAGMA table_info(usage_log)').all() as Array<{ name: string }>).map(c => c.name));
+      const costExpr = columns.has('cost_cents') ? 'COALESCE(SUM(cost_cents), 0)' : '0';
+      const agentExpr = columns.has('agent_slug') ? 'COALESCE(agent_slug, \'\')' : '\'\'';
+
+      const totals = db.prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) as ti,
+                COALESCE(SUM(output_tokens), 0) as to_,
+                COALESCE(SUM(cache_read_tokens), 0) as tcr,
+                COALESCE(SUM(cache_creation_tokens), 0) as tcc,
+                ${costExpr} as cost
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)`,
+      ).get(sinceIso) as { ti: number; to_: number; tcr: number; tcc: number; cost: number };
+
+      const sourceRows = db.prepare(
+        `SELECT source,
+                COUNT(*) as queries,
+                COALESCE(SUM(input_tokens), 0) as totalInput,
+                COALESCE(SUM(output_tokens), 0) as totalOutput,
+                ${costExpr} as costCents
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)
+         GROUP BY source
+         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+      ).all(sinceIso) as Array<{ source: string; queries: number; totalInput: number; totalOutput: number; costCents: number }>;
+
+      const sessionRows = db.prepare(
+        `SELECT session_key as sessionKey,
+                source,
+                ${agentExpr} as agentSlug,
+                COUNT(*) as queries,
+                COALESCE(SUM(input_tokens), 0) as totalInput,
+                COALESCE(SUM(output_tokens), 0) as totalOutput,
+                COALESCE(SUM(cache_read_tokens), 0) as totalCacheRead,
+                COALESCE(SUM(cache_creation_tokens), 0) as totalCacheCreation,
+                ${costExpr} as costCents,
+                COALESCE(SUM(num_turns), 0) as turns,
+                COALESCE(AVG(duration_ms), 0) as avgDurationMs,
+                MAX(created_at) as lastAt
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)
+         GROUP BY session_key, source, ${agentExpr}
+         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+      ).all(sinceIso) as Array<{
+        sessionKey: string;
+        source: string;
+        agentSlug: string;
+        queries: number;
+        totalInput: number;
+        totalOutput: number;
+        totalCacheRead: number;
+        totalCacheCreation: number;
+        costCents: number;
+        turns: number;
+        avgDurationMs: number;
+        lastAt: string;
+      }>;
+
+      const allSessions = sessionRows.map(row => {
+        const identity = classifySession(row.sessionKey, row.source, row.agentSlug);
+        return {
+          ...identity,
+          sessionKey: row.sessionKey,
+          source: row.source,
+          queries: row.queries,
+          totalInput: row.totalInput,
+          totalOutput: row.totalOutput,
+          totalTokens: row.totalInput + row.totalOutput,
+          totalCacheRead: row.totalCacheRead,
+          totalCacheCreation: row.totalCacheCreation,
+          costCents: row.costCents,
+          turns: row.turns,
+          avgDurationMs: Math.round(row.avgDurationMs || 0),
+          lastAt: row.lastAt,
+        };
+      });
+      const sessions = allSessions.slice(0, limit);
+
+      const agentMap = new Map<string, {
+        agentSlug: string | null;
+        label: string;
+        totalInput: number;
+        totalOutput: number;
+        totalTokens: number;
+        costCents: number;
+        queries: number;
+      }>();
+      for (const s of allSessions) {
+        const key = s.agentSlug || '';
+        const existing = agentMap.get(key);
+        if (existing) {
+          existing.totalInput += s.totalInput;
+          existing.totalOutput += s.totalOutput;
+          existing.totalTokens += s.totalTokens;
+          existing.costCents += s.costCents || 0;
+          existing.queries += s.queries;
+        } else {
+          agentMap.set(key, {
+            agentSlug: s.agentSlug,
+            label: s.agentSlug || 'global',
+            totalInput: s.totalInput,
+            totalOutput: s.totalOutput,
+            totalTokens: s.totalTokens,
+            costCents: s.costCents || 0,
+            queries: s.queries,
+          });
+        }
+      }
+
+      const taskMap = new Map<string, {
+        taskKey: string;
+        label: string;
+        kind: string;
+        targetTab: string;
+        controllable: boolean;
+        agentSlug: string | null;
+        totalInput: number;
+        totalOutput: number;
+        totalTokens: number;
+        costCents: number;
+        queries: number;
+        lastAt: string;
+      }>();
+      for (const s of allSessions) {
+        if (s.kind === 'chat session') continue;
+        const mapKey = `${s.kind}:${s.taskKey}:${s.agentSlug || ''}`;
+        const existing = taskMap.get(mapKey);
+        if (existing) {
+          existing.totalInput += s.totalInput;
+          existing.totalOutput += s.totalOutput;
+          existing.totalTokens += s.totalTokens;
+          existing.costCents += s.costCents || 0;
+          existing.queries += s.queries;
+          if ((s.lastAt || '') > (existing.lastAt || '')) existing.lastAt = s.lastAt;
+        } else {
+          taskMap.set(mapKey, {
+            taskKey: s.taskKey,
+            label: s.taskKey,
+            kind: s.kind,
+            targetTab: s.targetTab,
+            controllable: s.controllable,
+            agentSlug: s.agentSlug,
+            totalInput: s.totalInput,
+            totalOutput: s.totalOutput,
+            totalTokens: s.totalTokens,
+            costCents: s.costCents || 0,
+            queries: s.queries,
+            lastAt: s.lastAt,
+          });
+        }
+      }
+
+      const allTasks = Array.from(taskMap.values()).sort((a, b) => b.totalTokens - a.totalTokens);
+      const taskAgentMap = new Map<string, { agentSlug: string | null; totalTokens: number; totalInput: number; totalOutput: number; costCents: number; queries: number }>();
+      for (const t of allTasks) {
+        const key = t.agentSlug || '';
+        const existing = taskAgentMap.get(key);
+        if (existing) {
+          existing.totalTokens += t.totalTokens;
+          existing.totalInput += t.totalInput;
+          existing.totalOutput += t.totalOutput;
+          existing.costCents += t.costCents;
+          existing.queries += t.queries;
+        } else {
+          taskAgentMap.set(key, {
+            agentSlug: t.agentSlug,
+            totalTokens: t.totalTokens,
+            totalInput: t.totalInput,
+            totalOutput: t.totalOutput,
+            costCents: t.costCents,
+            queries: t.queries,
+          });
+        }
+      }
+      const taskTotals = allTasks.reduce((acc, t) => {
+        acc.totalTokens += t.totalTokens;
+        acc.totalInput += t.totalInput;
+        acc.totalOutput += t.totalOutput;
+        acc.costCents += t.costCents;
+        acc.queries += t.queries;
+        return acc;
+      }, { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 });
+      const tasks = allTasks.slice(0, limit);
+
+      res.json({
+        ok: true,
+        hours,
+        sinceIso,
+        totalInput: totals.ti,
+        totalOutput: totals.to_,
+        totalCacheRead: totals.tcr,
+        totalCacheCreation: totals.tcc,
+        totalCostCents: totals.cost,
+        totalTokens: totals.ti + totals.to_,
+        sessions,
+        tasks,
+        taskTotals,
+        taskAgents: Array.from(taskAgentMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+        agents: Array.from(agentMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+        sources: sourceRows.map(s => ({
+          ...s,
+          totalTokens: (s.totalInput || 0) + (s.totalOutput || 0),
+        })),
+      });
+    } catch (err) {
+      res.json({ ok: false, error: String(err), hours, sinceIso, totalTokens: 0, sessions: [], tasks: [], taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 }, taskAgents: [], agents: [], sources: [] });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.get('/api/build/operations', async (req, res) => {
+    try {
+      const [{ listAllForBuilder }, { computeBrokenJobs }, { listBackgroundTasks }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../gateway/failure-monitor.js'),
+        import('../agent/background-tasks.js'),
+      ]);
+      const cronPayload = getCronJobs() as { jobs?: Array<Record<string, unknown>> };
+      const usage = await getBuildUsageForOperations(req.query.hours ?? 168, req.query.limit ?? 50);
+      const snapshot = buildOperationsSnapshot({
+        cronJobs: cronPayload.jobs || [],
+        workflowSummaries: listAllForBuilder(),
+        brokenJobs: computeBrokenJobs() as unknown as Parameters<typeof buildOperationsSnapshot>[0]['brokenJobs'],
+        unleashedTasks: getUnleashedTasksForDashboard(),
+        backgroundTasks: await listBackgroundTasks() as unknown as Array<Record<string, unknown>>,
+        usageTasks: usage.tasks,
+        usageSummary: usage,
+      });
+      res.json({ ok: true, hours: usage.hours, sinceIso: usage.sinceIso, ...snapshot });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
     }
   });
 
@@ -10498,6 +12796,201 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     overflow-y: auto;
   }
 
+  /* ── Brain command center ──────────────── */
+  .brain-command-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .brain-hero-panel {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 18px;
+  }
+  .brain-pillar-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .brain-pillar-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 178px;
+  }
+  .brain-pillar-card strong {
+    font-size: 14px;
+    color: var(--text-primary);
+  }
+  .brain-pillar-card p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .brain-pillar-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: auto;
+  }
+  .brain-kpi-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+  .brain-kpi {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    padding: 12px;
+  }
+  .brain-kpi .value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1.1;
+  }
+  .brain-kpi .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+  }
+  .brain-library-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .brain-library-toolbar input {
+    flex: 1;
+    min-width: 220px;
+  }
+  .brain-result-row {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 13px 15px;
+    margin-bottom: 10px;
+  }
+  .brain-result-row:hover { border-color: var(--accent); }
+  .brain-result-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .brain-result-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+  }
+  .brain-result-subtitle {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+  }
+  .brain-result-preview {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 8px;
+    white-space: pre-wrap;
+    max-height: 112px;
+    overflow: hidden;
+  }
+  .brain-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    white-space: nowrap;
+  }
+  .brain-flow-list {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    overflow: hidden;
+  }
+  .brain-flow-row {
+    display: grid;
+    grid-template-columns: minmax(140px, 1.2fr) 100px repeat(4, 72px) minmax(120px, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-light);
+    font-size: 12px;
+  }
+  .brain-flow-row:last-child { border-bottom: none; }
+  .brain-source-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 12px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .brain-drop-zone {
+    border: 1px dashed var(--border-light);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    padding: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .brain-drop-zone.dragover {
+    border-color: var(--accent);
+    background: var(--accent-glow);
+  }
+  .brain-kv-builder {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .brain-kv-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.5fr) 30px;
+    gap: 6px;
+    align-items: center;
+  }
+  .brain-kv-row input {
+    padding: 7px 9px;
+    font-size: 12px;
+  }
+  @media (max-width: 760px) {
+    .brain-flow-row {
+      grid-template-columns: 1fr;
+      gap: 3px;
+    }
+    .brain-result-top {
+      flex-direction: column;
+    }
+    .brain-kv-row {
+      grid-template-columns: 1fr;
+    }
+  }
+
   /* ── Toast ──────────────────────────────── */
   .toast-container {
     position: fixed;
@@ -11778,6 +14271,75 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     font-weight: 500;
   }
 
+  /* Unified Memory tab — facet rail */
+  .vault-facet-list { display: flex; flex-direction: column; gap: 3px; }
+  .vault-facet-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border-radius: 6px; cursor: pointer;
+    color: var(--text-secondary); font-size: 12px;
+    user-select: none; transition: background var(--motion);
+  }
+  .vault-facet-row:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .vault-facet-row.active { background: var(--clementine-bg); color: var(--clementine); font-weight: 500; }
+  .vault-facet-row .vault-facet-count { font-size: 11px; opacity: 0.6; margin-left: 8px; }
+  .vault-facet-row.active .vault-facet-count { opacity: 0.85; }
+
+  /* Unified Memory tab — file list rows */
+  .vault-mem-row {
+    display: flex; flex-direction: column; gap: 3px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border-light);
+    cursor: pointer; transition: background var(--motion);
+  }
+  .vault-mem-row:hover { background: var(--bg-hover); }
+  .vault-mem-row.active { background: var(--clementine-bg); }
+  .vault-mem-row.active .vault-mem-row-title { color: var(--clementine); }
+  .vault-mem-row-title {
+    font-weight: 500; color: var(--text-primary); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .vault-mem-row-meta {
+    font-size: 11px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
+  .vault-mem-row-path {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--text-muted); opacity: 0.75;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .vault-pill {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 10px; line-height: 1.5; background: var(--bg-tertiary); color: var(--text-secondary);
+  }
+  .vault-pill.type { background: var(--clementine-bg); color: var(--clementine); }
+  .vault-pill.tag { background: var(--bg-tertiary); color: var(--text-secondary); }
+  .vault-pill.match { background: rgba(245,158,11,0.15); color: #d97706; }
+
+  /* Unified Memory tab — reader */
+  .vault-reader-fm {
+    background: var(--bg-secondary); border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 14px;
+    font-size: 12px; display: grid; grid-template-columns: max-content 1fr;
+    gap: 4px 12px; align-items: baseline;
+  }
+  .vault-reader-fm .k { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .vault-reader-fm .v { color: var(--text-primary); word-break: break-word; }
+  .vault-reader-body { max-width: 760px; }
+  .vault-reader-body h1 { font-size: 22px; margin: 0 0 12px; }
+  .vault-reader-body h2 { font-size: 17px; margin: 22px 0 8px; padding-top: 8px; border-top: 1px solid var(--border-light); }
+  .vault-reader-body h3 { font-size: 14px; margin: 16px 0 6px; color: var(--text-secondary); }
+  .vault-reader-body p, .vault-reader-body li { font-size: 14px; line-height: 1.65; }
+  .vault-reader-body code { background: var(--bg-tertiary); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .vault-reader-body pre { background: var(--bg-tertiary); padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .vault-reader-toc {
+    margin-top: 18px; padding: 10px 14px;
+    background: var(--bg-secondary); border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm); font-size: 12px;
+  }
+  .vault-reader-toc-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 6px; }
+  .vault-reader-toc a { display: block; color: var(--text-secondary); text-decoration: none; padding: 2px 0; }
+  .vault-reader-toc a:hover { color: var(--clementine); }
+  .vault-reader-toc a.lvl-3 { padding-left: 14px; font-size: 11px; }
+
   /* ── Task Cards ─────────────────────────── */
   .task-grid {
     display: grid;
@@ -12504,9 +15066,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item active" data-page="home" data-icon="home" title="Chat, today, activity">
         <span class="nav-icon"></span> Home
       </div>
-      <div class="nav-item" data-page="build" data-icon="workflow" title="Workflows, crons, skills">
+      <div class="nav-item" data-page="build" data-icon="workflow" title="Tricks Clementine knows">
         <span class="nav-icon"></span> Build
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
+      </div>
+      <div class="nav-item" data-page="heartbeat" data-icon="bell" title="Heartbeat controls and queued work">
+        <span class="nav-icon"></span> Heartbeat
       </div>
       <div class="nav-item" data-page="team" data-icon="users" title="Agents, activity, goals">
         <span class="nav-icon"></span> Team
@@ -12625,7 +15190,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
         <!-- KPI strip -->
         <section class="kpi-strip" id="home-kpis">
-          <div class="kpi-tile" data-kpi="activeRuns" onclick="navigateTo('build',{tab:'workflows'})">
+          <div class="kpi-tile" data-kpi="activeRuns" onclick="navigateTo('build',{tab:'crons'})">
             <div class="kpi-icon" data-icon="zap"></div>
             <div class="kpi-value" id="kpi-active-runs">--</div>
             <div class="kpi-label">Active runs</div>
@@ -12639,6 +15204,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="kpi-icon" data-icon="sparkles"></div>
             <div class="kpi-value" id="kpi-time-saved">--</div>
             <div class="kpi-label">Saved this week</div>
+          </div>
+          <div class="kpi-tile" data-kpi="tokens7d" onclick="navigateTo('build',{tab:'crons'})">
+            <div class="kpi-icon" data-icon="activity"></div>
+            <div class="kpi-value" id="kpi-tokens-7d">--</div>
+            <div class="kpi-label">Tokens 7d</div>
           </div>
           <div class="kpi-tile" data-kpi="approvals" onclick="navigateTo('brain',{tab:'learning'})">
             <div class="kpi-icon" data-icon="check"></div>
@@ -12698,171 +15268,1020 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
+    <!-- ═══ Build Page — Routines (single unified surface) ═══ -->
     <div class="page" id="page-build">
-      <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflows</button>
-        <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Crons <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
-        <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
-        <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
-      </div>
-      <!-- Builder header strip — persists across tabs (except Templates) -->
-      <div id="build-header-strip" style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border)">
-        <select id="builder-type" onchange="resetBuilder();updateBuilderMode()" style="display:none">
-          <option value="skill">skill</option>
-          <option value="cron">cron</option>
-          <option value="agent">agent</option>
-          <option value="workflow">workflow</option>
-        </select>
-        <label style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
-        <select id="builder-owner" onchange="onBuilderOwnerChange()" title="Filter and create scoped to this owner" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
-          <option value="">Clementine (global)</option>
-        </select>
-        <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
-        <input type="hidden" id="builder-agent" value="">
+      <!-- Toolbar -->
+      <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
+        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Tricks</h2>
+        <span id="routines-count" style="font-size:11px;color:var(--text-muted)"></span>
+        <span id="routines-editor-breadcrumb" style="display:none;font-size:12px;color:var(--text-muted)"> &rsaquo; <span id="routines-editor-name" style="color:var(--text-primary);font-weight:500"></span></span>
         <span style="flex:1"></span>
-        <button class="btn-sm btn-primary" onclick="newFromBuildHeader()" title="Create a new artifact for this tab" style="padding:4px 14px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
-        <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
-        <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
+        <label id="routines-owner-label" style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
+        <select id="routines-owner-filter" onchange="window.RoutinesUI && RoutinesUI.renderList()" style="padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
+          <option value="__all__">All</option>
+          <option value="__global__">Clementine (global)</option>
+        </select>
+        <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
+        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" title="Skip the chat and fill out a form yourself" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Trick</button>
       </div>
-      <!-- Build tab content area: canvas DOMINATES, chat is a sidebar -->
-      <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:flex;flex:1;min-height:0;overflow:hidden">
-        <!-- Left: Chat sidebar (compact) -->
-        <div id="builder-chat-sidebar" style="width:360px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);background:var(--bg-secondary)">
-          <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
-            <div class="empty-state" id="builder-empty-state" style="margin-top:40px">
-              <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
-              <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a cron job that checks my email every morning and sends me a summary')">Email summary cron</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create an SDR agent that researches leads and drafts outreach emails')">SDR agent</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Build a weekly analytics report that checks SEO rankings')">Weekly SEO report</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that researches a topic, writes a draft, and sends it for review')">Research workflow</button>
-              </div>
-            </div>
-          </div>
-          <div id="builder-file-area" style="padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-secondary)">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-              <span style="font-size:11px;font-weight:600;color:var(--text-secondary)">Reference Files</span>
-              <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-primary)">
-                + Add
-                <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">
-              </label>
-              <span style="font-size:10px;color:var(--text-muted)">Sent with each message so the AI can reference them</span>
-            </div>
-            <div id="builder-attachments-list"></div>
-          </div>
-          <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);align-items:center">
-            <label style="cursor:pointer;display:flex;align-items:center;color:var(--text-muted);font-size:18px" title="Attach file">
-              <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">&#x1F4CE;
-            </label>
-            <input type="text" id="builder-input" placeholder="Describe what you want to build..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendBuilderChat()}" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
-            <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
+      <!-- List view (default) -->
+      <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div id="routines-list-empty" class="empty-state" style="display:none;padding:64px 18px;text-align:center;color:var(--text-muted)">
+          <div style="font-size:38px;opacity:0.4;margin-bottom:14px">&#9881;</div>
+          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No tricks yet</div>
+          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Trick is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Trick</button>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
           </div>
         </div>
-        <!-- Right: Canvas (dominant) + Existing Skills drawer -->
-        <div id="builder-right-pane" style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg-primary)">
-          <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <span id="builder-right-pane-title">Live Preview</span>
-            <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted)"></span>
+        <div id="routines-list-wrap" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead style="text-align:left;color:var(--text-muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary)">
+              <tr>
+                <th style="padding:11px 14px">Name</th>
+                <th style="padding:11px 14px">Owner</th>
+                <th style="padding:11px 14px">Schedule</th>
+                <th style="padding:11px 14px">Steps</th>
+                <th style="padding:11px 14px">Last run</th>
+                <th style="padding:11px 14px;text-align:center">Enabled</th>
+                <th style="padding:11px 14px;text-align:right">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="routines-list-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <!-- Editor pane (hidden by default; replaces list when a routine is opened) -->
+      <div id="routines-editor-pane" style="display:none;flex:1;min-height:0;overflow-y:auto;background:var(--bg-primary);padding:18px"></div>
+      <!-- Run history drawer (slide-out from right) -->
+      <div id="routines-runs-drawer" style="display:none;position:fixed;top:var(--header-h, 56px);right:0;bottom:0;width:520px;max-width:100vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 24px rgba(0,0,0,0.18);z-index:120;overflow-y:auto"></div>
+      <!-- Create modal -->
+      <div id="routines-create-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px">
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New trick</h3>
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Name</label>
+          <input type="text" id="routines-create-name" placeholder="e.g. 8am Email Triage" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Description (optional)</label>
+          <input type="text" id="routines-create-description" placeholder="What does it do?" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Schedule (optional cron expression)</label>
+          <input type="text" id="routines-create-schedule" placeholder="e.g. 0 8 * * *  (leave blank for manual)" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Owner</label>
+          <select id="routines-create-owner" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+            <option value="">Clementine (global)</option>
+          </select>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Cancel</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.submitCreate()" style="padding:6px 14px">Create</button>
+          </div>
+        </div>
+      </div>
+      <!-- Chat-first builder modal — two-pane: chat on the left, live spec preview on the right -->
+      <style>
+        .trick-chat-body { display:flex; flex-direction:row; flex:1; min-height:0; }
+        .trick-chat-pane { width:420px; flex-shrink:0; display:flex; flex-direction:column; min-height:0; }
+        .trick-spec-pane { flex:1; min-width:0; min-height:0; overflow-y:auto; padding:18px 20px; background:var(--bg-tertiary); border-left:1px solid var(--border); }
+        .trick-spec-card { background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; margin-bottom:8px; }
+        .trick-spec-skeleton-row { height:14px; background:var(--bg-secondary); border-radius:4px; margin:8px 0; opacity:0.6; }
+        @keyframes trickShimmer { 0% { opacity:0.45 } 50% { opacity:0.85 } 100% { opacity:0.45 } }
+        .trick-spec-streaming .trick-spec-card { animation:trickShimmer 1.4s ease-in-out infinite; }
+        @media (max-width: 900px) {
+          .trick-chat-body { flex-direction:column; }
+          .trick-chat-pane { width:100%; max-height:50vh; }
+          .trick-spec-pane { border-left:none; border-top:1px solid var(--border); }
+        }
+      </style>
+      <div id="routines-chat-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);width:1100px;max-width:96vw;height:88vh;max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0">
+            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Build a trick with Clementine</h3>
+            <span id="routines-chat-status" style="color:var(--text-muted);flex:1;font-size:11px;min-height:14px"></span>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
+          </div>
+          <div class="trick-chat-body">
+            <!-- Left: chat pane -->
+            <div class="trick-chat-pane">
+              <div id="routines-chat-messages" style="flex:1;min-height:0;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:10px"></div>
+              <div style="padding:12px 18px;border-top:1px solid var(--border);background:var(--bg-secondary);flex-shrink:0">
+                <div style="display:flex;gap:8px;align-items:flex-end">
+                  <textarea id="routines-chat-input" rows="2" placeholder="Tell Clementine what you want her to do…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();window.RoutinesUI&&RoutinesUI.sendChat();}"></textarea>
+                  <button id="routines-chat-send" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.sendChat()" style="padding:8px 16px;align-self:flex-end">Send</button>
+                </div>
+              </div>
+            </div>
+            <!-- Right: live spec pane -->
+            <div class="trick-spec-pane" id="routines-chat-spec"></div>
+          </div>
+          <div style="padding:10px 18px;border-top:1px solid var(--border);background:var(--bg-secondary);display:flex;align-items:center;gap:10px;flex-shrink:0">
             <span style="flex:1"></span>
-            <select id="builder-canvas-picker" onchange="openBuilderWorkflow(this.value)" style="display:none;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;max-width:240px">
-              <option value="">— pick a workflow —</option>
-            </select>
-            <button id="builder-canvas-validate-btn" onclick="validateBuilderCanvas()" title="Static checks (cycles, missing fields, deps)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Validate</button>
-            <button id="builder-canvas-dryrun-btn" onclick="dryRunBuilderCanvas()" title="Describe what each step would do (no execution)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Dry-run</button>
-            <button id="builder-canvas-test-btn" onclick="testBuilderCanvas()" title="Test run (mock-safe by default)" style="display:none;background:var(--clementine);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Test</button>
-            <button id="builder-canvas-cancel-btn" onclick="cancelBuilderTest()" title="Cancel test run" style="display:none;background:var(--red);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>
-          </div>
-          <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
-            <div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>
-          </div>
-          <div id="builder-canvas-host" style="display:none;flex:1;flex-direction:column;min-height:0;position:relative">
-            <div id="builder-canvas-banner" style="padding:8px 14px;background:var(--bg-tertiary);border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);display:none"></div>
-            <div id="builder-canvas" style="flex:1;background:var(--bg-tertiary);position:relative;overflow:hidden"></div>
-            <!-- Floating add-node FAB + palette popover -->
-            <button id="builder-palette-btn" onclick="toggleBuilderPalette()" title="Add a step" style="position:absolute;left:14px;bottom:48px;width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;border:none;font-size:20px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.25);z-index:10">+</button>
-            <div id="builder-palette-pop" style="display:none;position:absolute;left:60px;bottom:48px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:6px;box-shadow:0 4px 16px rgba(0,0,0,0.2);z-index:11;min-width:160px">
-              <div onclick="_builderAddNodeOfKind('prompt')" class="builder-palette-item" data-kind="prompt">prompt</div>
-              <div onclick="_builderAddNodeOfKind('mcp')" class="builder-palette-item" data-kind="mcp">mcp tool</div>
-              <div onclick="_builderAddNodeOfKind('channel')" class="builder-palette-item" data-kind="channel">channel</div>
-              <div onclick="_builderAddNodeOfKind('transform')" class="builder-palette-item" data-kind="transform">transform</div>
-              <div onclick="_builderAddNodeOfKind('conditional')" class="builder-palette-item" data-kind="conditional">conditional</div>
-              <div onclick="_builderAddNodeOfKind('loop')" class="builder-palette-item" data-kind="loop">loop</div>
-            </div>
-            <!-- Slide-out config panel -->
-            <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;flex-direction:column"></div>
-            <!-- Empty-state CTA — visible when no workflow is open on the canvas -->
-            <div id="builder-canvas-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;color:var(--text-muted);text-align:center;padding:32px;pointer-events:none">
-              <div style="font-size:38px;opacity:0.4">&#128279;</div>
-              <div style="font-size:14px;font-weight:500;color:var(--text-secondary)">No workflow open</div>
-              <div style="font-size:12px;line-height:1.5;max-width:280px">
-                Pick one from the dropdown above &mdash; or click <strong>New</strong> in the header to create one from scratch, or open the <strong>Templates</strong> tab for starter patterns.
-              </div>
-            </div>
-            <div id="builder-canvas-footer" style="padding:6px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:14px;align-items:center">
-              <span id="builder-canvas-status"></span>
-              <span style="flex:1"></span>
-              <button id="builder-delete-btn" onclick="deleteCurrentBuilderWorkflow()" title="Delete this workflow" style="display:none;background:none;border:1px solid transparent;color:var(--red);font-size:11px;cursor:pointer;padding:2px 8px;border-radius:var(--radius-xs)">Delete</button>
-              <span id="builder-canvas-id" style="font-family:'JetBrains Mono',monospace;opacity:0.6"></span>
-            </div>
-          </div>
-          <!-- Existing skills drawer (visible in skill mode) -->
-          <div id="builder-skills-drawer" style="display:none;border-top:2px solid var(--border);max-height:260px;overflow-y:auto">
-            <div style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg-secondary);z-index:1">
-              <span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Existing Skills</span>
-              <span id="builder-skills-count" style="font-size:10px;color:var(--text-muted)"></span>
-            </div>
-            <div id="builder-skills-list" style="padding:0 12px 12px"></div>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat(true);RoutinesUI.openCreate();" style="padding:4px 10px;background:transparent;border:none;color:var(--text-muted);font-size:11px;cursor:pointer;text-decoration:underline">Build manually instead</button>
           </div>
         </div>
       </div>
-
-      <!-- Templates tab — starter patterns -->
-      <div id="build-tab-templates" data-build-tabpane="templates" style="display:none;padding:24px;overflow-y:auto">
-        <div style="max-width:920px;margin:0 auto">
-          <h2 style="font-size:18px;font-weight:600;margin:0 0 6px;color:var(--text-primary)">Start from a template</h2>
-          <p style="font-size:13px;color:var(--text-muted);margin:0 0 18px">Pick a pre-built pattern to fork into a new editable workflow.</p>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px">
-            <div class="card clickable-row" onclick="forkBuildTemplate('daily-news-digest')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128240;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Daily news digest</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 7am: pull RSS sources, summarize, send to Slack/email.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('lead-picker')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128202;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Lead picker → Salesforce</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Manual workflow: search leads by ICP, review, push selected to SF.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('pr-review-queue')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128221;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">PR review queue</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 9am M-F: list open PRs, summarize risk, message to Slack.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('email-triage')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128231;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Email triage</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 8am: list unread emails, classify by intent, draft replies for review.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('weekly-review')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128197;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Weekly review</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron Fri 6pm: review the week's daily notes, generate review note.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('blank-workflow')" style="padding:18px;border-style:dashed">
-              <div style="font-size:24px;margin-bottom:8px">&#10133;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Blank workflow</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Start from scratch with a single prompt step.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 1 step</div>
-            </div>
+      <!-- Step picker modal -->
+      <div id="routines-step-picker" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:0;width:640px;max-width:94vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+          <div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Add step</h3>
+            <span style="flex:1"></span>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeStepPicker()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
           </div>
+          <div id="routines-step-picker-body" style="padding:16px 20px;overflow-y:auto;flex:1"></div>
         </div>
       </div>
     </div>
+    <script>
+      // ── Routines UI ─────────────────────────────────────────────────
+      // Vanilla JS module that drives the new Routines surface. State-light,
+      // re-fetches from /api/routines on most actions to stay correct without
+      // a client-side data store. Renders linear step lists; no canvas.
+      (function() {
+        var R = {
+          state: {
+            list: [],
+            owners: [],
+            mcpTools: null,        // { servers: [{name,enabled,tools:[]}, ...] }
+            cliTools: null,        // [{cmd,description,userDefined}, ...]
+            editing: null,         // { id, routine, dirty }
+            assistBusy: false,
+          },
+          init: function() {
+            // Load reference data lazily; trigger list render immediately.
+            this.loadOwners();
+            this.refreshList();
+            this.loadMcpTools();
+            this.loadCliTools();
+          },
+          // ── data ────────────────────────────────────────────────────
+          loadOwners: function() {
+            // Reuse the agent registry the rest of the dashboard uses.
+            apiFetch('/api/agents').then(function(r){ return r.json(); }).then(function(data){
+              R.state.owners = (data.agents || []).map(function(a){ return { slug: a.slug, name: a.name || a.slug }; });
+              R.populateOwnerSelects();
+            }).catch(function(){ /* non-fatal */ });
+          },
+          populateOwnerSelects: function() {
+            var filter = document.getElementById('routines-owner-filter');
+            var creator = document.getElementById('routines-create-owner');
+            var keepFilter = filter && filter.value;
+            if (filter) {
+              filter.innerHTML = '<option value="__all__">All</option><option value="__global__">Clementine (global)</option>'
+                + R.state.owners.map(function(o){ return '<option value="' + R.esc(o.slug) + '">@' + R.esc(o.name) + '</option>'; }).join('');
+              if (keepFilter) filter.value = keepFilter;
+            }
+            if (creator) {
+              creator.innerHTML = '<option value="">Clementine (global)</option>'
+                + R.state.owners.map(function(o){ return '<option value="' + R.esc(o.slug) + '">@' + R.esc(o.name) + '</option>'; }).join('');
+            }
+          },
+          loadMcpTools: function() {
+            apiFetch('/api/routines/mcp-tools').then(function(r){ return r.json(); }).then(function(data){
+              R.state.mcpTools = data && data.servers ? data : { servers: [] };
+            }).catch(function(){ R.state.mcpTools = { servers: [] }; });
+          },
+          loadCliTools: function() {
+            apiFetch('/api/routines/cli-tools').then(function(r){ return r.json(); }).then(function(data){
+              R.state.cliTools = (data && data.tools) || [];
+            }).catch(function(){ R.state.cliTools = []; });
+          },
+          refreshList: function() {
+            apiFetch('/api/routines').then(function(r){ return r.json(); }).then(function(data){
+              R.state.list = (data && data.routines) || [];
+              R.renderList();
+            }).catch(function(){ R.state.list = []; R.renderList(); });
+          },
+          // ── list view ───────────────────────────────────────────────
+          renderList: function() {
+            var body = document.getElementById('routines-list-body');
+            var empty = document.getElementById('routines-list-empty');
+            var wrap = document.getElementById('routines-list-wrap');
+            var count = document.getElementById('routines-count');
+            if (!body || !empty || !wrap) return;
+            var filter = (document.getElementById('routines-owner-filter') || {}).value || '__all__';
+            var rows = R.state.list.filter(function(r){
+              if (filter === '__all__') return true;
+              if (filter === '__global__') return r.scope === 'global';
+              return r.scope === 'agent' && r.agentSlug === filter;
+            });
+            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' trick' : ' tricks');
+            if (rows.length === 0) {
+              empty.style.display = 'block';
+              wrap.style.display = 'none';
+              return;
+            }
+            empty.style.display = 'none';
+            wrap.style.display = 'block';
+            body.innerHTML = rows.map(function(r){
+              var owner = r.scope === 'agent' ? '@' + R.esc(r.agentSlug || '?') : 'Clementine';
+              var schedule = r.schedule ? '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px">' + R.esc(r.schedule) + '</code>' : '<span style="color:var(--text-muted)">manual</span>';
+              var enabledBadge = '<input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' onchange="event.stopPropagation();window.RoutinesUI&&RoutinesUI.toggle(\\x27' + R.esc(r.id) + '\\x27)" style="cursor:pointer">';
+              var origin = r.origin === 'cron' ? '<span title="Legacy cron entry — single prompt step" style="font-size:10px;color:var(--text-muted);margin-left:6px">[cron]</span>' : '';
+              return '<tr style="border-top:1px solid var(--border);cursor:pointer" onclick="window.RoutinesUI&&RoutinesUI.openEditor(\\x27' + R.esc(r.id) + '\\x27)">'
+                + '<td style="padding:11px 14px;color:var(--text-primary);font-weight:500">' + R.esc(r.name) + origin + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-secondary);font-size:12px">' + R.esc(owner) + '</td>'
+                + '<td style="padding:11px 14px">' + schedule + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-secondary);font-size:12px">' + r.stepCount + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-muted);font-size:12px">&mdash;</td>'
+                + '<td style="padding:11px 14px;text-align:center" onclick="event.stopPropagation()">' + enabledBadge + '</td>'
+                + '<td style="padding:11px 14px;text-align:right;white-space:nowrap" onclick="event.stopPropagation()">'
+                + '<button class="btn-sm" title="Run now" onclick="window.RoutinesUI&&RoutinesUI.run(\\x27' + R.esc(r.id) + '\\x27)" style="padding:4px 10px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);border-radius:4px;cursor:pointer;font-size:11px;margin-right:4px">&#9654; Run</button>'
+                + '<button class="btn-sm" title="Run history" onclick="window.RoutinesUI&&RoutinesUI.openRuns(\\x27' + R.esc(r.id) + '\\x27)" style="padding:4px 10px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:4px;cursor:pointer;font-size:11px">History</button>'
+                + '</td></tr>';
+            }).join('');
+          },
+          toggle: function(id) {
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/toggle', { method: 'POST' })
+              .then(function(r){ return r.json(); })
+              .then(function(){ R.refreshList(); })
+              .catch(function(err){ alert('Toggle failed: ' + err); });
+          },
+          run: function(id, approvedSideEffects) {
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ approvedSideEffects: approvedSideEffects === true })
+            }).then(function(r){
+              if (r.status === 409) {
+                return r.json().then(function(j){
+                  var lines = (j.sideEffects || []).map(function(s){ return '  • ' + s.kind + ': ' + s.label; }).join('\\n');
+                  if (confirm('This trick has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
+                });
+              }
+              return r.json().then(function(j){
+                if (j.ok) R.flash('Triggered.');
+                else alert('Run failed: ' + (j.error || 'unknown'));
+              });
+            }).catch(function(err){ alert('Run failed: ' + err); });
+          },
+          // ── editor ──────────────────────────────────────────────────
+          openEditor: function(id) {
+            apiFetch('/api/routines/' + encodeURIComponent(id))
+              .then(function(r){ return r.json(); })
+              .then(function(data){
+                if (!data || !data.routine) { alert('Failed to load trick'); return; }
+                R.state.editing = { id: data.id, routine: data.routine, dirty: false, validation: data.validation };
+                R.showEditor();
+              }).catch(function(err){ alert('Open failed: ' + err); });
+          },
+          showEditor: function() {
+            document.getElementById('routines-list-pane').style.display = 'none';
+            document.getElementById('routines-editor-pane').style.display = 'block';
+            document.getElementById('routines-back-btn').style.display = 'inline-block';
+            document.getElementById('routines-create-btn').style.display = 'none';
+            document.getElementById('routines-assist-btn').style.display = 'none';
+            document.getElementById('routines-owner-filter').style.display = 'none';
+            document.getElementById('routines-owner-label').style.display = 'none';
+            document.getElementById('routines-editor-breadcrumb').style.display = 'inline';
+            document.getElementById('routines-editor-name').textContent = R.state.editing.routine.name;
+            R.renderEditor();
+          },
+          closeEditor: function() {
+            if (R.state.editing && R.state.editing.dirty && !confirm('Discard unsaved changes?')) return;
+            R.state.editing = null;
+            document.getElementById('routines-list-pane').style.display = 'block';
+            document.getElementById('routines-editor-pane').style.display = 'none';
+            document.getElementById('routines-back-btn').style.display = 'none';
+            document.getElementById('routines-create-btn').style.display = 'inline-block';
+            document.getElementById('routines-assist-btn').style.display = 'inline-block';
+            document.getElementById('routines-owner-filter').style.display = 'inline-block';
+            document.getElementById('routines-owner-label').style.display = 'inline';
+            document.getElementById('routines-editor-breadcrumb').style.display = 'none';
+            R.refreshList();
+          },
+          renderEditor: function() {
+            var pane = document.getElementById('routines-editor-pane');
+            if (!pane || !R.state.editing) return;
+            var wf = R.state.editing.routine;
+            var html = '<div style="max-width:920px;margin:0 auto">';
+            html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:14px">'
+              + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">'
+              + '<input type="text" id="re-name" value="' + R.esc(wf.name) + '" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:14px;font-weight:600">'
+              + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)"><input type="checkbox" id="re-enabled" ' + (wf.enabled ? 'checked' : '') + ' onchange="window.RoutinesUI&&RoutinesUI.markDirty()"> Enabled</label>'
+              + '</div>'
+              + '<input type="text" id="re-description" value="' + R.esc(wf.description || '') + '" placeholder="Description (optional)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;margin-bottom:10px;box-sizing:border-box">'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;min-width:62px">Schedule</label>'
+              + '<input type="text" id="re-schedule" value="' + R.esc(wf.trigger && wf.trigger.schedule || '') + '" placeholder="cron e.g. 0 8 * * * (blank = manual)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="flex:1;min-width:240px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
+              + '</div>'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;min-width:62px">Model</label>'
+              + R.modelSelect('re-model', wf.model || '', 'Default for prompt steps that don\\x27t override')
+              + '</div></div>';
+            // Steps
+            html += '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:18px 0 8px">Steps</div>';
+            html += '<div id="re-steps-list">' + (wf.steps || []).map(function(s, i){ return R.renderStepCard(s, i); }).join('') + '</div>';
+            html += '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.openStepPicker()" style="margin-top:8px;padding:8px 14px;border:1px dashed var(--border);background:transparent;color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px;width:100%">+ Add step</button>';
+            // Action bar
+            html += '<div id="re-action-bar" style="position:sticky;bottom:0;background:var(--bg-primary);border-top:1px solid var(--border);padding:14px 0;margin-top:24px;display:flex;gap:8px;align-items:center">'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.dryRunCurrent()" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">Dry-run</button>'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.testCurrent()" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">Mock test</button>'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.openRuns(R.state && R.state.editing && R.state.editing.id)" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">History</button>'
+              + '<span style="flex:1"></span>'
+              + (R.state.editing.routine.sourceFile && R.state.editing.id.indexOf("cron:") !== 0 ? '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.deleteCurrent()" style="padding:6px 12px;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:6px;cursor:pointer;font-size:12px">Delete</button>' : '')
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.runCurrent()" style="padding:6px 14px;background:var(--green);border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:12px">&#9654; Run now</button>'
+              + '<button class="btn-sm btn-primary" id="re-save-btn" onclick="window.RoutinesUI&&RoutinesUI.saveCurrent()" style="padding:6px 16px">Save</button>'
+              + '</div>';
+            html += '<div id="re-status" style="font-size:11px;color:var(--text-muted);min-height:14px;padding:6px 0"></div>';
+            html += '</div>';
+            pane.innerHTML = html;
+            if (window.hydrateLucideIcons) window.hydrateLucideIcons();
+          },
+          renderStepCard: function(step, idx) {
+            var kind = step.kind || 'prompt';
+            var kindColor = { prompt: '#5e72e4', mcp: '#2dce89', cli: '#fb6340', conditional: '#f5365c', channel: '#11cdef', transform: '#ffd600', loop: '#8965e0' }[kind] || '#888';
+            var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
+            // Model picker is only meaningful for prompt steps (other kinds don't call the LLM directly).
+            var modelCtl = (kind === 'prompt')
+              ? R.modelSelect('', step.model || '', 'Use trick default', { idx: idx, small: true })
+              : '';
+            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+              + '<span style="font-size:11px;color:var(--text-muted);font-weight:600;min-width:24px">#' + (idx + 1) + '</span>'
+              + badge
+              + '<input type="text" value="' + R.esc(step.id) + '" onchange="window.RoutinesUI&&RoutinesUI.updateStep(' + idx + ',\\x27id\\x27,this.value)" style="font-family:\\x27JetBrains Mono\\x27,monospace;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;min-width:120px">'
+              + modelCtl
+              + '<span style="flex:1"></span>'
+              + (idx > 0 ? '<button title="Move up" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',-1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&uarr;</button>' : '')
+              + (idx < (R.state.editing.routine.steps.length - 1) ? '<button title="Move down" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&darr;</button>' : '')
+              + '<button title="Remove" onclick="window.RoutinesUI&&RoutinesUI.removeStep(' + idx + ')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px">&times;</button>'
+              + '</div>';
+            var body = R.renderStepBody(step, idx);
+            var depsList = (step.dependsOn || []).join(', ');
+            var depsRow = '<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><label style="font-size:10px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;min-width:60px">After</label>'
+              + '<input type="text" value="' + R.esc(depsList) + '" placeholder="step ids, comma-separated (blank = independent)" onchange="window.RoutinesUI&&RoutinesUI.updateStepDeps(' + idx + ',this.value)" style="flex:1;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace"></div>';
+            return '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:8px;border-left:3px solid ' + kindColor + '">' + head + body + depsRow + '</div>';
+          },
+          renderStepBody: function(step, idx) {
+            var kind = step.kind || 'prompt';
+            switch (kind) {
+              case 'prompt':
+                return '<textarea rows="3" placeholder="Prompt to send to the agent" oninput="window.RoutinesUI&&RoutinesUI.updateStep(' + idx + ',\\x27prompt\\x27,this.value)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:inherit;resize:vertical;box-sizing:border-box">' + R.esc(step.prompt || '') + '</textarea>';
+              case 'mcp':
+                var mcp = step.mcp || { server: '', tool: '', inputs: {} };
+                var serverOptions = '<option value="">— pick server —</option>' + (R.state.mcpTools && R.state.mcpTools.servers || []).map(function(s){ return '<option value="' + R.esc(s.name) + '" ' + (mcp.server === s.name ? 'selected' : '') + '>' + R.esc(s.name) + ' (' + s.tools.length + ')</option>'; }).join('');
+                var server = (R.state.mcpTools && R.state.mcpTools.servers || []).find(function(s){ return s.name === mcp.server; });
+                var toolOptions = '<option value="">— pick tool —</option>' + (server ? server.tools.map(function(t){ return '<option value="' + R.esc(t) + '" ' + (mcp.tool === t ? 'selected' : '') + '>' + R.esc(t) + '</option>'; }).join('') : '');
+                var inputsJson = JSON.stringify(mcp.inputs || {}, null, 2);
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateMcp(' + idx + ',\\x27server\\x27,this.value)" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + serverOptions + '</select>'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateMcp(' + idx + ',\\x27tool\\x27,this.value)" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + toolOptions + '</select>'
+                  + '</div>'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Inputs (JSON; values may use {{steps.x}} or {{input.name}})</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateMcpInputs(' + idx + ',this.value)" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc(inputsJson) + '</textarea>';
+              case 'cli':
+                var cli = step.cli || { cmd: '', args: [] };
+                var cliOptions = '<option value="">— pick CLI —</option>' + (R.state.cliTools || []).map(function(c){ return '<option value="' + R.esc(c.cmd) + '" ' + (cli.cmd === c.cmd ? 'selected' : '') + '>' + R.esc(c.cmd) + ' &mdash; ' + R.esc(c.description) + '</option>'; }).join('');
+                if (cli.cmd && !(R.state.cliTools || []).some(function(c){ return c.cmd === cli.cmd; })) {
+                  cliOptions += '<option value="' + R.esc(cli.cmd) + '" selected>' + R.esc(cli.cmd) + ' (custom)</option>';
+                }
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27cmd\\x27,this.value)" style="flex:1;min-width:200px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + cliOptions + '</select>'
+                  + '<input type="number" value="' + (cli.timeoutMs || 60000) + '" onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27timeoutMs\\x27,parseInt(this.value,10))" placeholder="timeout ms" style="width:120px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px" title="Timeout in milliseconds">'
+                  + '</div>'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Args (one per line; supports {{steps.x}} templates)</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateCliArgs(' + idx + ',this.value)" placeholder="--json\\norg list" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc((cli.args || []).join('\\n')) + '</textarea>'
+                  + '<label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11px;color:var(--text-secondary)"><input type="checkbox" ' + (cli.captureStderr ? 'checked' : '') + ' onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27captureStderr\\x27,this.checked)"> Include stderr in output</label>';
+              case 'conditional':
+                var cond = step.conditional || { condition: '', trueNext: [], falseNext: [] };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Condition (JS expression — has access to <code>steps.&lt;id&gt;</code>)</label>'
+                  + '<input type="text" value="' + R.esc(cond.condition || '') + '" placeholder="e.g. steps.s1.messages.length > 0" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27condition\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;margin-bottom:6px;box-sizing:border-box">'
+                  + '<div style="display:flex;gap:8px"><div style="flex:1">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">If true → run these step ids (comma)</label>'
+                  + '<input type="text" value="' + R.esc((cond.trueNext || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27trueNext\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">'
+                  + '</div><div style="flex:1">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">If false → run these step ids</label>'
+                  + '<input type="text" value="' + R.esc((cond.falseNext || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27falseNext\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">'
+                  + '</div></div>';
+              case 'channel':
+                var ch = step.channel || { channel: 'discord', target: '', content: '' };
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27channel\\x27,this.value)" style="padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">'
+                  + ['discord','slack','telegram','whatsapp','email','webhook'].map(function(c){ return '<option value="' + c + '"' + (ch.channel === c ? ' selected' : '') + '>' + c + '</option>'; }).join('')
+                  + '</select>'
+                  + '<input type="text" value="' + R.esc(ch.target || '') + '" placeholder="channel id, #channel, email, URL…" oninput="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27target\\x27,this.value)" style="flex:1;min-width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">'
+                  + '</div>'
+                  + '<textarea rows="3" placeholder="Message content (supports {{steps.x}})" oninput="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27content\\x27,this.value)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:inherit;resize:vertical;box-sizing:border-box">' + R.esc(ch.content || '') + '</textarea>';
+              case 'transform':
+                var tr = step.transform || { expression: '' };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Expression (sandboxed JS; returns the step output)</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateTransform(' + idx + ',this.value)" placeholder="e.g. steps.s1.items.filter(x =&gt; x.urgent)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc(tr.expression || '') + '</textarea>';
+              case 'loop':
+                var lp = step.loop || { items: '', bodyStepIds: [] };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Items expression (yields an array)</label>'
+                  + '<input type="text" value="' + R.esc(lp.items || '') + '" placeholder="e.g. steps.s1.results" oninput="window.RoutinesUI&&RoutinesUI.updateLoop(' + idx + ',\\x27items\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;margin-bottom:6px;box-sizing:border-box">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Body step ids (comma-separated)</label>'
+                  + '<input type="text" value="' + R.esc((lp.bodyStepIds || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateLoop(' + idx + ',\\x27bodyStepIds\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">';
+              default:
+                return '<em style="font-size:11px;color:var(--text-muted)">Unknown step kind: ' + R.esc(kind) + '</em>';
+            }
+          },
+          markDirty: function() {
+            if (!R.state.editing) return;
+            R.state.editing.dirty = true;
+            // Sync header inputs back to the routine.
+            var nm = document.getElementById('re-name'); if (nm) R.state.editing.routine.name = nm.value;
+            var de = document.getElementById('re-description'); if (de) R.state.editing.routine.description = de.value;
+            var sc = document.getElementById('re-schedule'); if (sc) {
+              var v = sc.value.trim();
+              R.state.editing.routine.trigger = v ? { schedule: v, manual: false } : { manual: true };
+            }
+            var en = document.getElementById('re-enabled'); if (en) R.state.editing.routine.enabled = en.checked;
+            var md = document.getElementById('re-model'); if (md) R.state.editing.routine.model = md.value || undefined;
+            R.setStatus('Unsaved changes');
+          },
+          updateStep: function(idx, field, value) {
+            if (!R.state.editing) return;
+            R.state.editing.routine.steps[idx][field] = value;
+            R.markDirty();
+          },
+          updateStepDeps: function(idx, csv) {
+            if (!R.state.editing) return;
+            R.state.editing.routine.steps[idx].dependsOn = csv.split(',').map(function(s){ return s.trim(); }).filter(function(s){ return s; });
+            R.markDirty();
+          },
+          updateMcp: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.mcp = s.mcp || { server: '', tool: '', inputs: {} };
+            s.mcp[field] = value;
+            if (field === 'server') s.mcp.tool = '';  // reset tool when server changes
+            R.markDirty();
+            R.renderEditor();  // re-render so tool dropdown updates
+          },
+          updateMcpInputs: function(idx, json) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.mcp = s.mcp || { server: '', tool: '', inputs: {} };
+            try { s.mcp.inputs = JSON.parse(json); R.setStatus(''); }
+            catch (e) { R.setStatus('Invalid JSON in step ' + s.id + ' inputs (will not save until fixed)'); return; }
+            R.markDirty();
+          },
+          updateCli: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.cli = s.cli || { cmd: '', args: [] };
+            s.cli[field] = value;
+            R.markDirty();
+          },
+          updateCliArgs: function(idx, txt) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.cli = s.cli || { cmd: '', args: [] };
+            s.cli.args = txt.split('\\n').map(function(l){ return l.trim(); }).filter(function(l){ return l; });
+            R.markDirty();
+          },
+          updateConditional: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.conditional = s.conditional || { condition: '', trueNext: [], falseNext: [] };
+            if (field === 'trueNext' || field === 'falseNext') {
+              s.conditional[field] = String(value).split(',').map(function(x){ return x.trim(); }).filter(function(x){ return x; });
+            } else {
+              s.conditional[field] = value;
+            }
+            R.markDirty();
+          },
+          updateChannel: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.channel = s.channel || { channel: 'discord', target: '', content: '' };
+            s.channel[field] = value;
+            R.markDirty();
+          },
+          updateTransform: function(idx, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.transform = { expression: value };
+            R.markDirty();
+          },
+          updateLoop: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.loop = s.loop || { items: '', bodyStepIds: [] };
+            if (field === 'bodyStepIds') {
+              s.loop.bodyStepIds = String(value).split(',').map(function(x){ return x.trim(); }).filter(function(x){ return x; });
+            } else {
+              s.loop.items = value;
+            }
+            R.markDirty();
+          },
+          moveStep: function(idx, dir) {
+            if (!R.state.editing) return;
+            var steps = R.state.editing.routine.steps;
+            var j = idx + dir;
+            if (j < 0 || j >= steps.length) return;
+            var t = steps[idx]; steps[idx] = steps[j]; steps[j] = t;
+            R.markDirty();
+            R.renderEditor();
+          },
+          removeStep: function(idx) {
+            if (!R.state.editing) return;
+            if (R.state.editing.routine.steps.length <= 1) { alert('A trick must have at least one step.'); return; }
+            if (!confirm('Remove this step?')) return;
+            var removed = R.state.editing.routine.steps.splice(idx, 1)[0];
+            // Strip lingering dependsOn references.
+            for (var i = 0; i < R.state.editing.routine.steps.length; i++) {
+              R.state.editing.routine.steps[i].dependsOn = (R.state.editing.routine.steps[i].dependsOn || []).filter(function(d){ return d !== removed.id; });
+            }
+            R.markDirty();
+            R.renderEditor();
+          },
+          // ── step picker ─────────────────────────────────────────────
+          openStepPicker: function() {
+            var modal = document.getElementById('routines-step-picker');
+            var body = document.getElementById('routines-step-picker-body');
+            if (!modal || !body) return;
+            var kinds = [
+              { kind: 'prompt', label: 'Prompt', desc: 'Send a prompt to the agent. Use this when the work needs reasoning or freeform tools.' },
+              { kind: 'mcp', label: 'MCP tool', desc: 'Call a specific MCP server tool (Composio, Claude integrations, local MCP).' },
+              { kind: 'cli', label: 'Local CLI', desc: 'Run an installed CLI (sf, gh, gcloud, …) and capture stdout.' },
+              { kind: 'conditional', label: 'If / Else', desc: 'Branch on a JS expression evaluated against prior step outputs.' },
+              { kind: 'channel', label: 'Channel send', desc: 'Send a message to Discord, Slack, Telegram, email, or webhook.' },
+              { kind: 'transform', label: 'Transform', desc: 'Sandboxed JS expression that reshapes prior step output.' },
+              { kind: 'loop', label: 'Loop', desc: 'Iterate over an array; runs the listed body steps for each item.' },
+            ];
+            body.innerHTML = kinds.map(function(k){
+              return '<div onclick="window.RoutinesUI&&RoutinesUI.addStep(\\x27' + k.kind + '\\x27)" style="padding:12px 14px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px;cursor:pointer;background:var(--bg-tertiary)"><div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:3px">' + k.label + '</div><div style="font-size:11px;color:var(--text-muted)">' + k.desc + '</div></div>';
+            }).join('');
+            modal.style.display = 'flex';
+          },
+          closeStepPicker: function() {
+            var m = document.getElementById('routines-step-picker'); if (m) m.style.display = 'none';
+          },
+          addStep: function(kind) {
+            if (!R.state.editing) return;
+            var steps = R.state.editing.routine.steps;
+            var n = steps.length + 1;
+            var nextId = 's' + n;
+            while (steps.some(function(s){ return s.id === nextId; })) { n++; nextId = 's' + n; }
+            var step = { id: nextId, prompt: '', dependsOn: steps.length ? [steps[steps.length - 1].id] : [], tier: 1, maxTurns: 15 };
+            if (kind !== 'prompt') step.kind = kind;
+            if (kind === 'mcp') step.mcp = { server: '', tool: '', inputs: {} };
+            if (kind === 'cli') step.cli = { cmd: '', args: [], timeoutMs: 60000 };
+            if (kind === 'conditional') step.conditional = { condition: '', trueNext: [], falseNext: [] };
+            if (kind === 'channel') step.channel = { channel: 'discord', target: '', content: '' };
+            if (kind === 'transform') step.transform = { expression: '' };
+            if (kind === 'loop') step.loop = { items: '', bodyStepIds: [] };
+            steps.push(step);
+            R.markDirty();
+            R.closeStepPicker();
+            R.renderEditor();
+          },
+          // ── editor actions ──────────────────────────────────────────
+          saveCurrent: function() {
+            if (!R.state.editing) return;
+            R.markDirty();  // capture latest header values
+            var btn = document.getElementById('re-save-btn');
+            if (btn) btn.textContent = 'Saving…';
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ routine: R.state.editing.routine })
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, status: r.status, body: j }; }); })
+              .then(function(res){
+                if (btn) btn.textContent = 'Save';
+                if (!res.ok) {
+                  if (res.body.error === 'validation') {
+                    var msg = (res.body.validation.issues || []).map(function(i){ return '• ' + i.severity + ': ' + i.message; }).join('\\n');
+                    if (confirm('Validation issues:\\n\\n' + msg + '\\n\\nSave anyway?')) {
+                      apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ routine: R.state.editing.routine, force: true })
+                      }).then(function(){ R.state.editing.dirty = false; R.setStatus('Saved (with warnings)'); R.refreshList(); });
+                    }
+                    return;
+                  }
+                  R.setStatus('Save failed: ' + (res.body.error || res.body.detail || 'unknown'));
+                  return;
+                }
+                R.state.editing.dirty = false;
+                R.setStatus('Saved.');
+                R.refreshList();
+              }).catch(function(err){
+                if (btn) btn.textContent = 'Save';
+                R.setStatus('Save error: ' + err);
+              });
+          },
+          runCurrent: function() {
+            if (!R.state.editing) return;
+            if (R.state.editing.dirty && !confirm('You have unsaved changes. Run anyway (using last saved version)?')) return;
+            R.run(R.state.editing.id);
+          },
+          dryRunCurrent: function() {
+            if (!R.state.editing) return;
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/dry-run', { method: 'POST' })
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                var lines = ['Dry-run for ' + R.state.editing.routine.name + ':\\n'];
+                (d.steps || []).forEach(function(s){ lines.push('• ' + s.description + (s.warnings.length ? '\\n   ⚠ ' + s.warnings.join('; ') : '')); });
+                if (d.notes && d.notes.length) lines.push('\\n' + d.notes.join('\\n'));
+                alert(lines.join('\\n'));
+              }).catch(function(err){ alert('Dry-run failed: ' + err); });
+          },
+          testCurrent: function() {
+            if (!R.state.editing) return;
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: 'mock' })
+            }).then(function(r){ return r.json(); }).then(function(d){
+              if (d.ok) R.setStatus('Mock test started (runId: ' + d.runId + '). See run history for output.');
+              else R.setStatus('Test failed to start: ' + (d.error || 'unknown'));
+            }).catch(function(err){ R.setStatus('Test error: ' + err); });
+          },
+          deleteCurrent: function() {
+            if (!R.state.editing) return;
+            if (!confirm('Delete routine "' + R.state.editing.routine.name + '"? This is permanent.')) return;
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), { method: 'DELETE' })
+              .then(function(r){ return r.json(); })
+              .then(function(j){
+                if (j.ok) { R.state.editing = null; R.closeEditor(); R.refreshList(); }
+                else alert('Delete failed: ' + (j.error || 'unknown'));
+              }).catch(function(err){ alert('Delete error: ' + err); });
+          },
+          setStatus: function(msg) {
+            var el = document.getElementById('re-status');
+            if (el) el.textContent = msg || '';
+          },
+          flash: function(msg) {
+            // Lightweight toast — reuse existing flash if available, else log.
+            if (window.flashMessage) window.flashMessage(msg);
+            else if (window.console) console.log('[routines]', msg);
+          },
+          // ── runs drawer ─────────────────────────────────────────────
+          openRuns: function(id) {
+            if (!id) return;
+            var drawer = document.getElementById('routines-runs-drawer');
+            if (!drawer) return;
+            drawer.innerHTML = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div><div style="font-size:12px;color:var(--text-muted)">Loading…</div></div>';
+            drawer.style.display = 'block';
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/runs').then(function(r){ return r.json(); }).then(function(d){
+              var runs = d.runs || [];
+              var html = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:14px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div>';
+              if (runs.length === 0) {
+                html += '<div style="font-size:12px;color:var(--text-muted);padding:24px 0;text-align:center">No runs yet.</div>';
+              } else {
+                html += runs.map(function(run){
+                  var when = run.startedAt || run.timestamp || '';
+                  var status = run.status || 'unknown';
+                  var color = { ok: 'var(--green)', error: 'var(--red)', partial: '#f5a623', skipped: 'var(--text-muted)', retried: '#f5a623' }[status] || 'var(--text-muted)';
+                  var dur = run.durationMs ? Math.round(run.durationMs / 100) / 10 + 's' : '';
+                  var preview = run.outputPreview || run.output_preview || run.outputPreview || '';
+                  return '<div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px;font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + '"></span><span style="color:var(--text-primary);font-weight:500">' + R.esc(status) + '</span><span style="color:var(--text-muted)">' + R.esc(when) + '</span><span style="flex:1"></span><span style="color:var(--text-muted);font-size:11px">' + dur + '</span></div>' + (preview ? '<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);font-family:\\x27JetBrains Mono\\x27,monospace;white-space:pre-wrap;max-height:120px;overflow:auto">' + R.esc(String(preview).slice(0, 800)) + '</div>' : '') + '</div>';
+                }).join('');
+              }
+              html += '</div>';
+              drawer.innerHTML = html;
+            }).catch(function(err){
+              drawer.innerHTML = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0;font-size:15px;font-weight:600">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div><div style="margin-top:14px;font-size:12px;color:var(--red)">Failed to load: ' + R.esc(String(err)) + '</div></div>';
+            });
+          },
+          closeRuns: function() {
+            var d = document.getElementById('routines-runs-drawer'); if (d) d.style.display = 'none';
+          },
+          // ── create modal ────────────────────────────────────────────
+          openCreate: function() {
+            var m = document.getElementById('routines-create-modal'); if (!m) return;
+            document.getElementById('routines-create-name').value = '';
+            document.getElementById('routines-create-description').value = '';
+            document.getElementById('routines-create-schedule').value = '';
+            m.style.display = 'flex';
+          },
+          closeCreate: function() {
+            var m = document.getElementById('routines-create-modal'); if (m) m.style.display = 'none';
+          },
+          submitCreate: function() {
+            var name = document.getElementById('routines-create-name').value.trim();
+            if (!name) { alert('Name is required'); return; }
+            var body = {
+              name: name,
+              description: document.getElementById('routines-create-description').value.trim(),
+              schedule: document.getElementById('routines-create-schedule').value.trim() || undefined,
+              agent: document.getElementById('routines-create-owner').value || undefined,
+            };
+            apiFetch('/api/routines', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
+              .then(function(res){
+                if (!res.ok) { alert('Create failed: ' + (res.body.error || 'unknown')); return; }
+                R.closeCreate();
+                R.refreshList();
+                R.openEditor(res.body.id);
+              }).catch(function(err){ alert('Create error: ' + err); });
+          },
+          // ── chat-first builder ──────────────────────────────────────
+          // Multi-turn conversation that asks clarifying questions and
+          // drafts a trick spec. The agent emits a fenced json-artifact
+          // block; we parse it for the live preview + Save button.
+          openChat: function() {
+            var m = document.getElementById('routines-chat-modal'); if (!m) return;
+            R.state.chatMessages = [];
+            R.state.chatArtifact = null;
+            R.state.chatBusy = false;
+            R.state.chatStreaming = false;
+            document.getElementById('routines-chat-input').value = '';
+            document.getElementById('routines-chat-status').textContent = '';
+            // Reset the builder session so the prior conversation doesn't leak in.
+            apiFetch('/api/builder/reset', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ artifactType: 'workflow' })
+            }).catch(function(){ /* non-fatal */ });
+            R.renderChatMessages();
+            R.renderChatSpec();
+            // Seed with a greeting from the assistant so the panel isn't empty.
+            R.appendChatMessage('assistant', 'Hi! Tell me what you want Clementine to do — a sentence is fine. I\\x27ll ask a couple of follow-ups (when it should run, which tools she needs, which model) and draft a trick you can save.');
+            m.style.display = 'flex';
+            setTimeout(function(){ document.getElementById('routines-chat-input').focus(); }, 50);
+          },
+          closeChat: function(silent) {
+            var m = document.getElementById('routines-chat-modal'); if (m) m.style.display = 'none';
+            if (!silent) R.refreshList();
+          },
+          appendChatMessage: function(role, text) {
+            R.state.chatMessages.push({ role: role, text: text });
+            R.renderChatMessages();
+          },
+          renderChatMessages: function() {
+            var box = document.getElementById('routines-chat-messages'); if (!box) return;
+            var streaming = R.state.chatStreaming;
+            var msgs = R.state.chatMessages || [];
+            box.innerHTML = msgs.map(function(m, i){
+              var isUser = m.role === 'user';
+              var bg = isUser ? 'var(--clementine,#ff8c21)' : 'var(--bg-tertiary)';
+              var color = isUser ? '#fff' : 'var(--text-primary)';
+              var align = isUser ? 'flex-end' : 'flex-start';
+              var isLastAssistant = !isUser && i === msgs.length - 1 && streaming;
+              var caret = isLastAssistant ? '<span style="display:inline-block;width:6px;height:14px;margin-left:2px;background:var(--text-primary);opacity:0.55;animation:trickShimmer 1s infinite"></span>' : '';
+              var bodyText = m.text || (isLastAssistant ? '' : '(thinking…)');
+              return '<div style="display:flex;justify-content:' + align + '"><div style="max-width:82%;padding:8px 12px;border-radius:10px;background:' + bg + ';color:' + color + ';font-size:13px;line-height:1.5;white-space:pre-wrap">' + R.esc(bodyText) + caret + '</div></div>';
+            }).join('');
+            box.scrollTop = box.scrollHeight;
+          },
+          // Renders the right-hand spec pane. Skeleton state when the agent
+          // hasn't drafted anything yet; populated card view once it has a
+          // name + at least one step. Save button lives at the bottom.
+          renderChatSpec: function() {
+            var pane = document.getElementById('routines-chat-spec'); if (!pane) return;
+            pane.classList.toggle('trick-spec-streaming', !!R.state.chatStreaming);
+            var a = R.state.chatArtifact;
+            if (!a || !a.name) {
+              pane.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px">Trick spec</div>'
+                + '<div class="trick-spec-card" style="opacity:0.7"><div class="trick-spec-skeleton-row" style="width:60%"></div><div class="trick-spec-skeleton-row" style="width:90%"></div><div class="trick-spec-skeleton-row" style="width:40%"></div></div>'
+                + '<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:14px;font-style:italic">I\\x27ll fill this in as we chat. Each answer you give populates a field on the right — name, schedule, model, steps. When it\\x27s ready you\\x27ll see a Save trick button.</div>';
+              return;
+            }
+            // Parse the YAML-ish steps string into displayable cards.
+            var steps = R.parseStepsForSpec(a.steps);
+            var stepCount = steps.length;
+            var schedule = a.schedule ? R.humanizeCron(a.schedule) : 'manual';
+            var modelLabel = a.model ? R.modelLabel(a.model) : 'inherit';
+            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em">Trick spec</div><span style="flex:1"></span>'
+              + (R.state.chatStreaming ? '<span style="font-size:11px;color:var(--clementine)">drafting…</span>' : '')
+              + '</div>';
+            var meta = '<div class="trick-spec-card">'
+              + '<div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:4px">' + R.esc(a.name) + '</div>'
+              + (a.description ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">' + R.esc(a.description) + '</div>' : '')
+              + '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--text-muted)">'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Schedule</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + R.esc(schedule) + (a.schedule ? ' <code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:10px;color:var(--text-muted)" title="' + R.esc(a.schedule) + '">' + R.esc(a.schedule) + '</code>' : '') + '</div></div>'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Model</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + R.esc(modelLabel) + '</div></div>'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Steps</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + stepCount + '</div></div>'
+              + '</div></div>';
+            var stepsHtml = '';
+            if (steps.length > 0) {
+              stepsHtml = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:18px 0 8px">Steps</div>'
+                + steps.map(function(s, i){
+                  var kind = s.kind || 'prompt';
+                  var kindColor = { prompt: '#5e72e4', mcp: '#2dce89', cli: '#fb6340', conditional: '#f5365c', channel: '#11cdef', transform: '#ffd600', loop: '#8965e0' }[kind] || '#888';
+                  var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
+                  return '<div class="trick-spec-card" style="border-left:3px solid ' + kindColor + '">'
+                    + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="font-size:11px;color:var(--text-muted);font-weight:600">#' + (i + 1) + '</span>' + badge + '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px;color:var(--text-secondary)">' + R.esc(s.id) + '</code></div>'
+                    + (s.preview ? '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">' + R.esc(s.preview) + '</div>' : '')
+                    + '</div>';
+                }).join('');
+            }
+            var ready = a.name && stepCount > 0;
+            var saveRow = ready
+              ? '<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--green,#22c55e);font-weight:500">✓ Ready to save</span><span style="flex:1"></span><button class="btn-sm btn-primary" onclick="window.RoutinesUI&&RoutinesUI.saveChatDraft()" style="padding:6px 18px">Save trick</button></div>'
+              : '<div style="margin-top:18px;font-size:11px;color:var(--text-muted);font-style:italic">A few more details and I\\x27ll let you save.</div>';
+            pane.innerHTML = head + meta + stepsHtml + saveRow;
+          },
+          // Best-effort parser for the agent's YAML-ish steps string. Handles
+          // flat top-level "id:" keys with indented "prompt:", "kind:",
+          // "dependsOn:" children. Falls back gracefully on weird shapes.
+          parseStepsForSpec: function(stepsStr) {
+            if (!stepsStr) return [];
+            if (Array.isArray(stepsStr)) {
+              return stepsStr.map(function(s){ return { id: String(s.id || ''), kind: s.kind || 'prompt', preview: String(s.prompt || '').slice(0, 160) }; }).filter(function(s){ return s.id; });
+            }
+            if (typeof stepsStr !== 'string') return [];
+            var lines = stepsStr.split(/\\r?\\n/);
+            var steps = [];
+            var current = null;
+            lines.forEach(function(line){
+              var topMatch = line.match(/^([A-Za-z0-9_-]+)\\s*:\\s*$/);
+              if (topMatch && !line.startsWith(' ') && !line.startsWith('\\t')) {
+                if (current) steps.push(current);
+                current = { id: topMatch[1], kind: 'prompt', promptParts: [] };
+                return;
+              }
+              if (!current) return;
+              var promptM = line.match(/^\\s+prompt\\s*:\\s*(.*)$/);
+              if (promptM) { current.promptParts.push(promptM[1]); return; }
+              var kindM = line.match(/^\\s+kind\\s*:\\s*(\\w+)/);
+              if (kindM) { current.kind = kindM[1]; return; }
+              if (/^\\s+/.test(line) && line.trim().length) {
+                // Continuation of multi-line prompt or other field — capture for preview
+                current.promptParts.push(line.trim());
+              }
+            });
+            if (current) steps.push(current);
+            return steps.map(function(s){
+              return { id: s.id, kind: s.kind, preview: s.promptParts.join(' ').slice(0, 160) };
+            });
+          },
+          // Friendly cron string for the spec pane (and reusable in the list).
+          humanizeCron: function(expr) {
+            if (!expr) return 'manual';
+            var parts = String(expr).trim().split(/\\s+/);
+            if (parts.length !== 5) return expr;
+            var min = parts[0], hour = parts[1], dom = parts[2], mon = parts[3], dow = parts[4];
+            var dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+            var pad2 = function(n){ n = String(n); return n.length < 2 ? '0' + n : n; };
+            var fmt = function(h, m){
+              var hn = parseInt(h, 10), mn = parseInt(m, 10);
+              if (isNaN(hn) || isNaN(mn)) return '';
+              var ampm = hn >= 12 ? 'pm' : 'am';
+              var h12 = ((hn + 11) % 12) + 1;
+              return mn === 0 ? h12 + ampm : h12 + ':' + pad2(mn) + ampm;
+            };
+            if (min === '*' && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every minute';
+            if (/^\\*\\/\\d+$/.test(min) && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every ' + min.slice(2) + ' min';
+            if (min === '0' && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'hourly';
+            if (/^\\d+$/.test(min) && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every hour at :' + pad2(min);
+            if (min === '0' && /^\\*\\/\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') return 'every ' + hour.slice(2) + ' hours';
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') return 'daily at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '1-5') return 'weekdays at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && /^\\d$/.test(dow)) return 'every ' + dows[+dow] + ' at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && /^\\d+$/.test(dom) && mon === '*' && dow === '*') return 'monthly on day ' + dom + ' at ' + fmt(hour, min);
+            return expr;
+          },
+          modelLabel: function(id) {
+            var found = (R.MODEL_OPTS || []).find(function(o){ return o.id === id; });
+            return found ? found.label.split(' — ')[0] : id;
+          },
+          sendChat: async function() {
+            if (R.state.chatBusy) return;
+            var input = document.getElementById('routines-chat-input');
+            var text = input.value.trim();
+            if (!text) return;
+            input.value = '';
+            R.appendChatMessage('user', text);
+            R.state.chatBusy = true;
+            R.state.chatStreaming = true;
+            var sendBtn = document.getElementById('routines-chat-send');
+            var status = document.getElementById('routines-chat-status');
+            if (sendBtn) { sendBtn.textContent = 'Thinking…'; sendBtn.disabled = true; }
+            if (status) status.textContent = 'Clementine is drafting…';
+            // Push a placeholder assistant bubble that we'll fill from the stream.
+            R.state.chatMessages.push({ role: 'assistant', text: '' });
+            R.renderChatMessages();
+            R.renderChatSpec();
+            try {
+              var resp = await apiFetch('/api/builder/chat/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message: text,
+                  artifactType: 'workflow',
+                  currentArtifact: R.state.chatArtifact || undefined,
+                })
+              });
+              if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+              var reader = resp.body.getReader();
+              var decoder = new TextDecoder();
+              var buf = '';
+              while (true) {
+                var chunk = await reader.read();
+                if (chunk.done) break;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var idx;
+                while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+                  var raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                  if (!raw.startsWith('data:')) continue;
+                  var json = raw.replace(/^data:\\s*/, '').trim();
+                  var evt = null;
+                  try { evt = JSON.parse(json); } catch (e) { continue; }
+                  var lastIdx = R.state.chatMessages.length - 1;
+                  if (evt.type === 'text') {
+                    if (lastIdx >= 0 && R.state.chatMessages[lastIdx].role === 'assistant') {
+                      R.state.chatMessages[lastIdx].text = evt.text || '';
+                      R.renderChatMessages();
+                    }
+                  } else if (evt.type === 'done') {
+                    if (lastIdx >= 0 && R.state.chatMessages[lastIdx].role === 'assistant') {
+                      R.state.chatMessages[lastIdx].text = evt.response || R.state.chatMessages[lastIdx].text || '(no reply)';
+                    }
+                    if (evt.artifact) R.state.chatArtifact = evt.artifact;
+                    R.state.chatStreaming = false;
+                    R.renderChatMessages();
+                    R.renderChatSpec();
+                    if (status) status.textContent = evt.artifact ? 'Draft updated.' : '';
+                  } else if (evt.type === 'error') {
+                    if (status) status.textContent = 'Error: ' + (evt.error || 'unknown');
+                  }
+                }
+              }
+            } catch (err) {
+              if (status) status.textContent = 'Chat error: ' + err;
+            } finally {
+              R.state.chatBusy = false;
+              R.state.chatStreaming = false;
+              if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
+              R.renderChatMessages();
+              R.renderChatSpec();
+            }
+          },
+          // Persist the current draft as a real trick. The artifact's steps
+          // field can come back as a YAML-ish string (per the agent's prompt
+          // template); we hand it off to /api/routines which parses it.
+          saveChatDraft: function() {
+            var a = R.state.chatArtifact;
+            if (!a || !a.name) return;
+            var btn = document.getElementById('routines-chat-save');
+            if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+            apiFetch('/api/routines', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: a.name,
+                description: a.description || '',
+                schedule: a.schedule || '',
+                model: a.model || undefined,
+                draftYaml: a.steps,
+              })
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
+              .then(function(res){
+                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                if (!res.ok) {
+                  alert('Save failed: ' + (res.body && res.body.error || 'unknown'));
+                  return;
+                }
+                R.closeChat();
+                if (res.body && res.body.id) R.openEditor(res.body.id);
+              }).catch(function(err){
+                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                alert('Save failed: ' + err);
+              });
+          },
+          // ── helpers ─────────────────────────────────────────────────
+          esc: function(s) {
+            if (s == null) return '';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+          },
+          // Available Claude models for trick + step model pickers.
+          MODEL_OPTS: [
+            { id: 'claude-opus-4-7',           label: 'Opus 4.7 — most capable' },
+            { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6 — balanced' },
+            { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fastest' },
+          ],
+          // Render a model select. If opts.idx is set, this is a per-step
+          // picker and changes route through updateStep(idx, 'model', value);
+          // otherwise it's the trick-level picker (id=re-model) that
+          // markDirty reads.
+          modelSelect: function(id, current, defaultLabel, opts) {
+            var size = (opts && opts.small) ? 'padding:3px 6px;font-size:11px;min-width:140px' : 'padding:6px 10px;font-size:12px;min-width:200px';
+            var idAttr = id ? ' id="' + id + '"' : '';
+            var onchange = (opts && typeof opts.idx === 'number')
+              ? ' onchange="window.RoutinesUI&&RoutinesUI.updateStep(' + opts.idx + ',\\x27model\\x27,this.value)"'
+              : ' onchange="window.RoutinesUI&&RoutinesUI.markDirty()"';
+            var html = '<select' + idAttr + onchange + ' style="' + size + ';border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)" title="' + R.esc(defaultLabel || '') + '">';
+            html += '<option value=""' + (current ? '' : ' selected') + '>' + R.esc(defaultLabel || 'inherit') + '</option>';
+            R.MODEL_OPTS.forEach(function(m){
+              html += '<option value="' + R.esc(m.id) + '"' + (current === m.id ? ' selected' : '') + '>' + R.esc(m.label) + '</option>';
+            });
+            html += '</select>';
+            return html;
+          },
+        };
+        window.RoutinesUI = R;
+        // Compatibility shims for legacy callers in other parts of the dashboard.
+        // The old switchBuildTab(tab) is referenced from KPI tiles, getting-started cards,
+        // and the navigateTo dispatcher. Map them all to the unified Routines view.
+        if (typeof window.switchBuildTab !== 'function' || true) {
+          window.switchBuildTab = function() { try { R.init(); } catch (e) { /* */ } };
+        }
+        // Auto-init when the user lands on the build page.
+        document.addEventListener('DOMContentLoaded', function() {
+          var nav = document.querySelector('[data-page="build"]');
+          if (nav) nav.addEventListener('click', function() { setTimeout(function() { R.init(); }, 50); });
+          // If page-build is already active on load (deep-link), init now.
+          var page = document.getElementById('page-build');
+          if (page && page.classList.contains('active')) R.init();
+        });
+      })();
+    </script>
 
     <!-- page-agent-detail merged into Team page; click an agent in Roster to drill down. -->
 
@@ -12872,7 +16291,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
          si-* status cards/proposals/history, teach-skill-form, panel-skills,
          pending-skills-card, panel-workflows, advisor-analytics-content.) -->
     <!-- (Session 5) page-automations parking removed. Self-Improve now lives in
-         Brain → Learning; Build (Workflows/Crons/Skills/Templates) is the home for
+         Brain → Learning; Build (Workflows/Scheduled Tasks/Skills/Templates) is the home for
          everything else that was here. -->
 
     <!-- page-team-status merged into Team → Activity tab.
@@ -12927,9 +16346,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <h1>Brain</h1>
           <p class="desc">Query what you know, feed new knowledge in, and watch the system learn.</p>
         </div>
-        <div class="actions" style="flex:1;max-width:560px;display:flex;gap:8px">
-          <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')runMemorySearch()">
-          <button class="btn-primary btn-sm" onclick="runMemorySearch()">Search</button>
+        <div class="actions" style="flex:1;max-width:640px;display:flex;gap:8px">
+          <input type="text" id="memory-search-input" placeholder="Find seeded files, memories, notes, and artifacts..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')brainUnifiedSearchFromHeader()">
+          <button class="btn-primary btn-sm" onclick="brainUnifiedSearchFromHeader()" title="Search the whole brain"><span class="icon-slot" data-icon="search"></span> Find</button>
+          <button class="btn-sm" onclick="switchTab('intelligence','seed')" title="Upload a local file or folder"><span class="icon-slot" data-icon="upload"></span> Seed</button>
           <button class="btn-sm" onclick="openQuickAddMemory()" title="Append a quick note to today's daily log">+ Add memory</button>
         </div>
       </div>
@@ -12962,18 +16382,109 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
-        <button class="active" data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
+        <button class="active" data-icon="layoutDashboard" onclick="switchTab('intelligence','overview')"><span class="icon-slot"></span> Overview</button>
+        <button data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Chunks</button>
+        <button data-icon="upload" onclick="switchTab('intelligence','seed')"><span class="icon-slot"></span> Seed</button>
+        <button data-icon="repeat" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Automate</button>
+        <button data-icon="listChecks" onclick="switchTab('intelligence','runs')"><span class="icon-slot"></span> Runs</button>
         <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
-        <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Files</button>
-        <button data-icon="folder" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Ingestion</button>
+        <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Memory</button>
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
         <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
-        <button onclick="switchTab('intelligence','seed')">Seed</button>
-        <button onclick="switchTab('intelligence','runs')">Runs</button>
       </div>
       <div id="intelligence-tab-content">
-        <div class="tab-pane active" id="tab-intelligence-search">
+        <div class="tab-pane active" id="tab-intelligence-overview">
+          <div class="brain-command-shell">
+            <div class="brain-hero-panel">
+              <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
+                <div style="max-width:720px">
+                  <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">Brain command center</div>
+                  <div style="font-size:18px;font-weight:700;margin-bottom:5px">Find anything Clementine knows, then prove how it got there.</div>
+                  <div style="font-size:13px;color:var(--text-secondary);line-height:1.5">Use this page to seed local data, keep connected sources refreshed on a schedule, search agent-created artifacts, and verify retrieval coverage.</div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="btn-primary btn-sm" onclick="switchTab('intelligence','seed')"><span class="icon-slot" data-icon="upload"></span> Seed local data</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','sources')"><span class="icon-slot" data-icon="repeat"></span> Add scheduled feed</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','health')"><span class="icon-slot" data-icon="activity"></span> Verify health</button>
+                </div>
+              </div>
+              <div id="brain-command-kpis" class="brain-kpi-row">
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+
+            <div class="brain-pillar-grid">
+              <div class="brain-pillar-card">
+                <strong>Find</strong>
+                <p>Search memories, seeded records, vault files, and saved tool artifacts in one place.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="focusBrainLibrarySearch()">Search library</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','files')">Browse files</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Seed</strong>
+                <p>Choose files or folders from the local machine, preview what will be written, then commit to memory.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','seed')">Upload data</button>
+                  <button class="btn-sm" onclick="document.getElementById('brain-file-input')?.click()">Choose files</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Automate</strong>
+                <p>Create scheduled feeds for REST endpoints or connected apps so the brain keeps learning without manual uploads.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','sources');setTimeout(brainShowPollForm,80)">REST feed</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','sources');setTimeout(brainOpenFeedWizard,80)">Connected app</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Verify</strong>
+                <p>Check dense model readiness, retrieval coverage, ingestion runs, and whether new data is actually searchable.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','health')">Open health</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','runs')">View runs</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="brain-hero-panel">
+              <div class="brain-library-toolbar" style="margin-bottom:12px">
+                <input id="brain-library-search-input" type="text" placeholder="Search the whole brain..." onkeydown="if(event.key==='Enter')runBrainLibrarySearch()">
+                <select id="brain-library-scope" onchange="runBrainLibrarySearch()" style="width:150px">
+                  <option value="all">Everything</option>
+                  <option value="memory">Memory</option>
+                  <option value="files">Files</option>
+                  <option value="artifacts">Artifacts</option>
+                </select>
+                <button class="btn-primary btn-sm" onclick="runBrainLibrarySearch()">Search</button>
+                <button class="btn-sm" onclick="runBrainLibrarySearch('')">Recent</button>
+              </div>
+              <div id="brain-library-summary" style="font-size:12px;color:var(--text-muted);margin-bottom:10px"></div>
+              <div id="brain-library-results">
+                <div class="empty-state" style="padding:20px">Search the whole brain, or click Recent to inspect the latest remembered items.</div>
+              </div>
+            </div>
+
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <div style="font-weight:600">Recent knowledge flow</div>
+                <button class="btn-sm" onclick="refreshBrainOverview()">Refresh</button>
+              </div>
+              <div id="brain-overview-flow"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-search">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+            <input type="text" id="memory-detail-search-input" placeholder="Search editable memory chunks..." style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter')runMemoryDetailSearch()">
+            <button class="btn-primary btn-sm" onclick="runMemoryDetailSearch()">Search chunks</button>
+            <button class="btn-sm" onclick="document.getElementById('memory-detail-search-input').value='pinned:true';runMemoryDetailSearch()">Pinned</button>
+            <button class="btn-sm" onclick="document.getElementById('memory-detail-search-input').value='since:7d';runMemoryDetailSearch()">Last 7d</button>
+          </div>
           <div id="memory-coverage-strip" style="margin-bottom:14px"></div>
           <div id="memory-search-results"></div>
           <div id="memory-overview" style="margin-top:18px">
@@ -12991,6 +16502,54 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 <span style="font-size:11px;color:var(--text-muted)">What the agent captured, with reason &amp; salience</span>
               </div>
               <div class="card-body" id="panel-recent-writes" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Persistent learnings</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="learnings-filter-scope" onchange="refreshLearnings()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="active" selected>Active</option>
+                    <option value="all">Active + superseded + cancelled</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Distilled durable beliefs from past sessions</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-learnings" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Open commitments</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="commitments-filter-status" onchange="refreshCommitments()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="open" selected>Open</option>
+                    <option value="done">Done</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Promises tracked across sessions</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-commitments" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Recent episodes</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="episodes-filter-since" onchange="refreshRecentEpisodes()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="24h">Last 24h</option>
+                    <option value="7d" selected>Last 7d</option>
+                    <option value="30d">Last 30d</option>
+                    <option value="">All</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Consolidated session summaries</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-recent-episodes" style="padding:0">
                 <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
               </div>
             </div>
@@ -13044,18 +16603,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="card" style="padding:20px;margin-bottom:16px">
             <div style="font-weight:600;margin-bottom:8px">Drop a file or folder into the brain</div>
             <div style="color:var(--muted);margin-bottom:12px;font-size:13px">
-              Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Commit ingests everything.
+              Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Save to brain writes the full source.
             </div>
 
             <!-- Primary: native file/folder pickers -->
-            <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
-              <button class="btn-primary" onclick="document.getElementById('brain-file-input').click()">📄 Choose file(s)…</button>
-              <button class="btn-primary" onclick="document.getElementById('brain-folder-input').click()">📁 Choose folder…</button>
-              <input type="text" id="brain-seed-slug" placeholder="slug (auto if blank)" style="width:220px">
+            <div id="brain-drop-zone" class="brain-drop-zone" ondragover="brainHandleDrag(event, true)" ondragleave="brainHandleDrag(event, false)" ondrop="brainHandleDrop(event)">
+              <div style="min-width:220px;flex:1">
+                <div style="font-weight:600;margin-bottom:4px">Upload local knowledge</div>
+                <div style="font-size:12px;color:var(--text-muted);line-height:1.5">Drop files here, choose a folder, or use the advanced path option for data already on this machine. Clementine previews records before writing anything.</div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <button class="btn-primary" onclick="document.getElementById('brain-file-input').click()" type="button"><span class="icon-slot" data-icon="fileText"></span> Choose files</button>
+                <button class="btn-primary" onclick="document.getElementById('brain-folder-input').click()" type="button"><span class="icon-slot" data-icon="folder"></span> Choose folder</button>
+                <input type="text" id="brain-seed-slug" placeholder="source name (optional)" style="width:220px">
+              </div>
             </div>
             <input type="file" id="brain-file-input" multiple style="display:none" onchange="brainHandleFilesChosen(this.files, false)">
             <input type="file" id="brain-folder-input" webkitdirectory directory multiple style="display:none" onchange="brainHandleFilesChosen(this.files, true)">
-            <div id="brain-upload-status" style="margin-bottom:8px;color:var(--muted);font-size:13px"></div>
+            <div id="brain-upload-status" style="margin:8px 0;color:var(--muted);font-size:13px"></div>
 
             <!-- Secondary: for power users who want to point at an existing on-disk path -->
             <details style="margin-bottom:8px">
@@ -13066,8 +16631,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </details>
 
             <div style="display:flex;gap:8px;margin-top:8px">
-              <button class="btn-primary" onclick="brainPreviewSeed()">Preview</button>
-              <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Commit ingestion</button>
+              <button class="btn-primary" onclick="brainPreviewSeed()">Preview records</button>
+              <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Save to brain</button>
             </div>
 
             <div id="brain-seed-manifest" style="margin-top:16px"></div>
@@ -13079,14 +16644,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Sources -->
         <div class="tab-pane" id="tab-intelligence-sources">
 
-          <!-- ═══ Auto-seed feeds (Claude Desktop connectors → cron → brain) ═══ -->
+          <!-- ═══ Auto-seed feeds (connected tools → cron → brain) ═══ -->
           <div class="card" style="padding:16px;margin-bottom:16px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-              <div style="font-weight:600">Auto-seed feeds</div>
+              <div style="font-weight:600">Seed memory from connected apps</div>
               <button class="btn-primary" onclick="brainOpenFeedWizard()">+ Add feed</button>
             </div>
             <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
-              One-click scheduled feeds that use your authenticated Claude Desktop connectors (Google Drive, Outlook, Gmail, Slack…) to pull records and commit them to the brain. No API keys required.
+              Scheduled feeds use authenticated tools (Composio, Claude Desktop connectors, or local MCP servers) to fetch records, compare them with current memory, and save distilled notes to the brain.
             </div>
             <div id="brain-feeds-connectors" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
             <div id="brain-feeds-list"></div>
@@ -13094,7 +16659,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
           <!-- ═══ Auto-seed feed wizard (hidden by default) ═══ -->
           <div id="brain-feed-wizard" class="card" style="display:none;padding:16px;margin-bottom:16px">
-            <div style="font-weight:600;margin-bottom:4px">Add auto-seed feed</div>
+            <div style="font-weight:600;margin-bottom:4px">Add memory seed feed</div>
             <div id="brain-feed-wizard-breadcrumbs" style="color:var(--muted);font-size:12px;margin-bottom:12px"></div>
             <div id="brain-feed-wizard-step"></div>
             <div style="display:flex;gap:8px;margin-top:14px">
@@ -13145,14 +16710,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <input type="text" id="brain-poll-url" placeholder="https://api.example.com/v1/items">
               <label>Method</label>
               <select id="brain-poll-method"><option>GET</option><option>POST</option></select>
-              <label>Headers (JSON)</label>
-              <input type="text" id="brain-poll-headers" placeholder='{"Authorization":"Bearer $\{stripe_api_key}"}'>
-              <label>Query params (JSON)</label>
-              <input type="text" id="brain-poll-params" placeholder='{"limit":"100"}'>
-              <label>Records JSON path</label>
-              <input type="text" id="brain-poll-recordspath" placeholder="data">
+              <label>Headers</label>
+              <div class="brain-kv-builder">
+                <div id="brain-poll-headers-rows"></div>
+                <button class="btn-sm" type="button" onclick="brainAddKvRow('headers')">Add header</button>
+                <input type="hidden" id="brain-poll-headers">
+              </div>
+              <label>Query params</label>
+              <div class="brain-kv-builder">
+                <div id="brain-poll-params-rows"></div>
+                <button class="btn-sm" type="button" onclick="brainAddKvRow('params')">Add param</button>
+                <input type="hidden" id="brain-poll-params">
+              </div>
+              <label>Record list field</label>
+              <input type="text" id="brain-poll-recordspath" placeholder="data, items, results">
               <label>Cron schedule</label>
-              <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
+              <div>
+                <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
+                <div id="brain-poll-schedule-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"></div>
+              </div>
               <label>Target folder</label>
               <input type="text" id="brain-poll-folder" placeholder="04-Ingest/stripe">
               <label>Project (optional)</label>
@@ -13190,24 +16766,55 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="brain-runs-list"></div>
         </div>
         <div class="tab-pane" id="tab-intelligence-files">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
-            <input type="text" id="vault-files-search" placeholder="Search title or path..." style="flex:1;min-width:200px;padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);font-size:13px" oninput="refreshVaultFiles()">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+            <input type="text" id="vault-files-search" placeholder="Search title, frontmatter, or content..." style="flex:1;min-width:220px;padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);font-size:13px" oninput="refreshVaultFiles()">
             <select id="vault-files-agent-filter" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
               <option value="">All authors</option>
               <option value="__shared__">Shared (vault root)</option>
             </select>
             <select id="vault-files-since" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
               <option value="7">Past 7 days</option>
-              <option value="30" selected>Past 30 days</option>
+              <option value="30">Past 30 days</option>
               <option value="90">Past 90 days</option>
               <option value="365">Past year</option>
+              <option value="9999" selected>All time</option>
             </select>
-            <button class="btn-sm" onclick="refreshVaultFiles()">Refresh</button>
+            <button class="btn-sm" onclick="refreshVaultFiles()" title="Refresh"><span class="icon-slot" data-icon="refreshCw"></span></button>
           </div>
-          <div id="vault-files-folder-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
-          <div id="vault-files-list">
-            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+          <div class="vault-mem-grid" style="display:grid;grid-template-columns:240px minmax(280px,1fr) minmax(360px,1.4fr);gap:12px;align-items:stretch;height:calc(100vh - 240px);min-height:520px">
+
+            <!-- Left rail: facet chips (folder / type / tag) -->
+            <div class="vault-mem-rail" style="overflow-y:auto;padding:10px 8px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:2px 4px 6px">Folders</div>
+              <div id="vault-files-folder-chips" class="vault-facet-list"></div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:14px 4px 6px">Type</div>
+              <div id="vault-files-type-chips" class="vault-facet-list"></div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:14px 4px 6px">Tags</div>
+              <div id="vault-files-tag-chips" class="vault-facet-list"></div>
+            </div>
+
+            <!-- Middle: file list -->
+            <div class="vault-mem-list" style="overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--bg-card);display:flex;flex-direction:column;min-height:0">
+              <div id="vault-files-list-meta" style="font-size:11px;color:var(--text-muted);padding:10px 14px;border-bottom:1px solid var(--border-light);flex-shrink:0">Loading…</div>
+              <div id="vault-files-list" style="flex:1;overflow-y:auto;min-height:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+
+            <!-- Right: inline reader -->
+            <div class="vault-mem-reader" style="overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--bg-card);display:flex;flex-direction:column;min-height:0">
+              <div id="vault-reader-header" style="padding:14px 18px;border-bottom:1px solid var(--border-light);flex-shrink:0">
+                <div style="font-weight:600;font-size:15px;color:var(--text-primary)">No file selected</div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Pick a file from the list to read it here.</div>
+              </div>
+              <div id="vault-reader-body" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:14px;line-height:1.6;min-height:0">
+                <div style="color:var(--text-muted);font-size:13px">Tip: hover a row for a peek, click to open.</div>
+              </div>
+            </div>
           </div>
+
+          <!-- Hover preview popover (shared, repositioned per row) -->
+          <div id="vault-hover-popover" style="display:none;position:fixed;z-index:300;width:340px;max-width:90vw;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:0 10px 30px rgba(0,0,0,0.25);padding:12px 14px;font-size:12px;line-height:1.5;pointer-events:none"></div>
         </div>
         <div class="tab-pane" id="tab-intelligence-health">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
@@ -13363,6 +16970,269 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           done: 'Finalizing',
           error: 'Error',
         };
+
+        function brainTypeLabel(kind) {
+          if (kind === 'memory') return 'Memory';
+          if (kind === 'file') return 'File';
+          if (kind === 'artifact') return 'Artifact';
+          return kind || 'Item';
+        }
+
+        function brainStatusBadge(status) {
+          var s = String(status || 'unknown');
+          var color = s === 'ok' ? 'var(--green)' : (s === 'partial' ? 'var(--yellow)' : (s === 'error' ? 'var(--red)' : 'var(--text-muted)'));
+          return '<span class="brain-badge" style="color:' + color + ';border-color:' + color + '33">' + escapeHtml(s) + '</span>';
+        }
+
+        function brainUnifiedSearchFromHeader() {
+          var header = document.getElementById('memory-search-input');
+          var q = header ? header.value.trim() : '';
+          switchTab('intelligence', 'overview');
+          setTimeout(function() {
+            var input = document.getElementById('brain-library-search-input');
+            if (input) input.value = q;
+            runBrainLibrarySearch(q);
+          }, 60);
+        }
+
+        function focusBrainLibrarySearch() {
+          switchTab('intelligence', 'overview');
+          setTimeout(function() {
+            var input = document.getElementById('brain-library-search-input');
+            if (input) input.focus();
+          }, 80);
+        }
+
+        async function runBrainLibrarySearch(forceQuery) {
+          var input = document.getElementById('brain-library-search-input');
+          var header = document.getElementById('memory-search-input');
+          var scopeEl = document.getElementById('brain-library-scope');
+          var q = forceQuery !== undefined ? String(forceQuery || '') : (input ? input.value.trim() : '');
+          if (input && forceQuery !== undefined) input.value = q;
+          if (header && q) header.value = q;
+          var scope = scopeEl ? scopeEl.value : 'all';
+          var resultsEl = document.getElementById('brain-library-results');
+          var summaryEl = document.getElementById('brain-library-summary');
+          if (!resultsEl) return;
+          resultsEl.innerHTML = '<div class="empty-state" style="padding:20px">Searching…</div>';
+          if (summaryEl) summaryEl.textContent = '';
+          try {
+            var r = await apiFetch('/api/brain/library/search?q=' + encodeURIComponent(q) + '&scope=' + encodeURIComponent(scope) + '&limit=36');
+            var d = await r.json();
+            if (!r.ok || !d.ok) {
+              resultsEl.innerHTML = '<div class="empty-state" style="color:var(--red)">Search failed: ' + escapeHtml(d.error || r.status) + '</div>';
+              return;
+            }
+            var counts = d.totalByType || {};
+            if (summaryEl) {
+              var label = q ? ('Results for "' + q + '"') : 'Recent brain items';
+              summaryEl.innerHTML = escapeHtml(label) + ' · '
+                + (counts.memory || 0) + ' memory · '
+                + (counts.files || 0) + ' files · '
+                + (counts.artifacts || 0) + ' artifacts';
+            }
+            if (!d.results || d.results.length === 0) {
+              resultsEl.innerHTML = '<div class="empty-state" style="padding:20px">No matches. Try fewer words or switch the scope to Everything.</div>';
+              return;
+            }
+            var html = '';
+            for (var i = 0; i < d.results.length; i++) {
+              var item = d.results[i];
+              var badges = ['<span class="brain-badge">' + escapeHtml(brainTypeLabel(item.kind)) + '</span>'];
+              (item.badges || []).slice(0, 4).forEach(function(b) {
+                badges.push('<span class="brain-badge">' + escapeHtml(b) + '</span>');
+              });
+              var actions = '';
+              if (item.kind === 'file' && item.relPath) {
+                actions = '<button class="btn-sm" onclick="openVaultFile(\\'' + escapeHtml(item.relPath) + '\\')">Open</button>';
+              } else if (item.kind === 'memory' && item.chunkId) {
+                actions = '<button class="btn-sm" onclick="editChunk(' + item.chunkId + ')">Edit</button>'
+                  + '<button class="btn-sm" onclick="openBrainChunkTrace(' + item.chunkId + ')">Trace</button>';
+              } else if (item.kind === 'artifact' && item.artifactId) {
+                actions = '<button class="btn-sm" onclick="openBrainArtifact(' + item.artifactId + ')">Open</button>';
+              }
+              html += '<div class="brain-result-row">'
+                + '<div class="brain-result-top">'
+                  + '<div style="min-width:0;flex:1">'
+                    + '<div class="brain-result-title">' + escapeHtml(item.title || '(untitled)') + '</div>'
+                    + '<div class="brain-result-subtitle">' + escapeHtml(item.subtitle || item.source || '') + '</div>'
+                  + '</div>'
+                  + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center">' + badges.join('') + actions + '</div>'
+                + '</div>'
+                + (item.preview ? '<div class="brain-result-preview">' + escapeHtml(item.preview) + '</div>' : '')
+                + (item.timestamp ? '<div style="font-size:11px;color:var(--text-muted);margin-top:8px">' + escapeHtml(timeAgo(item.timestamp)) + '</div>' : '')
+                + '</div>';
+            }
+            resultsEl.innerHTML = html;
+          } catch (err) {
+            resultsEl.innerHTML = '<div class="empty-state" style="color:var(--red)">Search error: ' + escapeHtml(String(err)) + '</div>';
+          }
+        }
+
+        async function openBrainChunkTrace(id) {
+          var drawer = document.getElementById('brain-chunk-trace-drawer');
+          if (!drawer) {
+            drawer = document.createElement('div');
+            drawer.id = 'brain-chunk-trace-drawer';
+            drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:620px;max-width:94vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:221;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
+            drawer.innerHTML =
+              '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
+                + '<div style="flex:1;min-width:0">'
+                  + '<div id="brain-chunk-title" style="font-weight:600;font-size:15px"></div>'
+                  + '<div id="brain-chunk-subtitle" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px"></div>'
+                + '</div>'
+                + '<button class="btn-icon btn-sm" onclick="closeBrainChunkTrace()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
+              + '</div>'
+              + '<div id="brain-chunk-body" style="flex:1;overflow:auto;padding:18px 22px;font-size:12px;line-height:1.55"></div>';
+            document.body.appendChild(drawer);
+          }
+          drawer.style.transform = 'translateX(0)';
+          document.getElementById('brain-chunk-title').textContent = 'Memory chunk #' + id;
+          document.getElementById('brain-chunk-subtitle').textContent = 'Loading…';
+          document.getElementById('brain-chunk-body').innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div></div>';
+          try {
+            var chunkResp = await apiFetch('/api/memory/chunks/' + id);
+            var chunkData = await chunkResp.json();
+            var historyResp = await apiFetch('/api/memory/chunks/' + id + '/history');
+            var historyData = await historyResp.json();
+            if (!chunkResp.ok || !chunkData.ok || !chunkData.chunk) throw new Error(chunkData.error || 'chunk not found');
+            var c = chunkData.chunk;
+            document.getElementById('brain-chunk-title').textContent = c.section || ('Memory chunk #' + id);
+            document.getElementById('brain-chunk-subtitle').textContent = c.sourceFile || c.source_file || '';
+            var metaRows = [
+              ['ID', c.id || id],
+              ['Type', c.chunkType || c.chunk_type || '—'],
+              ['Source', c.sourceFile || c.source_file || '—'],
+              ['Agent', c.agentSlug || c.agent_slug || 'global'],
+              ['Salience', c.salience != null ? Number(c.salience).toFixed(2) : '—'],
+              ['Confidence', c.confidence != null ? Number(c.confidence).toFixed(2) : '—'],
+              ['Updated', c.lastUpdated || c.updated_at || '—'],
+            ];
+            var html = '<div style="display:grid;grid-template-columns:110px 1fr;gap:6px 12px;margin-bottom:14px">';
+            metaRows.forEach(function(row) {
+              html += '<div style="color:var(--text-muted)">' + escapeHtml(row[0]) + '</div><div style="overflow-wrap:anywhere">' + escapeHtml(row[1]) + '</div>';
+            });
+            html += '</div>';
+            html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Stored content</div>';
+            html += '<div style="white-space:pre-wrap;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;margin-bottom:14px">' + escapeHtml(c.content || '') + '</div>';
+            var history = historyData.ok && Array.isArray(historyData.history) ? historyData.history : [];
+            html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Change history</div>';
+            if (!history.length) {
+              html += '<div class="empty-state" style="padding:16px;text-align:left">No edits or supersedes recorded.</div>';
+            } else {
+              html += '<div style="border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden">';
+              history.forEach(function(h) {
+                html += '<div style="padding:8px 10px;border-bottom:1px solid var(--border-light);font-size:12px">'
+                  + '<div style="color:var(--text-muted);font-size:11px">' + escapeHtml(h.timestamp || h.at || '') + '</div>'
+                  + '<div>' + escapeHtml(h.kind || h.action || 'edit') + (h.reason ? ' · ' + escapeHtml(h.reason) : '') + '</div>'
+                  + '</div>';
+              });
+              html += '</div>';
+            }
+            document.getElementById('brain-chunk-body').innerHTML = html;
+          } catch (err) {
+            document.getElementById('brain-chunk-subtitle').textContent = 'Failed';
+            document.getElementById('brain-chunk-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(String(err)) + '</div>';
+          }
+        }
+
+        function closeBrainChunkTrace() {
+          var drawer = document.getElementById('brain-chunk-trace-drawer');
+          if (drawer) drawer.style.transform = 'translateX(100%)';
+        }
+
+        async function openBrainArtifact(id) {
+          var drawer = document.getElementById('brain-artifact-drawer');
+          if (!drawer) {
+            drawer = document.createElement('div');
+            drawer.id = 'brain-artifact-drawer';
+            drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:620px;max-width:94vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:220;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
+            drawer.innerHTML =
+              '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
+                + '<div style="flex:1;min-width:0">'
+                  + '<div id="brain-artifact-title" style="font-weight:600;font-size:15px"></div>'
+                  + '<div id="brain-artifact-subtitle" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px"></div>'
+                + '</div>'
+                + '<button class="btn-icon btn-sm" onclick="closeBrainArtifact()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
+              + '</div>'
+              + '<div id="brain-artifact-body" style="flex:1;overflow:auto;padding:18px 22px;font-size:12px;line-height:1.55;white-space:pre-wrap;font-family:\\x27JetBrains Mono\\x27,monospace"></div>';
+            document.body.appendChild(drawer);
+          }
+          drawer.style.transform = 'translateX(0)';
+          document.getElementById('brain-artifact-title').textContent = 'Artifact #' + id;
+          document.getElementById('brain-artifact-subtitle').textContent = 'Loading…';
+          document.getElementById('brain-artifact-body').textContent = '';
+          try {
+            var r = await apiFetch('/api/brain/artifacts/' + encodeURIComponent(id));
+            var d = await r.json();
+            if (!r.ok || !d.ok || !d.artifact) throw new Error(d.error || 'not found');
+            var a = d.artifact;
+            document.getElementById('brain-artifact-title').textContent = a.summary || ('Artifact #' + id);
+            document.getElementById('brain-artifact-subtitle').textContent = (a.toolName || 'tool') + ' · ' + (a.storedAt || '');
+            document.getElementById('brain-artifact-body').textContent = a.content || a.summary || '';
+          } catch (err) {
+            document.getElementById('brain-artifact-subtitle').textContent = 'Failed';
+            document.getElementById('brain-artifact-body').textContent = String(err);
+          }
+        }
+
+        function closeBrainArtifact() {
+          var drawer = document.getElementById('brain-artifact-drawer');
+          if (drawer) drawer.style.transform = 'translateX(100%)';
+        }
+
+        async function refreshBrainOverview() {
+          var kpis = document.getElementById('brain-command-kpis');
+          var flow = document.getElementById('brain-overview-flow');
+          try {
+            var all = await Promise.all([
+              apiFetch('/api/memory/health').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+              apiFetch('/api/brain/sources').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+              apiFetch('/api/brain/runs?limit=8').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+            ]);
+            var h = (all[0] && all[0].health) || {};
+            var sources = (all[1] && all[1].sources) || [];
+            var runs = (all[2] && all[2].runs) || [];
+            var dense = h.denseEmbeddings || {};
+            var densePct = dense.total > 0 ? Math.round((dense.withDense / Math.max(1, dense.total)) * 100) + '%' : '0%';
+            var activeSources = sources.filter(function(s) { return s.enabled; }).length;
+            var scheduledSources = sources.filter(function(s) { return s.enabled && s.scheduleCron; }).length;
+            var lastRun = runs.length ? runs[0] : null;
+            if (kpis) {
+              kpis.innerHTML =
+                '<div class="brain-kpi"><div class="value">' + ((h.chunks && h.chunks.total) || 0).toLocaleString() + '</div><div class="label">Searchable chunks</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + densePct + '</div><div class="label">Semantic coverage</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + activeSources + '</div><div class="label">Active sources</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + scheduledSources + '</div><div class="label">Scheduled feeds</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + (lastRun ? escapeHtml(lastRun.status) : 'none') + '</div><div class="label">Latest ingestion</div></div>';
+            }
+            if (flow) {
+              if (!runs.length) {
+                flow.innerHTML = '<div class="empty-cta"><div class="label">No ingestion runs yet</div><div class="hint">Seed local data or add a scheduled feed to start the knowledge flow.</div></div>';
+              } else {
+                var html = '<div class="brain-flow-list">';
+                html += '<div class="brain-flow-row" style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.04em"><div>Source</div><div>Status</div><div>In</div><div>Written</div><div>Same</div><div>Failed</div><div>When</div></div>';
+                for (var i = 0; i < runs.length; i++) {
+                  var run = runs[i];
+                  html += '<div class="brain-flow-row">'
+                    + '<div style="font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(run.sourceSlug || '—') + '</div>'
+                    + '<div>' + brainStatusBadge(run.status) + '</div>'
+                    + '<div>' + (run.recordsIn || 0) + '</div>'
+                    + '<div>' + (run.recordsWritten || 0) + '</div>'
+                    + '<div>' + (run.recordsUnchanged || 0) + '</div>'
+                    + '<div>' + (run.recordsFailed || 0) + '</div>'
+                    + '<div style="color:var(--text-muted)">' + escapeHtml(timeAgo(run.finishedAt || run.startedAt)) + '</div>'
+                    + '</div>';
+                }
+                html += '</div>';
+                flow.innerHTML = html;
+              }
+            }
+            if (document.getElementById('brain-library-results')) runBrainLibrarySearch('');
+          } catch (err) {
+            if (kpis) kpis.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load overview: ' + escapeHtml(String(err)) + '</div>';
+          }
+        }
 
         function brainRenderProgress(el, opts) {
           const label = BRAIN_STAGE_LABELS[opts.stage] || opts.stage || 'Working';
@@ -13551,6 +17421,55 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           ];
         }
 
+        function brainSetPollCron(expr) {
+          var input = document.getElementById('brain-poll-cron');
+          if (input) input.value = expr;
+        }
+
+        function brainRenderPollScheduleChips() {
+          var el = document.getElementById('brain-poll-schedule-chips');
+          if (!el) return;
+          el.innerHTML = brainScheduleChips().map(function(c) {
+            return '<button class="btn-sm" type="button" onclick="brainSetPollCron(\\'' + escapeHtml(c.cron) + '\\')">' + escapeHtml(c.label) + '</button>';
+          }).join('');
+        }
+
+        function brainAddKvRow(kind, key, value) {
+          var el = document.getElementById(kind === 'params' ? 'brain-poll-params-rows' : 'brain-poll-headers-rows');
+          if (!el) return;
+          var row = document.createElement('div');
+          row.className = 'brain-kv-row';
+          row.innerHTML =
+            '<input type="text" class="brain-kv-key" placeholder="' + (kind === 'params' ? 'limit' : 'Authorization') + '">'
+            + '<input type="text" class="brain-kv-value" placeholder="' + (kind === 'params' ? '100' : 'Bearer ${"${"}ref}') + '">'
+            + '<button class="btn-icon btn-sm" type="button" onclick="this.closest(\\'.brain-kv-row\\').remove()" title="Remove">' + lucide('x', 'icn-sm') + '</button>';
+          el.appendChild(row);
+          row.querySelector('.brain-kv-key').value = key || '';
+          row.querySelector('.brain-kv-value').value = value || '';
+        }
+
+        function brainEnsureKvRows() {
+          var h = document.getElementById('brain-poll-headers-rows');
+          var p = document.getElementById('brain-poll-params-rows');
+          if (h && h.children.length === 0) brainAddKvRow('headers', 'Authorization', 'Bearer ${"${"}api_key}');
+          if (p && p.children.length === 0) brainAddKvRow('params', 'limit', '100');
+          brainRenderPollScheduleChips();
+        }
+
+        function brainCollectKv(kind) {
+          var el = document.getElementById(kind === 'params' ? 'brain-poll-params-rows' : 'brain-poll-headers-rows');
+          var out = {};
+          if (!el) return out;
+          el.querySelectorAll('.brain-kv-row').forEach(function(row) {
+            var keyEl = row.querySelector('.brain-kv-key');
+            var valEl = row.querySelector('.brain-kv-value');
+            var key = keyEl ? keyEl.value.trim() : '';
+            var val = valEl ? valEl.value.trim() : '';
+            if (key) out[key] = val;
+          });
+          return out;
+        }
+
         async function brainLoadFeedConnectors() {
           try {
             const resp = await apiFetch('/api/brain/connectors');
@@ -13558,7 +17477,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             const el = document.getElementById('brain-feeds-connectors');
             if (!el) return data;
             if (!data.integrations || !data.integrations.length) {
-              el.innerHTML = '<div style="color:var(--muted);font-size:13px">No Claude Desktop connectors detected yet. Open Claude Desktop → Connectors to sign into Google Drive, Outlook, Gmail, etc.</div>';
+              el.innerHTML = '<div style="color:var(--muted);font-size:13px">No seed-ready tools detected yet. Connect Composio or open Claude Desktop → Connectors to sign into Google Drive, Outlook, Gmail, etc.</div>';
               return data;
             }
             el.innerHTML = data.integrations.map(function(i) {
@@ -13566,7 +17485,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               const color = ok ? '#2f7d32' : '#8a5a00';
               const bg = ok ? '#e8f5e9' : '#fff3cd';
               const dot = ok ? '✓' : '⚠';
-              const label = ok ? i.label : i.label + ' (incomplete in Claude Desktop)';
+              const source = i.kind === 'composio' ? 'Composio' : (i.kind === 'claude-desktop' ? 'Claude Desktop' : 'MCP');
+              const label = ok ? i.label + ' · ' + source : i.label + ' (incomplete in ' + source + ')';
               return '<span style="padding:3px 10px;border-radius:12px;background:' + bg + ';color:' + color + ';font-size:12px;font-weight:500">' + dot + ' ' + escapeHtml(label) + '</span>';
             }).join('');
             return data;
@@ -13599,7 +17519,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 '<div style="font-size:12px;margin-top:4px">' + fieldsLine + '</div>' +
                 '</div>' +
                 '<button class="btn-primary" onclick="brainRunFeed(\\'' + f.name.replace(/"/g, '') + '\\')">Run now</button> ' +
-                '<button class="btn" onclick="brainDeleteFeed(\\'' + f.name.replace(/"/g, '') + '\\')">🗑</button>' +
+                '<button class="btn" onclick="brainDeleteFeed(\\'' + f.name.replace(/"/g, '') + '\\')">Delete</button>' +
                 '</div>';
             }).join('');
           } catch (err) {
@@ -13647,6 +17567,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             for (const f of (s.recipe.fields || [])) {
               if (f.defaultValue) s.values[f.key] = f.defaultValue;
             }
+            if (s.recipe.integration === '*' && s.pick) {
+              s.values.toolSourceName = s.pick.name;
+              s.values.toolSourceKind = s.pick.kind;
+              s.values.toolSourceLabel = s.pick.label;
+            }
             s.schedule = s.recipe.defaultSchedule;
             s.step = 2;
           } else if (s.step === 2) {
@@ -13655,6 +17580,27 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             inputs.forEach(function(inp) { s.values[inp.dataset.field] = inp.value; });
             const missing = (s.recipe.fields || []).filter(function(f) { return f.required && !(s.values[f.key] || '').trim(); });
             if (missing.length) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Required: ' + missing.map(function(f) { return f.label; }).join(', ') + '</span>'; return; }
+            if (s.recipe && s.recipe.id === 'tool-backed-memory-seed') {
+              const toolName = String(s.values.toolName || '').trim();
+              if (!/^mcp__.+__.+$/.test(toolName)) {
+                document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick an exact tool before continuing.</span>';
+                return;
+              }
+              const rawVariables = String(s.values.variablesJson || '').trim();
+              if (rawVariables) {
+                try {
+                  const parsedVariables = JSON.parse(rawVariables);
+                  if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) {
+                    document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be a JSON object, for example {}.</span>';
+                    return;
+                  }
+                } catch (err) {
+                  void err;
+                  document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be valid JSON, for example {}.</span>';
+                  return;
+                }
+              }
+            }
             s.step = 3;
           } else if (s.step === 3) {
             brainFeedWizardSubmit();
@@ -13822,6 +17768,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           if (field) await brainRenderFieldPicker(field, s.values);
         }
 
+        function brainFullToolNameForPick(pick, tool) {
+          if (!pick || !tool) return tool || '';
+          if (String(tool).startsWith('mcp__')) return tool;
+          const server = pick.kind === 'claude-desktop' ? ('claude_ai_' + pick.name) : pick.name;
+          return 'mcp__' + server + '__' + tool;
+        }
+
         function brainFeedWizardRender() {
           if (!brainFeedWizardState) return;
           const s = brainFeedWizardState;
@@ -13837,7 +17790,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           let html = '';
           if (s.step === 0) {
             if (!s.connected.length) {
-              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
+              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Connect Composio or open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
             } else {
               html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">' +
                 s.connected.map(function(i) {
@@ -13849,7 +17802,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 }).join('') + '</div>';
             }
           } else if (s.step === 1) {
-            const recipes = (s.catalog.recipes || []).filter(function(r) { return r.integration === s.pick.name; });
+            const recipes = (s.catalog.recipes || []).filter(function(r) { return r.integration === s.pick.name || r.integration === '*'; });
             if (!recipes.length) {
               html = '<div style="color:var(--muted)">No recipes for this connector yet.</div>';
             } else {
@@ -13878,6 +17831,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                       '<div style="color:var(--muted);font-size:13px;padding:6px">Loading choices…</div>' +
                     '</div>' +
                     '<input type="hidden" data-field="' + f.key + '" value="' + escapeHtml(val) + '">';
+                  } else if (s.recipe.integration === '*' && f.key === 'toolName') {
+                    const tools = (s.pick && s.pick.tools) || [];
+                    if (!tools.length) {
+                      control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="mcp__server__TOOL_NAME" style="width:100%">';
+                    } else {
+                      const options = tools.map(function(t) {
+                        const full = brainFullToolNameForPick(s.pick, t);
+                        const selected = full === val ? ' selected' : '';
+                        return '<option value="' + escapeHtml(full) + '"' + selected + '>' + escapeHtml(t) + '</option>';
+                      }).join('');
+                      control = '<select data-field="' + f.key + '" style="width:100%;padding:6px">' +
+                        '<option value="">— pick a tool —</option>' +
+                        options +
+                      '</select>' +
+                      '<div style="font-size:11px;color:var(--muted);margin-top:4px">The feed will call the selected tool exactly, then compare returned records with memory.</div>';
+                    }
+                  } else if (s.recipe.integration === '*' && ['callGoal', 'variablesJson', 'recordStrategy'].includes(f.key)) {
+                    const minHeight = f.key === 'variablesJson' ? '70px' : '92px';
+                    control = '<textarea data-field="' + f.key + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%;min-height:' + minHeight + ';resize:vertical">' + escapeHtml(val) + '</textarea>';
                   } else {
                     control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">';
                   }
@@ -13919,6 +17891,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         function brainFeedWizardPickRecipe(id) {
           const r = (brainFeedWizardState.catalog.recipes || []).find(function(x) { return x.id === id; });
           brainFeedWizardState.recipe = r;
+          if (r && r.integration === '*' && brainFeedWizardState.pick) {
+            brainFeedWizardState.values.toolSourceName = brainFeedWizardState.pick.name;
+            brainFeedWizardState.values.toolSourceKind = brainFeedWizardState.pick.kind;
+            brainFeedWizardState.values.toolSourceLabel = brainFeedWizardState.pick.label;
+          }
           brainFeedWizardRender();
         }
 
@@ -13971,25 +17948,44 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const data = await resp.json();
           const el = document.getElementById('brain-sources-list');
           if (!data.sources || !data.sources.length) {
-            el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed a local file/folder in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab, or register a scheduled REST poll above.</div>';
+            el.innerHTML = '<div class="empty-cta"><div class="label">No ingestion sources yet</div><div class="hint">Seed a local file/folder or create a scheduled feed. Ingested data remains searchable even if a source is later disabled.</div></div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Schedule</th><th>Target</th><th>Project</th><th>Enabled</th><th>Last run</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
-            data.sources.map((s) => {
-              const projTag = s.project
-                ? '<code style="font-size:11px">' + escapeHtml(s.project.split('/').filter(Boolean).pop() || s.project) + '</code>'
-                : '—';
-              return '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
-                '<td><code style="font-size:11px">' + escapeHtml(s.scheduleCron || '—') + '</code></td>' +
-                '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
-                '<td>' + projTag + '</td>' +
-                '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
-                '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
-                '<td>' + escapeHtml(s.lastStatus || '—') + '</td>' +
-                '<td><button class="btn" onclick="brainRunSource(\\'' + escapeHtml(s.slug) + '\\')">Run</button> ' +
-                '<button class="btn" onclick="brainDeleteSource(\\'' + escapeHtml(s.slug) + '\\')">🗑</button></td></tr>';
-            }).join('') +
-            '</tbody></table>';
+          var html = '<div style="display:flex;flex-direction:column;gap:10px">';
+          data.sources.forEach(function(s) {
+            const projTag = s.project
+              ? '<span class="brain-badge">' + escapeHtml(s.project.split('/').filter(Boolean).pop() || s.project) + '</span>'
+              : '';
+            const schedule = s.scheduleCron ? '<span class="brain-badge">' + escapeHtml(s.scheduleCron) + '</span>' : '<span class="brain-badge">manual</span>';
+            const enabled = s.enabled ? '<span class="brain-badge" style="color:var(--green);border-color:var(--green)33">enabled</span>' : '<span class="brain-badge">disabled</span>';
+            html += '<div class="brain-source-card">'
+              + '<div style="min-width:0;flex:1">'
+                + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:5px">'
+                  + '<strong style="font-size:14px">' + escapeHtml(s.slug) + '</strong>'
+                  + '<span class="brain-badge">' + escapeHtml(s.kind) + '</span>'
+                  + '<span class="brain-badge">' + escapeHtml(s.adapter) + '</span>'
+                  + schedule + enabled + projTag
+                + '</div>'
+                + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">'
+                  + 'Target: <code>' + escapeHtml(s.targetFolder || 'default') + '</code>'
+                  + ' · Last run: ' + escapeHtml(s.lastRunAt ? timeAgo(s.lastRunAt) : 'never')
+                  + ' · Status: ' + escapeHtml(s.lastStatus || 'none')
+                + '</div>'
+              + '</div>'
+              + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
+                + '<button class="btn-sm brain-run-source" data-slug="' + escapeHtml(s.slug) + '">Run now</button>'
+                + '<button class="btn-sm brain-delete-source" data-slug="' + escapeHtml(s.slug) + '" title="Delete source">Delete</button>'
+              + '</div>'
+              + '</div>';
+          });
+          html += '</div>';
+          el.innerHTML = html;
+          el.querySelectorAll('.brain-run-source').forEach(function(btn) {
+            btn.onclick = function() { brainRunSource(btn.getAttribute('data-slug') || ''); };
+          });
+          el.querySelectorAll('.brain-delete-source').forEach(function(btn) {
+            btn.onclick = function() { brainDeleteSource(btn.getAttribute('data-slug') || ''); };
+          });
         }
 
         async function brainRunSource(slug) {
@@ -14027,6 +18023,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           document.getElementById('brain-creds-form').style.display = 'none';
           const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
           brainLoadProjects(['brain-poll-project']);
+          brainEnsureKvRows();
         }
 
         function brainShowWebhookForm() {
@@ -14097,17 +18094,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const slug = document.getElementById('brain-poll-slug').value.trim();
           const url = document.getElementById('brain-poll-url').value.trim();
           const method = document.getElementById('brain-poll-method').value;
-          const headersText = document.getElementById('brain-poll-headers').value.trim();
-          const paramsText = document.getElementById('brain-poll-params').value.trim();
           const recordsPath = document.getElementById('brain-poll-recordspath').value.trim();
           const cronExpr = document.getElementById('brain-poll-cron').value.trim();
           const folder = document.getElementById('brain-poll-folder').value.trim();
           const statusEl = document.getElementById('brain-poll-status');
           if (!slug || !url) { statusEl.innerHTML = '<span style="color:#e66">slug and URL required</span>'; return; }
 
-          let headers = {}, params = {};
-          try { if (headersText) headers = JSON.parse(headersText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid headers JSON</span>'; return; }
-          try { if (paramsText) params = JSON.parse(paramsText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid params JSON</span>'; return; }
+          const headers = brainCollectKv('headers');
+          const params = brainCollectKv('params');
 
           const cfg = { url, method, headers, params };
           if (recordsPath) cfg.recordsJsonPath = recordsPath;
@@ -14143,6 +18137,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         async function brainShowCredsForm() {
           document.getElementById('brain-creds-form').style.display = '';
           document.getElementById('brain-poll-form').style.display = 'none';
+          const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
           const resp = await apiFetch('/api/brain/credentials');
           const data = await resp.json();
           const refs = data.refs || [];
@@ -14170,20 +18165,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         }
 
         async function brainLoadRuns() {
-          const resp = await apiFetch('/api/brain/runs');
+          const resp = await apiFetch('/api/brain/runs?limit=80');
           const data = await resp.json();
           const el = document.getElementById('brain-runs-list');
           if (!data.runs || !data.runs.length) {
-            el.innerHTML = '<div style="color:var(--muted);padding:20px">No ingestion runs yet.</div>';
+            el.innerHTML = '<div class="empty-cta"><div class="label">No ingestion runs yet</div><div class="hint">Preview and commit a seed, or run a scheduled source.</div></div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Skipped</th><th>Failed</th><th>Overview</th></tr></thead><tbody>' +
+          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Same</th><th>Skipped</th><th>Failed</th><th>Recall check</th><th>Overview</th></tr></thead><tbody>' +
             data.runs.map((r) =>
               '<tr><td>' + r.id + '</td><td>' + escapeHtml(r.sourceSlug) + '</td>' +
               '<td>' + escapeHtml(r.startedAt) + '</td>' +
-              '<td>' + escapeHtml(r.status) + '</td>' +
+              '<td>' + brainStatusBadge(r.status) + '</td>' +
               '<td>' + r.recordsIn + '</td><td>' + r.recordsWritten + '</td>' +
-              '<td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
+              '<td>' + (r.recordsUnchanged || 0) + '</td><td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
+              '<td>' + escapeHtml(r.recallCheckStatus || '—') + '</td>' +
               '<td>' + (r.overviewNotePath ? '<code style="font-size:12px">' + escapeHtml(r.overviewNotePath) + '</code>' : '—') + '</td></tr>').join('') +
             '</tbody></table>';
         }
@@ -14202,6 +18198,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         // structure) to ~/.clementine/uploads/<id>/ → backend returns
         // the on-disk path, which we feed into the existing preview/
         // commit pipeline.
+
+        function brainHandleDrag(event, over) {
+          event.preventDefault();
+          var zone = document.getElementById('brain-drop-zone');
+          if (!zone) return;
+          if (over) zone.classList.add('dragover');
+          else zone.classList.remove('dragover');
+        }
+
+        async function brainHandleDrop(event) {
+          event.preventDefault();
+          var zone = document.getElementById('brain-drop-zone');
+          if (zone) zone.classList.remove('dragover');
+          var files = event.dataTransfer && event.dataTransfer.files ? event.dataTransfer.files : null;
+          if (!files || files.length === 0) return;
+          await brainHandleFilesChosen(files, false);
+        }
 
         async function brainHandleFilesChosen(fileList, isFolder) {
           const statusEl = document.getElementById('brain-upload-status');
@@ -14251,15 +18264,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           }
         }
 
-        // Wire tab refresh on switchTab → brain tabs
-        (function() {
-          const origSwitch = window.switchTab;
-          window.switchTab = function(page, tab) {
-            origSwitch(page, tab);
-            if (page === 'intelligence' && tab === 'sources') { brainLoadSources(); brainLoadFeedConnectors(); brainLoadFeeds(); }
-            if (page === 'intelligence' && tab === 'runs') brainLoadRuns();
-          };
-        })();
+        // Brain tab refresh is handled by the global switchTab dispatcher.
       </script>
     </div>
 
@@ -14586,6 +18591,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- (Session 5) team-status / agent-detail / goals parking divs removed.
          Team's Roster / Activity / Goals tabs are the live homes. -->
 
+    <!-- ═══ Heartbeat Control Page ═══ -->
+    <div class="page" id="page-heartbeat">
+      <div class="page-head">
+        <div class="icon icon-slot" data-icon="bell"></div>
+        <div class="title-block">
+          <h1>Heartbeat</h1>
+          <p class="desc">Tune proactive check-ins, silence rules, and work queued for the next autonomous pulse.</p>
+        </div>
+        <div class="actions">
+          <button class="btn-sm" onclick="refreshHeartbeatControl()">Refresh</button>
+          <button class="btn-primary btn-sm" onclick="openHeartbeatQueueModal('')">Queue Work</button>
+        </div>
+      </div>
+      <div id="heartbeat-control-content" style="padding:18px">
+        <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+      </div>
+    </div>
+
     <!-- ═══ Settings Page (merged: General + Remote + Integrations + Projects) ═══ -->
     <div class="page" id="page-settings">
       <div class="page-title">Settings</div>
@@ -14602,8 +18625,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane active" id="tab-settings-general">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
             <p style="color:var(--text-muted);margin:0">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code>.</p>
-            <button class="btn-sm" style="white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDashboard()">Restart Dashboard</button>
+            <button class="btn-sm btn-primary" style="white-space:nowrap;padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
           </div>
+          <div id="budget-health-content" style="margin-bottom:16px"><div class="empty-state">Loading budget health...</div></div>
           <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
         </div>
         <div class="tab-pane" id="tab-settings-remote">
@@ -14766,8 +18790,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="card" style="margin-bottom:16px">
             <div class="card-header">Diagnostics &amp; maintenance</div>
             <div class="card-body" style="padding:16px;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-sm btn-primary" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
               <button class="btn-sm" onclick="restartDashboard()">Restart Dashboard</button>
-              <button class="btn-sm" onclick="if(confirm('Restart the daemon? Active sessions drain first.')) apiPost('/api/restart')">Restart Daemon</button>
               <button class="btn-sm" onclick="apiFetch('/api/doctor').then(function(r){return r.text()}).then(function(t){alert(t)})">Run Doctor</button>
               <button class="btn-sm" onclick="apiFetch('/api/version').then(function(r){return r.json()}).then(function(d){alert('Version: '+(d.version||'?')+'\\nNode: '+(d.node||'?'))})">Build info</button>
             </div>
@@ -15387,18 +19411,27 @@ async function apiFetch(url, opts) {
     }
     // 401 means the dashboard was restarted and regenerated its token.
     // The page still in your browser has a stale one baked into <meta>,
-    // so every API call silently fails. Reload once to pick up the new
-    // HTML (and new token). Guard against reload loops with sessionStorage.
+    // so every API call silently fails. Reload to pick up the new HTML
+    // (and new token), but throttle by token so a tab cannot get stuck
+    // forever after one earlier restart.
     if (resp.status === 401) {
-      var key = '_dashReloadedOnce';
-      if (!sessionStorage.getItem(key)) {
-        sessionStorage.setItem(key, String(Date.now()));
+      var key = '_dashReloadedForToken:' + (_dashToken || 'missing').slice(0, 12);
+      var lastReload = Number(sessionStorage.getItem(key) || '0');
+      var now = Date.now();
+      if (!lastReload || now - lastReload > 5000) {
+        sessionStorage.setItem(key, String(now));
         console.warn('Dashboard token expired — reloading to refresh.');
         location.reload();
         // Let the reload kick in; return the 401 so any caller that
         // handles it sees a consistent result until the page unloads.
         return resp;
       }
+    } else if (resp.ok) {
+      try {
+        Object.keys(sessionStorage).forEach(function(k) {
+          if (k.indexOf('_dashReloadedForToken:') === 0) sessionStorage.removeItem(k);
+        });
+      } catch (_) { /* ignore */ }
     }
     return resp;
   }
@@ -15449,6 +19482,11 @@ var LUCIDE = {
   send:        '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
   arrowRight:  '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
   tool:        '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  upload:      '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
+  repeat:      '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  listChecks:  '<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+  activity:    '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+  layoutDashboard:'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   database:    '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
 };
 function lucide(name, cls) {
@@ -15456,7 +19494,7 @@ function lucide(name, cls) {
   return '<svg class="icn ' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true">' + path + '</svg>';
 }
 
-var DESTINATIONS = ['home', 'build', 'team', 'brain', 'settings'];
+var DESTINATIONS = ['home', 'build', 'heartbeat', 'team', 'brain', 'settings'];
 
 var ROUTE_REDIRECTS = {
   // old hash → new {page, tab}
@@ -15466,12 +19504,13 @@ var ROUTE_REDIRECTS = {
   'goals': { page: 'team', tab: 'goals' },
   'workflows': { page: 'build', tab: 'workflows' },
   'automations': { page: 'build', tab: 'crons' },
-  'unleashed': { page: 'build', tab: 'workflows' },
+  'unleashed': { page: 'build', tab: 'crons' },
   'builder': { page: 'build', tab: 'workflows' },
   'skill-studio': { page: 'build', tab: 'skills' },
+  'heartbeats': { page: 'heartbeat' },
   'team-status': { page: 'team', tab: 'activity' },
   'agent-detail': { page: 'team', tab: 'roster' },
-  'intelligence': { page: 'brain', tab: 'memory' },
+  'intelligence': { page: 'brain', tab: 'overview' },
   'memory-health': { page: 'brain', tab: 'health' },
   'claims': { page: 'brain', tab: 'health' },
   'metrics': { page: 'team', tab: 'activity' },
@@ -15528,9 +19567,12 @@ function navigateTo(page, opts) {
       }, 80);
       break;
     case 'build':
-      switchBuildTab(opts.tab || 'workflows');
+      switchBuildTab(opts.tab || 'crons');
       var bp = currentAgentSlug || '';
       refreshBuilderAgents(bp);
+      break;
+    case 'heartbeat':
+      refreshHeartbeatControl();
       break;
     case 'team':
       refreshTeam();
@@ -15541,9 +19583,10 @@ function navigateTo(page, opts) {
       }
       break;
     case 'brain':
-      var bt = opts.tab || 'memory';
+      var bt = opts.tab || 'overview';
       // Spec tab names → internal intelligence-tab ids
-      var intelTab = bt === 'memory' ? 'search'
+      var intelTab = bt === 'overview' ? 'overview'
+        : bt === 'memory' ? 'search'
         : bt === 'knowledge' ? 'graph'
         : bt === 'ingestion' ? 'sources'
         : bt === 'health' ? 'health'
@@ -15590,28 +19633,84 @@ function switchDestTab(page, tab) {
 
 // (Session 5) openAutomationsTab compat shim removed — all callers route via navigateTo + ROUTE_REDIRECTS.
 
-// ── Build (Workflows / Crons / Skills / Templates) tabs ─────────────
+// ── Build (Automation / Workflow Builder / Skills / Templates) tabs ─────────────
+var BUILD_OWNER_ALL = '__all__';
+
+function getBuildOwnerFilter() {
+  var sel = document.getElementById('builder-owner');
+  return sel ? sel.value : BUILD_OWNER_ALL;
+}
+
+function getBuildCreateOwner() {
+  var owner = getBuildOwnerFilter();
+  return owner === BUILD_OWNER_ALL ? '' : owner;
+}
+
+function buildOwnerMatches(agentSlug) {
+  var owner = getBuildOwnerFilter();
+  if (owner === BUILD_OWNER_ALL) return true;
+  if (owner) return agentSlug === owner;
+  return !agentSlug;
+}
+
+function buildOwnerScopeLabel() {
+  var owner = getBuildOwnerFilter();
+  if (owner === BUILD_OWNER_ALL) return 'all agents';
+  return owner || 'global';
+}
+
 function switchBuildTab(tab) {
-  if (!tab) tab = 'workflows';
+  if (!tab) tab = 'crons';
   // Update tab-bar active state
   document.querySelectorAll('#build-tabs button').forEach(function(b) {
     b.classList.toggle('active', b.getAttribute('data-build-tab') === tab);
   });
   // Show/hide tab panes
   var workPane = document.getElementById('build-tab-workflows');
+  var cronPane = document.getElementById('build-tab-crons');
   var tplPane = document.getElementById('build-tab-templates');
   var headerStrip = document.getElementById('build-header-strip');
+  var usagePanel = document.getElementById('build-usage-panel');
+  var newBtn = document.getElementById('builder-new-btn');
   // Always close any open workflow when changing tabs — switching context
   // is a clean slate, not a stale node hanging on the canvas.
   if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
   if (tab === 'templates') {
     if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'none';
     if (tplPane) tplPane.style.display = '';
     if (headerStrip) headerStrip.style.display = 'none';
-  } else {
-    if (workPane) workPane.style.display = 'flex';
+    if (usagePanel) usagePanel.style.display = 'none';
+  } else if (tab === 'crons') {
+    if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'block';
     if (tplPane) tplPane.style.display = 'none';
     if (headerStrip) headerStrip.style.display = 'flex';
+    if (usagePanel) usagePanel.style.display = '';
+    if (newBtn) newBtn.style.display = 'none';
+    var typeSelCron = document.getElementById('builder-type');
+    if (typeSelCron) typeSelCron.value = 'cron';
+    var saveBtnCron = document.getElementById('builder-save-btn');
+    var testBtnCron = document.getElementById('builder-test-btn');
+    var statusCron = document.getElementById('builder-preview-status');
+    if (saveBtnCron) saveBtnCron.style.display = 'none';
+    if (testBtnCron) testBtnCron.style.display = 'none';
+    if (statusCron) statusCron.textContent = '';
+    if (typeof populateBuilderOwnerPicker === 'function') {
+      populateBuilderOwnerPicker().catch(function() { /* */ });
+    }
+    if (typeof refreshCron === 'function') refreshCron();
+    if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
+  } else {
+    if (workPane) workPane.style.display = 'flex';
+    if (cronPane) cronPane.style.display = 'none';
+    if (tplPane) tplPane.style.display = 'none';
+    if (headerStrip) headerStrip.style.display = 'flex';
+    if (usagePanel) usagePanel.style.display = '';
+    if (newBtn) {
+      newBtn.style.display = '';
+      newBtn.textContent = tab === 'skills' ? 'New Skill' : 'New Workflow';
+    }
     // Map build-tab → builder-type so the canvas + chat reflect the tab.
     var typeSel = document.getElementById('builder-type');
     if (typeSel) {
@@ -15635,6 +19734,7 @@ function switchBuildTab(tab) {
     if (typeof populateBuilderOwnerPicker === 'function') {
       populateBuilderOwnerPicker().catch(function() { /* */ });
     }
+    if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
     // Focus chat input
     setTimeout(function() {
       var bi = document.getElementById('builder-input');
@@ -15643,12 +19743,12 @@ function switchBuildTab(tab) {
   }
 }
 
-// "New" button in the Build header strip — context-aware. Crons open the
-// dedicated cron modal so the entry lands in CRON.md (not as a one-step
+// "New" button in the Build header strip — context-aware. Scheduled Tasks
+// open the dedicated cron modal so the entry lands in CRON.md (not as a one-step
 // workflow file). Workflows route through /api/builder/workflows. Owner is
 // read from the header's Owner picker — empty string means global.
 async function newFromBuildHeader() {
-  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'crons';
   if (activeTab === 'skills') {
     if (typeof resetBuilder === 'function') resetBuilder();
     var bi = document.getElementById('builder-input');
@@ -15659,7 +19759,7 @@ async function newFromBuildHeader() {
     toast('Pick a template to fork from the cards.', 'info');
     return;
   }
-  var owner = (document.getElementById('builder-owner') || {}).value || '';
+  var owner = getBuildCreateOwner();
   if (activeTab === 'crons') {
     if (typeof openCreateCronModal === 'function') {
       openCreateCronModal(owner);
@@ -15681,9 +19781,34 @@ async function newFromBuildHeader() {
   } catch (err) { toast('Create error: ' + err, 'error'); }
 }
 
+async function createScheduledWorkflowFromBuild() {
+  var owner = getBuildCreateOwner();
+  var name = prompt('Scheduled workflow name:');
+  if (!name || !name.trim()) return;
+  var schedule = prompt('Cron schedule:', '0 9 * * 1-5');
+  if (!schedule || !schedule.trim()) return;
+  var initialPrompt = prompt('First step prompt:', 'Describe what this scheduled workflow should do.');
+  if (!initialPrompt || !initialPrompt.trim()) return;
+  try {
+    var body = {
+      name: name.trim(),
+      schedule: schedule.trim(),
+      initialPrompt: initialPrompt.trim(),
+      description: 'Scheduled workflow',
+    };
+    if (owner) body.agent = owner;
+    var r = await apiJson('POST', '/api/builder/workflows', body);
+    if (r && r.id) {
+      toast('Created scheduled workflow: ' + name.trim(), 'success');
+      refreshCron();
+      if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+    }
+  } catch (err) { toast('Create error: ' + err, 'error'); }
+}
+
 // Owner picker — populated from /api/agents on first build-tab activation
-// and refreshed on demand. Empty value = Clementine/global; any other value
-// is the agent slug for scoped reads/writes.
+// and refreshed on demand. "__all__" means aggregate view, empty string means
+// Clementine/global, any other value is the agent slug for scoped reads/writes.
 var _builderOwnerPickerLoaded = false;
 async function populateBuilderOwnerPicker(force) {
   if (_builderOwnerPickerLoaded && !force) return;
@@ -15692,8 +19817,8 @@ async function populateBuilderOwnerPicker(force) {
   try {
     var r = await apiFetch('/api/agents');
     var agents = r.ok ? await r.json() : [];
-    var prev = sel.value;
-    var opts = '<option value="">Clementine (global)</option>';
+    var prev = sel.value || BUILD_OWNER_ALL;
+    var opts = '<option value="' + BUILD_OWNER_ALL + '">All agents</option><option value="">Clementine (global)</option>';
     if (Array.isArray(agents)) {
       for (var i = 0; i < agents.length; i++) {
         var slug = agents[i] && agents[i].slug;
@@ -15703,8 +19828,10 @@ async function populateBuilderOwnerPicker(force) {
       }
     }
     sel.innerHTML = opts;
-    if (prev) sel.value = prev;
+    sel.value = prev;
+    if (sel.value !== prev) sel.value = BUILD_OWNER_ALL;
     _builderOwnerPickerLoaded = true;
+    if (typeof onBuilderOwnerChange === 'function') onBuilderOwnerChange();
   } catch (err) {
     // Leave the default global option in place; not fatal.
   }
@@ -15715,11 +19842,18 @@ async function populateBuilderOwnerPicker(force) {
 // working, then refresh the canvas picker so the list re-filters.
 async function onBuilderOwnerChange() {
   var sel = document.getElementById('builder-owner');
-  var owner = sel ? sel.value : '';
+  var owner = sel ? sel.value : BUILD_OWNER_ALL;
+  var createOwner = getBuildCreateOwner();
   var hidden = document.getElementById('builder-agent');
   var label = document.getElementById('builder-agent-label');
-  if (hidden) hidden.value = owner || '';
-  if (label) label.textContent = owner ? 'Owner: ' + owner : '';
+  if (hidden) hidden.value = createOwner || '';
+  if (label) label.textContent = owner === BUILD_OWNER_ALL ? 'Viewing: all agents' : (owner ? 'Owner: ' + owner : 'Owner: global');
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'crons';
+  if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
+  if (activeTab === 'crons') {
+    if (typeof refreshCron === 'function') refreshCron();
+    return;
+  }
   var typeSel = document.getElementById('builder-type');
   var type = typeSel && typeSel.value === 'cron' ? 'cron' : 'workflow';
   await refreshBuilderCanvasPicker(type);
@@ -15770,16 +19904,19 @@ async function forkBuildTemplate(templateId) {
   var name = prompt('Name for the new workflow:', tpl.name);
   if (!name) return;
   try {
-    var r = await apiJson('POST', '/api/builder/workflows', {
+    var body = {
       name: name,
       description: tpl.description,
       schedule: tpl.schedule,
       initialPrompt: tpl.initialPrompt,
-    });
+    };
+    var owner = getBuildCreateOwner();
+    if (owner) body.agent = owner;
+    var r = await apiJson('POST', '/api/builder/workflows', body);
     if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
     if (r && r.id) {
-      switchBuildTab(tpl.schedule ? 'crons' : 'workflows');
-      refreshBuilderCanvasPicker(tpl.schedule ? 'cron' : 'workflow');
+      switchBuildTab('workflows');
+      refreshBuilderCanvasPicker('workflow');
       setTimeout(function() { openBuilderWorkflow(r.id); }, 200);
       toast('Forked template: ' + name, 'success');
     }
@@ -15809,8 +19946,8 @@ function openCommandK() {
     { kw: 'home chat',          page: 'home',     tab: 'chat',         label: 'Home · Chat' },
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
-    { kw: 'build workflows',    page: 'build',    tab: 'workflows',    label: 'Build · Workflows' },
-    { kw: 'build crons',        page: 'build',    tab: 'crons',        label: 'Build · Crons' },
+    { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
+    { kw: 'build crons scheduled tasks operations automation', page: 'build', tab: 'crons', label: 'Build · Operations' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
@@ -15874,7 +20011,7 @@ async function refreshUnleashed() {
     var tasks = d.tasks || [];
     var badge = document.getElementById('nav-unleashed-count');
     if (badge) {
-      var running = tasks.filter(function(t) { return t.status === 'running'; }).length;
+      var running = tasks.filter(function(t) { return t.live === true || t.runtimeState === 'active'; }).length;
       if (running > 0) { badge.style.display = ''; badge.textContent = String(running); }
       else { badge.style.display = 'none'; }
     }
@@ -15890,15 +20027,18 @@ async function refreshUnleashed() {
     html += '<th style="padding:8px 12px;text-align:right;color:var(--text-muted);font-weight:600">Action</th>';
     html += '</tr></thead><tbody>';
     tasks.forEach(function(t) {
-      var statusColor = t.status === 'running' ? 'var(--green)' : t.status === 'completed' ? 'var(--blue)' : t.status === 'cancelled' ? 'var(--text-muted)' : 'var(--orange)';
+      var effectiveStatus = t.effectiveStatus || t.status || 'unknown';
+      var statusColor = t.live ? 'var(--green)' : t.status === 'completed' ? 'var(--blue)' : t.status === 'cancelled' ? 'var(--text-muted)' : 'var(--orange)';
       html += '<tr style="border-bottom:1px solid var(--border)">';
       html += '<td style="padding:10px 12px;font-weight:600">' + esc(t.name || '—') + '</td>';
-      html += '<td style="padding:10px 12px"><span style="color:' + statusColor + ';font-size:11px;font-weight:600;text-transform:uppercase">' + esc(t.status || 'unknown') + '</span></td>';
+      html += '<td style="padding:10px 12px"><span style="color:' + statusColor + ';font-size:11px;font-weight:600;text-transform:uppercase">' + esc(effectiveStatus) + '</span></td>';
       html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.phase != null ? String(t.phase) : '—') + '</td>';
       html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.startedAt || '—') + '</td>';
       html += '<td style="padding:10px 12px;text-align:right">';
-      if (t.status === 'running') {
-        html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="cancelUnleashed(\\'' + esc(t.name) + '\\')">Cancel</button>';
+      if (t.live === true || t.runtimeState === 'active') {
+        html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="cancelUnleashed(\\'' + esc(t.runtimeName || t.name) + '\\')">Cancel</button>';
+      } else if (t.stale === true || t.runtimeState === 'stale') {
+        html += '<button class="btn-sm" style="font-size:11px" onclick="deleteUnleashedRuntime(\\'' + esc(t.runtimeName || t.name) + '\\')">Clean up</button>';
       }
       html += '</td></tr>';
     });
@@ -15948,15 +20088,28 @@ function switchTab(group, tab) {
   }
   // Tab-specific refresh
   if (group === 'intelligence') {
+    if (tab === 'overview' && typeof refreshBrainOverview === 'function') refreshBrainOverview();
     if (tab === 'graph') refreshGraph();
     if (tab === 'search') {
       // Consolidated Memory tab: search results + stats + MEMORY.md + recent writes + supersedes + coverage strip.
       refreshMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
+      if (typeof refreshCommitments === 'function') refreshCommitments();
+      if (typeof refreshLearnings === 'function') refreshLearnings();
       if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
-    if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
+    if (tab === 'files' && typeof refreshVaultFiles === 'function') {
+      if (typeof vaultRestoreFromHash === 'function') vaultRestoreFromHash();
+      refreshVaultFiles();
+    }
+    if (tab === 'sources') {
+      if (typeof brainLoadSources === 'function') brainLoadSources();
+      if (typeof brainLoadFeedConnectors === 'function') brainLoadFeedConnectors();
+      if (typeof brainLoadFeeds === 'function') brainLoadFeeds();
+    }
+    if (tab === 'runs' && typeof brainLoadRuns === 'function') brainLoadRuns();
     if (tab === 'health') {
       if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
       if (typeof refreshGraphStats === 'function') refreshGraphStats();
@@ -16778,7 +20931,104 @@ async function toggleCronJob(name) {
   try {
     await apiFetch('/api/cron/' + encodeURIComponent(name) + '/toggle', { method: 'POST' });
     toast('Toggled ' + name, 'success');
+    refreshCron();
+    if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('cron');
   } catch(e) { toast('Failed to toggle: ' + e, 'error'); }
+}
+
+async function toggleScheduledWorkflow(id) {
+  try {
+    var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id));
+    var d = await r.json();
+    if (!r.ok || !d.workflow) {
+      toast(d.error || 'Workflow not found', 'error');
+      refreshCron();
+      return;
+    }
+    d.workflow.enabled = d.workflow.enabled === false ? true : false;
+    var saved = await apiJson('PUT', '/api/builder/workflows/' + encodeURIComponent(id), { workflow: d.workflow, force: true });
+    if (saved && saved.ok !== false) {
+      refreshCron();
+      if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+    }
+  } catch(e) {
+    toast('Failed to toggle workflow: ' + e, 'error');
+    refreshCron();
+  }
+}
+
+async function runScheduledWorkflow(id) {
+  try {
+    await triggerWorkflowRun(id);
+    setTimeout(refreshCron, 1000);
+  } catch(e) { toast('Failed to run workflow: ' + e, 'error'); }
+}
+
+async function triggerWorkflowRun(id, approvedSideEffects) {
+  var payload = {};
+  if (approvedSideEffects) payload.approvedSideEffects = true;
+  var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id) + '/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  var d = await r.json();
+  if (r.status === 409 && d && d.error === 'approval_required') {
+    var sideEffects = (d.sideEffects || []).slice(0, 5).map(function(s) {
+      return '- ' + (s.id || 'step') + ' · ' + (s.kind || 'step') + (s.label ? ' · ' + s.label : '');
+    }).join('\\n');
+    if (!confirm((d.message || 'This workflow needs approval before side effects run.') + '\\n\\n' + sideEffects + '\\n\\nRun it now?')) {
+      toast('Workflow run cancelled before side effects.', 'info');
+      return null;
+    }
+    return triggerWorkflowRun(id, true);
+  }
+  if (d && d.ok) {
+    toast(d.message || 'Workflow triggered', 'success');
+    return d;
+  }
+  toast((d && (d.error || d.message)) || 'Workflow run failed', 'error');
+  return d;
+}
+
+async function runBuilderCanvasReal() {
+  if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
+  if (_builderSaveTimer) { clearTimeout(_builderSaveTimer); _builderSaveTimer = null; await _flushBuilderSave(); }
+  if (!confirm('Run this workflow through the real agent engine now? Mock Test is safer for validation; real runs can spend tokens and may request approval for side effects.')) return;
+  await triggerWorkflowRun(_builderCanvasOpenId);
+}
+
+function openScheduledWorkflow(id) {
+  switchBuildTab('workflows');
+  setTimeout(function() { openBuilderWorkflow(id); }, 120);
+}
+
+function confirmDeleteScheduledWorkflow(id, name) {
+  document.getElementById('confirm-message').textContent = 'Delete scheduled workflow "' + name + '"? This cannot be undone.';
+  const btn = document.getElementById('confirm-action');
+  btn.onclick = async () => {
+    await apiDelete('/api/builder/workflows/' + encodeURIComponent(id));
+    closeConfirmModal();
+    refreshCron();
+    if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+  };
+  document.getElementById('confirm-modal').classList.add('show');
+}
+
+async function cancelBackgroundTask(id) {
+  if (!confirm('Cancel background task "' + id + '"? It will stop immediately if pending, or at the next phase boundary if already running.')) return;
+  try {
+    await apiPost('/api/background-tasks/' + encodeURIComponent(id) + '/cancel');
+    setTimeout(refreshCron, 1000);
+  } catch(e) { toast('Failed to cancel background task: ' + e, 'error'); }
+}
+
+async function deleteBackgroundTask(id) {
+  if (!confirm('Remove background task "' + id + '" from the dashboard? This does not delete any scheduled task definition.')) return;
+  try {
+    await apiDelete('/api/background-tasks/' + encodeURIComponent(id));
+    setTimeout(refreshCron, 500);
+  } catch(e) { toast('Failed to clean up background task: ' + e, 'error'); }
 }
 
 // ── Theme ─────────────────────────────────
@@ -16816,6 +21066,7 @@ async function apiPost(url) {
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
     setTimeout(refreshAll, 1000);
+    return d;
   } catch(e) { toast(String(e), 'error'); }
 }
 async function apiJson(method, url, body) {
@@ -16839,7 +21090,82 @@ async function apiDelete(url) {
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
     setTimeout(refreshAll, 500);
+    return d;
   } catch(e) { toast(String(e), 'error'); }
+}
+
+function settingRequiresDaemonRestart(key) {
+  if (!key) return true;
+  if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') return false;
+  if (key.indexOf('ASSISTANT_') === 0) return false;
+  return true;
+}
+
+function renderRestartRequiredBanner() {
+  var reason = '';
+  try { reason = localStorage.getItem('clem-restart-required') || ''; } catch(e) { reason = ''; }
+  var existing = document.getElementById('restart-required-banner');
+  if (!reason) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.id = 'restart-required-banner';
+    existing.style.cssText = 'position:fixed;left:18px;right:18px;bottom:18px;z-index:9999;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);box-shadow:0 8px 28px rgba(0,0,0,0.28);padding:12px 14px;color:var(--text-primary)';
+    document.body.appendChild(existing);
+  }
+  existing.innerHTML = '<div style="min-width:220px;flex:1"><div style="font-weight:700;font-size:13px">Restart required</div>'
+    + '<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">' + esc(reason) + '</div></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+    + '<button class="btn-sm btn-primary" onclick="restartDaemonFromDashboard()">Restart Clementine</button>'
+    + '<button class="btn-sm" onclick="dismissRestartRequiredBanner()">Later</button>'
+    + '</div>';
+}
+
+function markRestartRequired(reason) {
+  var msg = reason || 'This change needs a Clementine restart before the daemon and channel workers use it.';
+  try { localStorage.setItem('clem-restart-required', msg); } catch(e) { /* ignore */ }
+  renderRestartRequiredBanner();
+}
+
+function clearRestartRequired() {
+  try { localStorage.removeItem('clem-restart-required'); } catch(e) { /* ignore */ }
+  var existing = document.getElementById('restart-required-banner');
+  if (existing) existing.remove();
+}
+
+function dismissRestartRequiredBanner() {
+  var existing = document.getElementById('restart-required-banner');
+  if (existing) existing.remove();
+}
+
+async function restartDaemonFromDashboard(skipConfirm) {
+  if (!skipConfirm && !confirm('Restart Clementine now? Active work may pause briefly while the daemon reloads.')) return;
+  toast('Restarting Clementine...', 'info');
+  try {
+    var r = await apiFetch('/api/restart', { method: 'POST' });
+    var d = {};
+    try { d = await r.json(); } catch(e) { d = {}; }
+    if (!r.ok || d.error) {
+      var err = String(d.error || 'Restart failed');
+      if (/not running/i.test(err)) {
+        var launch = await apiFetch('/api/launch', { method: 'POST' });
+        var launchData = await launch.json();
+        if (!launch.ok || launchData.error) throw new Error(launchData.error || 'Launch failed');
+        clearRestartRequired();
+        toast('Clementine started', 'success');
+        setTimeout(refreshAll, 2000);
+        return;
+      }
+      throw new Error(err);
+    }
+    clearRestartRequired();
+    toast('Clementine restart requested', 'success');
+    setTimeout(refreshAll, 2500);
+  } catch(e) {
+    toast('Restart failed: ' + String(e), 'error');
+  }
 }
 
 // ── Status + Overview ─────────────────────
@@ -17201,142 +21527,365 @@ function closeSessionModal() {
 
 // ── Cron Jobs ─────────────────────────────
 let cronJobsData = [];
-async function refreshCron() {
-  try {
-    const r = await apiFetch('/api/cron');
-    const d = await r.json();
-    cronJobsData = d.jobs || [];
-    document.getElementById('nav-cron-count').textContent = cronJobsData.length;
+let scheduledWorkflowData = [];
+let buildUsageByTask = {};
 
-    if (cronJobsData.length === 0) {
-      document.getElementById('panel-cron').innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div></div>';
+function jsStr(s) {
+  return String(s ?? '').replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'").replace(/\\r/g, '\\\\r').replace(/\\n/g, '\\\\n');
+}
+
+function durationLabel(ms) {
+  if (!ms || ms < 0) return '';
+  var mins = Math.floor(ms / 60000);
+  if (mins < 1) return '<1m';
+  if (mins < 60) return mins + 'm';
+  return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+}
+
+function mergeBuildUsageTasks(tasks) {
+  buildUsageByTask = {};
+  (tasks || []).forEach(function(t) {
+    var rawKey = t.taskKey || t.label;
+    if (!rawKey) return;
+    var key = (t.agentSlug ? (t.agentSlug + ':') : '') + rawKey;
+    if (!buildUsageByTask[key]) {
+      buildUsageByTask[key] = {
+        totalTokens: 0,
+        totalInput: 0,
+        totalOutput: 0,
+        costCents: 0,
+        queries: 0,
+        lastAt: '',
+      };
+    }
+    buildUsageByTask[key].totalTokens += t.totalTokens || 0;
+    buildUsageByTask[key].totalInput += t.totalInput || 0;
+    buildUsageByTask[key].totalOutput += t.totalOutput || 0;
+    buildUsageByTask[key].costCents += t.costCents || 0;
+    buildUsageByTask[key].queries += t.queries || 0;
+    if ((t.lastAt || '') > (buildUsageByTask[key].lastAt || '')) buildUsageByTask[key].lastAt = t.lastAt;
+  });
+}
+
+function buildUsageBadge(key, agentSlug) {
+  var usageKey = (agentSlug ? (agentSlug + ':') : '') + key;
+  var usage = buildUsageByTask[usageKey] || buildUsageByTask[key];
+  if (!usage || !usage.totalTokens) return '';
+  return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens)) + ' tok 7d</span>';
+}
+
+async function refreshBuildUsage() {
+  var host = document.getElementById('build-usage-panel');
+  if (!host) return;
+  try {
+    var r = await apiFetch('/api/build/usage?hours=168&limit=50');
+    var d = await r.json();
+    if (!d || d.ok === false) {
+      host.innerHTML = '<div class="empty-state" style="padding:10px;color:var(--text-muted)">Usage unavailable</div>';
       return;
     }
 
-    // Group jobs: main (no agent) first, then by agent slug
-    var groups = {};
-    for (const job of cronJobsData) {
-      var g = job.agent || '_main';
-      if (!groups[g]) groups[g] = [];
-      groups[g].push(job);
+    var owner = getBuildOwnerFilter();
+    var sessions = (d.sessions || []).filter(function(s) { return buildOwnerMatches(s.agentSlug || ''); });
+    var tasks = (d.tasks || []).filter(function(t) { return buildOwnerMatches(t.agentSlug || ''); });
+    mergeBuildUsageTasks(d.tasks || []);
+
+    function totalForOwner(rows, fallbackAll) {
+      if (owner === BUILD_OWNER_ALL) return fallbackAll || 0;
+      var match = (rows || []).filter(function(row) {
+        return owner ? row.agentSlug === owner : !row.agentSlug;
+      })[0];
+      return match ? (match.totalTokens || 0) : 0;
     }
-    var groupOrder = Object.keys(groups).sort(function(a, b) {
-      if (a === '_main') return -1;
-      if (b === '_main') return 1;
-      return a.localeCompare(b);
+    var visibleTokenTotal = totalForOwner(d.agents || [], d.totalTokens || 0);
+    var automationTokens = totalForOwner(d.taskAgents || [], (d.taskTotals && d.taskTotals.totalTokens) || 0);
+    var topSession = sessions[0] || null;
+    var scopeLabel = buildOwnerScopeLabel();
+    var agentTotals = {};
+    (d.agents || []).forEach(function(s) {
+      var key = s.agentSlug || 'global';
+      agentTotals[key] = s.totalTokens || 0;
     });
+    var agentBreakdown = Object.keys(agentTotals).sort(function(a, b) { return agentTotals[b] - agentTotals[a]; }).slice(0, 4);
+    var agentBreakdownHtml = owner === BUILD_OWNER_ALL && agentBreakdown.length
+      ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">' + agentBreakdown.map(function(k) { return esc(k) + ': ' + esc(formatTokens(agentTotals[k])); }).join(' · ') + '</div>'
+      : '';
 
-    let html = '';
-    for (var gi = 0; gi < groupOrder.length; gi++) {
-      var groupKey = groupOrder[gi];
-      var groupJobs = groups[groupKey];
-      var groupLabel = groupKey === '_main' ? 'Clementine' : groupKey.replace(/-/g, ' ').replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:10px">'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Workflow Builder</strong><span class="badge badge-purple">manual/mock</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Canvas tests are mock-safe. Use Run Real or schedule the workflow when it should execute.</div>'
+      + '</div>'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Scheduled Work</strong><span class="badge badge-green">recurring</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Enabled cards can spend tokens automatically. Toggle, run, or delete them here.</div>'
+      + '</div>'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em">Token Usage · 7d · ' + esc(scopeLabel) + '</div>'
+      + '<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px"><strong style="font-size:22px">' + esc(formatTokens(visibleTokenTotal)) + '</strong><span style="font-size:12px;color:var(--text-muted)">' + esc(formatTokens(automationTokens)) + ' scheduled work</span></div>'
+      + (topSession ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Top: ' + esc(topSession.label) + '</div>' : '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">No usage logged for this scope.</div>')
+      + agentBreakdownHtml
+      + '</div>'
+      + '</div>';
 
-      if (groupOrder.length > 1) {
-        var enabledCount = groupJobs.filter(function(j) { return j.enabled !== false; }).length;
-        html += '<div style="display:flex;align-items:center;gap:10px;margin:' + (gi > 0 ? '28px' : '0') + ' 0 12px">'
-          + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0">' + esc(groupLabel) + '</h3>'
-          + '<span style="font-size:12px;color:var(--text-muted)">' + enabledCount + ' of ' + groupJobs.length + ' active</span>'
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px">';
+    html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Highest Token Sessions</div>';
+    if (sessions.length === 0) {
+      html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No sessions in the last 7 days.</div>';
+    } else {
+      html += sessions.slice(0, 5).map(function(s) {
+        return '<div class="clickable-row" onclick="viewSessionModal(\\x27' + encodeURIComponent(s.sessionKey) + '\\x27)" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:9px 12px;border-bottom:1px solid var(--border)">'
+          + '<div style="min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.label) + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.kind) + (s.agentSlug ? ' · ' + esc(s.agentSlug) : '') + ' · ' + esc(timeAgo(s.lastAt)) + '</div></div>'
+          + '<div style="text-align:right"><div style="font-size:12px;font-weight:700">' + esc(formatTokens(s.totalTokens || 0)) + '</div>'
+          + '<div style="font-size:10px;color:var(--text-muted)">' + esc(formatTokens(s.totalInput || 0)) + ' in</div></div>'
           + '</div>';
-      }
+      }).join('');
+    }
+    html += '</div>';
 
-      html += '<div class="task-grid">';
-      for (const job of groupJobs) {
-        var enabled = job.enabled !== false;
-        var cardCls = 'task-card' + (enabled ? '' : ' disabled');
-        if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
-          cardCls += ' running';
-        }
-        var desc = describeCron(job.schedule || '');
-        var schedHtml = desc
-          ? esc(desc) + ' <code>' + esc(job.schedule) + '</code>'
-          : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
+    html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Scheduled Work Spend</div>';
+    if (tasks.length === 0) {
+      html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No scheduled or long-running task usage in the last 7 days.</div>';
+    } else {
+      html += tasks.slice(0, 5).map(function(t) {
+        var tab = t.targetTab === 'workflows' ? 'workflows' : 'crons';
+        return '<div class="clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27' + tab + '\\x27})" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:9px 12px;border-bottom:1px solid var(--border)">'
+          + '<div style="min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(t.label || t.taskKey) + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted)">' + esc(t.kind) + (t.controllable ? ' · controllable' : '') + '</div></div>'
+          + '<div style="text-align:right"><div style="font-size:12px;font-weight:700">' + esc(formatTokens(t.totalTokens || 0)) + '</div>'
+          + '<div style="font-size:10px;color:var(--text-muted)">' + esc(t.queries || 0) + ' calls</div></div>'
+          + '</div>';
+      }).join('');
+    }
+    html += '</div></div>';
 
-        var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
-        if (job.recentRuns && job.recentRuns.length > 0) {
-          var lr = job.recentRuns[0];
-          var statusIcon = lr.status === 'ok' ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
-          lastRunHtml = statusIcon + ' ' + esc(lr.status) + ' · ' + timeAgo(lr.finishedAt || lr.startedAt);
-        }
+    host.innerHTML = html;
+  } catch(e) {
+    host.innerHTML = '<div class="empty-state" style="padding:10px;color:var(--text-muted)">Failed to load token usage</div>';
+  }
+}
 
-        var badgesHtml = '';
-        var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
-        if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
-        if (job.agent) badgesHtml += '<span class="badge badge-orange">' + esc(job.agent) + '</span>';
-        if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
-        if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
-        if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
-        badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+function buildOpsOwnerMatches(owner) {
+  if (getBuildOwnerFilter() === BUILD_OWNER_ALL) return true;
+  return buildOwnerMatches(owner || '');
+}
 
-        var safeName = esc(job.name).replace(/'/g, '');
-        // Display name without agent prefix for cleaner cards
-        var displayName = job.agent ? job.name.replace(job.agent + ':', '') : job.name;
+function operationUsageBadge(usage) {
+  if (!usage || !usage.totalTokens) return '';
+  return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens || 0)) + ' tok 7d</span>';
+}
 
-        html += '<div class="' + cardCls + '">'
-          + '<div class="task-card-header">'
-          + '<strong>' + esc(displayName) + '</strong>'
-          + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + esc(job.name) + '\\x27)"><span class="toggle-slider"></span></label>'
-          + '</div>'
-          + '<div class="task-card-schedule">' + schedHtml + '</div>'
-          + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
-          + '<div class="task-card-status">' + lastRunHtml + '</div>'
-          + '<div class="task-card-badges">' + badgesHtml + '</div>'
-          + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(job.name) + '\\x27)">Run Now</button>'
-          + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
-          + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
-          + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
-          + '</div></div>';
-      }
-      // Add "new task" card only to the main group
-      if (groupKey === '_main') {
-        html += '<div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div>';
-      }
-      html += '</div>';
+function operationScheduleHtml(schedule) {
+  var desc = describeCron(schedule || '');
+  return desc ? esc(desc) + ' <code>' + esc(schedule) + '</code>' : '<code style="color:var(--accent)">' + esc(schedule || '') + '</code>';
+}
+
+function operationSectionHeader(title, subtitle, badgeClass, badgeText, marginTop) {
+  return '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:' + (marginTop || '0') + ' 0 12px;flex-wrap:wrap">'
+    + '<div><h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">' + esc(title) + '</h3>'
+    + '<div style="font-size:12px;color:var(--text-muted);line-height:1.4">' + esc(subtitle) + '</div></div>'
+    + (badgeText ? '<span class="badge ' + badgeClass + '">' + esc(badgeText) + '</span>' : '')
+    + '</div>';
+}
+
+function renderOperationsSummary(ops) {
+  var s = ops.summary || {};
+  return '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px">'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Needs Attention</div><div style="font-size:20px;font-weight:700;color:' + ((s.needsAttention || 0) > 0 ? 'var(--red)' : 'var(--green)') + '">' + esc(s.needsAttention || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tasks</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledTasks || 0) + '/' + esc(s.scheduledTasks || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Workflows</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledWorkflows || 0) + '/' + esc(s.scheduledWorkflows || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Running Now</div><div style="font-size:20px;font-weight:700;color:' + ((s.runningNow || 0) > 0 ? 'var(--blue)' : 'var(--text-primary)') + '">' + esc(s.runningNow || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tokens</div><div style="font-size:20px;font-weight:700">' + esc(formatTokens(s.automationTokens || 0)) + '</div></div>'
+    + '</div>';
+}
+
+function renderAttentionCard(item) {
+  var broken = item.brokenJob || null;
+  var runtime = item.runtime || {};
+  var jobName = broken ? broken.jobName : '';
+  var runtimeName = runtime.runtimeName || runtime.name || runtime.jobName || runtime.id || '';
+  var cardStyle = 'border-left:3px solid ' + (item.severity === 'critical' ? 'var(--red)' : 'var(--yellow)');
+  var title = item.title || jobName || runtimeName || 'Needs attention';
+  var detail = item.detail ? '<div class="task-card-prompt">' + esc(String(item.detail).slice(0, 240)) + '</div>' : '';
+  var diagnosisHtml = '';
+  if (broken && broken.diagnosis) {
+    var d = broken.diagnosis;
+    var proposed = d.proposedFix || {};
+    diagnosisHtml = '<div style="margin-top:8px;padding:8px;border-radius:6px;background:var(--bg-tertiary);font-size:12px;line-height:1.4">'
+      + '<strong>Diagnosis:</strong> ' + esc(d.rootCause || item.reason || '')
+      + (proposed.details ? '<br><strong>Fix:</strong> ' + esc(proposed.details) : '')
+      + '</div>';
+  }
+  var actions = '';
+  if (jobName) {
+    actions += '<button class="btn-sm" data-trace-job="' + esc(jobName) + '">Trace</button>';
+    if (item.type === 'broken_scheduled_task') {
+      actions += '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(jobName) + '\\x27)">Run Now</button>'
+        + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + jsStr(jobName) + '\\x27)">Edit</button>'
+        + '<button class="btn-sm" onclick="toggleCronJob(\\x27' + jsStr(jobName) + '\\x27)">Disable</button>';
+    }
+    if (item.actions && item.actions.applyFix) actions += '<button class="btn-sm btn-primary" onclick="applyBrokenJobFix(\\x27' + jsStr(jobName) + '\\x27)">Apply Fix</button>';
+    if (item.actions && item.actions.dismissDiagnosis) actions += '<button class="btn-sm" onclick="dismissBrokenJobDiagnosis(\\x27' + jsStr(jobName) + '\\x27)">Dismiss</button>';
+  }
+  if (item.source === 'runtime') {
+    if (item.actions && item.actions.cancel && runtimeName) actions += '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>';
+    if (item.actions && item.actions.cleanup && item.type === 'failed_runtime' && runtime.id && !runtime.jobName) actions += '<button class="btn-sm" onclick="deleteBackgroundTask(\\x27' + jsStr(runtime.id) + '\\x27)">Clean up</button>';
+    else if (item.actions && item.actions.cleanup && runtimeName) actions += '<button class="btn-sm" onclick="deleteUnleashedRuntime(\\x27' + jsStr(runtimeName) + '\\x27)">Clean up</button>';
+  }
+  return '<div class="task-card disabled" style="' + cardStyle + '">'
+    + '<div class="task-card-header"><strong>' + esc(title) + '</strong><span class="badge ' + (item.severity === 'critical' ? 'badge-red' : 'badge-yellow') + '">' + esc(item.status || 'review') + '</span></div>'
+    + '<div class="task-card-schedule">' + esc(item.ownerLabel || 'Clementine') + (item.lastAt ? ' · last issue ' + esc(timeAgo(item.lastAt)) : '') + '</div>'
+    + detail
+    + diagnosisHtml
+    + '<div class="task-card-badges"><span class="badge badge-yellow">needs attention</span><span class="badge badge-gray">' + esc(item.source === 'runtime' ? 'runtime' : 'scheduled task') + '</span>' + operationUsageBadge(item.usage) + '</div>'
+    + (actions ? '<div class="task-card-actions">' + actions + '</div>' : '')
+    + '</div>';
+}
+
+function renderScheduledTaskCard(task) {
+  var enabled = task.enabled !== false;
+  var cardCls = 'task-card' + (enabled ? '' : ' disabled') + (task.health === 'running' ? ' running' : '');
+  var style = task.health === 'broken' ? 'border-left:3px solid var(--red)' : task.health === 'failed' ? 'border-left:3px solid var(--yellow)' : '';
+  var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
+  if (task.lastRun) {
+    var lr = task.lastRun;
+    var ok = lr.status === 'ok';
+    var statusIcon = ok ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+    lastRunHtml = statusIcon + ' ' + esc(lr.status || 'unknown') + ' · ' + esc(timeAgo(lr.finishedAt || lr.startedAt || ''));
+  }
+  if (task.broken) {
+    lastRunHtml = '<span style="color:var(--red)">Needs attention</span> · ' + esc(task.broken.errorCount48h || 0) + '/' + esc(task.broken.totalRuns48h || 0) + ' failures';
+  }
+  var badges = '';
+  if (task.owner) badges += '<span class="badge badge-orange">' + esc(task.owner) + '</span>';
+  if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
+  if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
+  if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
+  badges += operationUsageBadge(task.usage);
+  badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+  badges += '<span class="badge ' + (task.health === 'broken' || task.health === 'failed' ? 'badge-yellow' : 'badge-gray') + '">' + esc(task.healthLabel || task.health) + '</span>';
+  var safeName = jsStr(task.name);
+  return '<div class="' + cardCls + '" style="' + style + '">'
+    + '<div class="task-card-header"><strong>' + esc(task.displayName || task.name) + '</strong>'
+    + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label></div>'
+    + '<div class="task-card-schedule">' + operationScheduleHtml(task.schedule) + '</div>'
+    + '<div class="task-card-prompt">' + esc(task.prompt || '') + '</div>'
+    + '<div class="task-card-status">' + lastRunHtml + '</div>'
+    + '<div class="task-card-badges">' + badges + '</div>'
+    + '<div class="task-card-actions">'
+    + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)">Run Now</button>'
+    + '<button class="btn-sm" data-trace-job="' + esc(task.name) + '">Trace</button>'
+    + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
+    + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
+    + '</div></div>';
+}
+
+function renderScheduledWorkflowCard(wf) {
+  var enabled = wf.enabled !== false;
+  var wfId = jsStr(wf.id);
+  var wfName = jsStr(wf.name);
+  var badges = '';
+  if (wf.owner) badges += '<span class="badge badge-orange">' + esc(wf.owner) + '</span>';
+  badges += '<span class="badge badge-purple">chained workflow</span>';
+  badges += '<span class="badge badge-gray">' + esc(wf.stepCount || 0) + ' steps</span>';
+  badges += operationUsageBadge(wf.usage);
+  badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+  return '<div class="task-card' + (enabled ? '' : ' disabled') + '">'
+    + '<div class="task-card-header"><strong>' + esc(wf.displayName || wf.name) + '</strong>'
+    + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleScheduledWorkflow(\\x27' + wfId + '\\x27)"><span class="toggle-slider"></span></label></div>'
+    + '<div class="task-card-schedule">' + operationScheduleHtml(wf.schedule) + '</div>'
+    + '<div class="task-card-prompt">' + esc(wf.description || ((wf.stepCount || 0) + ' step chained workflow')) + '</div>'
+    + '<div class="task-card-status">Run Now executes the real workflow engine. Canvas tests are mock-safe and stub prompt steps.</div>'
+    + '<div class="task-card-badges">' + badges + '</div>'
+    + '<div class="task-card-actions">'
+    + '<button class="btn-sm btn-success" onclick="runScheduledWorkflow(\\x27' + wfId + '\\x27)">Run Now</button>'
+    + '<button class="btn-sm" onclick="openScheduledWorkflow(\\x27' + wfId + '\\x27)">Open</button>'
+    + '<button class="btn-sm btn-danger" onclick="confirmDeleteScheduledWorkflow(\\x27' + wfId + '\\x27,\\x27' + wfName + '\\x27)">Del</button>'
+    + '</div></div>';
+}
+
+function renderRunningCard(item) {
+  var runtime = item.runtime || {};
+  var runtimeName = runtime.runtimeName || runtime.name || runtime.jobName || runtime.id || '';
+  var elapsed = '';
+  if (item.startedAt) elapsed = durationLabel(Date.now() - new Date(item.startedAt).getTime());
+  var cap = item.maxMinutes ? ' · max ' + item.maxMinutes + 'm' : item.maxHours ? ' · max ' + item.maxHours + 'h' : '';
+  return '<div class="task-card running">'
+    + '<div class="task-card-header"><strong>' + esc(item.title || runtimeName || 'running task') + '</strong><span class="badge badge-blue">' + esc(item.status || 'running') + '</span></div>'
+    + '<div class="task-card-schedule">' + esc(item.ownerLabel || 'Clementine') + (elapsed ? ' · running ' + esc(elapsed) : '') + cap + '</div>'
+    + '<div class="task-card-prompt">' + esc(item.promptPreview || '') + '</div>'
+    + '<div class="task-card-badges"><span class="badge badge-purple">' + esc(item.type) + '</span>' + operationUsageBadge(item.usage) + '</div>'
+    + '<div class="task-card-actions">'
+    + (item.type === 'background' ? '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(runtime.id || runtimeName) + '\\x27)">Cancel</button>' : '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>')
+    + '</div></div>';
+}
+
+async function refreshCron() {
+  try {
+    var r = await apiFetch('/api/build/operations?hours=168&limit=50');
+    var ops = await r.json();
+    if (!r.ok || !ops || ops.ok === false) throw new Error((ops && ops.error) || 'Build operations unavailable');
+    mergeBuildUsageTasks(ops.usageTasks || []);
+    cronJobsData = (ops.scheduledTasks || []).map(function(t) { return t.definition || {}; });
+    scheduledWorkflowData = (ops.scheduledWorkflows || []).map(function(w) { return w.definition || w; });
+
+    var totalScheduled = (ops.summary && (ops.summary.scheduledTasks + ops.summary.scheduledWorkflows)) || (cronJobsData.length + scheduledWorkflowData.length);
+    var navCount = document.getElementById('nav-cron-count');
+    if (navCount) navCount.textContent = totalScheduled;
+    var tabCount = document.getElementById('build-tab-cron-count');
+    if (tabCount) {
+      tabCount.textContent = totalScheduled;
+      tabCount.style.display = totalScheduled > 0 ? '' : 'none';
     }
 
-    // Fetch unleashed task status and append if any exist
-    try {
-      var ur = await apiFetch('/api/unleashed');
-      var ud = await ur.json();
-      var tasks = ud.tasks || [];
-      if (tasks.length > 0) {
-        html += '<h3 style="margin:24px 0 12px;font-size:14px;color:var(--text-secondary)">Unleashed Tasks</h3>';
-        html += '<table><tr><th>Task</th><th>Status</th><th>Phase</th><th>Duration</th><th style="width:80px"></th></tr>';
-        for (var ti = 0; ti < tasks.length; ti++) {
-          var t = tasks[ti];
-          var statusColors = { running: 'badge-blue', completed: 'badge-green', cancelled: 'badge-gray', timeout: 'badge-yellow', error: 'badge-red', max_phases: 'badge-yellow' };
-          var cls = statusColors[t.status] || 'badge-gray';
-          var badge = '<span class="badge ' + cls + '">' + esc(t.status) + '</span>';
-          var duration = '';
-          if (t.startedAt) {
-            var endTime = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
-            var mins = Math.round((endTime - new Date(t.startedAt).getTime()) / 60000);
-            duration = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
-          }
-          var cancelBtn = t.status === 'running'
-            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + esc(t.jobName) + '\\x27)">Cancel</button> '
-            : '';
-          var detailBtn = '<button class="btn-sm" onclick="toggleUnleashedDetail(\\x27' + esc(t.jobName) + '\\x27, this)">Details</button>';
-          html += '<tr>'
-            + '<td><strong>' + esc(t.jobName) + '</strong>'
-            + (t.lastPhaseOutputPreview ? '<br><span style="font-size:11px;color:var(--text-muted)">' + esc(t.lastPhaseOutputPreview.slice(0,80)) + '...</span>' : '')
-            + '</td>'
-            + '<td>' + badge + '</td>'
-            + '<td>' + (t.phase || 0) + '</td>'
-            + '<td>' + esc(duration) + (t.maxHours ? ' / ' + t.maxHours + 'h max' : '') + '</td>'
-            + '<td>' + cancelBtn + detailBtn + '</td>'
-            + '</tr>'
-            + '<tr class="unleashed-detail-row" id="unleashed-detail-' + esc(t.jobName).replace(/[^a-zA-Z0-9_-]/g,'_') + '" style="display:none"><td colspan="5"></td></tr>';
-        }
-        html += '</table>';
-      }
-    } catch(ue) { /* unleashed status is optional */ }
+    var panel = document.getElementById('panel-cron');
+    if (!panel) return;
 
-    document.getElementById('panel-cron').innerHTML = html;
+    var activeBuildTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || '';
+    var ownerScoped = currentPage === 'build' && activeBuildTab === 'crons';
+    var visibleAttention = ownerScoped ? (ops.needsAttention || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.needsAttention || []);
+    var visibleTasks = ownerScoped ? (ops.scheduledTasks || []).filter(function(t) { return buildOpsOwnerMatches(t.owner || ''); }) : (ops.scheduledTasks || []);
+    var visibleWorkflows = ownerScoped ? (ops.scheduledWorkflows || []).filter(function(w) { return buildOpsOwnerMatches(w.owner || ''); }) : (ops.scheduledWorkflows || []);
+    var visibleRunning = ownerScoped ? (ops.runningNow || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.runningNow || []);
+    var ownerFilter = getBuildOwnerFilter();
 
-    // Attach trace button handlers via delegation
-    document.getElementById('panel-cron').onclick = function(ev) {
+    var html = renderOperationsSummary(ops);
+    if (visibleAttention.length > 0) {
+      html += operationSectionHeader('Needs Attention', 'Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.', visibleAttention.length > 0 ? 'badge-yellow' : 'badge-gray', visibleAttention.length + ' review', '0')
+        + '<div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
+      if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
+    }
+
+    html += operationSectionHeader('Scheduled Tasks', 'Single recurring jobs from CRON.md. These are the default scheduled automation surface.', 'badge-blue', visibleTasks.length + ' task' + (visibleTasks.length === 1 ? '' : 's'), visibleAttention.length > 0 ? '28px' : '0')
+      + '<div class="task-grid">';
+    if (visibleTasks.length === 0) {
+      var emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled tasks across any agent.' : (ownerFilter ? 'No scheduled tasks for ' + ownerFilter + '.' : 'No global scheduled tasks.');
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>'
+        + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
+    } else {
+      html += visibleTasks.map(renderScheduledTaskCard).join('');
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>';
+    }
+    html += '</div>';
+
+    html += operationSectionHeader('Scheduled Workflows', 'A scheduled workflow is one scheduled trigger that runs chained steps. It is separate from CRON.md scheduled tasks.', 'badge-purple', visibleWorkflows.length + ' workflow' + (visibleWorkflows.length === 1 ? '' : 's'), '28px');
+    if (visibleWorkflows.length > 0) {
+      html += '<div class="task-grid">' + visibleWorkflows.map(renderScheduledWorkflowCard).join('') + '</div>';
+    } else {
+      html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No scheduled workflows in this scope. Build and schedule chained workflows from the Workflow Builder when a multi-step run is needed.</div>';
+    }
+
+    if (visibleRunning.length > 0) {
+      html += operationSectionHeader('Running Now', 'Live background, long-running, and unleashed work. These are executions, not scheduled definitions.', 'badge-blue', visibleRunning.length + ' active', '28px')
+        + '<div class="task-grid">' + visibleRunning.slice(0, 10).map(renderRunningCard).join('') + '</div>';
+      if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
+    }
+
+    panel.innerHTML = html;
+    panel.onclick = function(ev) {
       var target = ev.target;
       while (target && target.id !== 'panel-cron') {
         if (target.dataset && target.dataset.traceJob) {
@@ -17346,7 +21895,10 @@ async function refreshCron() {
         target = target.parentElement;
       }
     };
-  } catch(e) { }
+  } catch(e) {
+    var panel = document.getElementById('panel-cron');
+    if (panel) panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load Build operations: ' + esc(String(e)) + '</div>';
+  }
 }
 
 var traceData = [];
@@ -17471,8 +22023,18 @@ async function cancelUnleashed(jobName) {
   if (!confirm('Cancel unleashed task "' + jobName + '"?')) return;
   try {
     await apiPost('/api/unleashed/' + encodeURIComponent(jobName) + '/cancel');
+    if (typeof refreshUnleashed === 'function') refreshUnleashed();
     setTimeout(refreshCron, 1000);
   } catch(e) { toast('Failed to cancel: ' + e, 'error'); }
+}
+
+async function deleteUnleashedRuntime(jobName) {
+  if (!confirm('Remove runtime record "' + jobName + '" from the dashboard? This does not delete the scheduled task definition.')) return;
+  try {
+    await apiDelete('/api/unleashed/' + encodeURIComponent(jobName));
+    if (typeof refreshUnleashed === 'function') refreshUnleashed();
+    setTimeout(refreshCron, 500);
+  } catch(e) { toast('Failed to clean up: ' + e, 'error'); }
 }
 
 var unleashedDetailTimers = {};
@@ -17879,6 +22441,125 @@ async function deleteDelegation(id) {
 }
 
 // ── Heartbeat Queue ──────────────────────
+
+async function refreshHeartbeatControl() {
+  var container = document.getElementById('heartbeat-control-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/heartbeat/control');
+    var d = await r.json();
+    if (d.error) throw new Error(d.error);
+    var s = d.settings || {};
+    var state = d.state || {};
+    var queue = d.workQueue || { items: [] };
+    var agents = d.agents || [];
+    var topics = Array.isArray(state.reportedTopics) ? state.reportedTopics.slice(-8).reverse() : [];
+    var lastTick = state.timestamp ? fmtTimeAgo(state.timestamp) : 'Never';
+    var lastDiscord = state.lastDiscordMessageAt ? fmtTimeAgo(state.lastDiscordMessageAt) : 'None';
+    var silent = Number(state.consecutiveSilentBeats || 0);
+    var qItems = queue.items || [];
+
+    var html = '';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:var(--accent)">' + esc(lastTick) + '</div><div style="font-size:11px;color:var(--text-muted)">Last heartbeat</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:' + (silent > 0 ? 'var(--text-secondary)' : 'var(--green)') + '">' + silent + '</div><div style="font-size:11px;color:var(--text-muted)">Silent beats</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:' + ((queue.pending || 0) > 0 ? 'var(--yellow)' : 'var(--green)') + '">' + (queue.pending || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Queued work</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text-secondary)">' + esc(lastDiscord) + '</div><div style="font-size:11px;color:var(--text-muted)">Last Discord mention</div></div></div>';
+    html += '</div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start">';
+
+    html += '<div class="card"><div class="card-header">Controls</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Interval</label><input id="hb-control-interval" type="number" min="5" max="240" value="' + esc(String(s.intervalMinutes || 30)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Start</label><input id="hb-control-start" type="number" min="0" max="23" value="' + esc(String(s.activeStart ?? 8)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">End</label><input id="hb-control-end" type="number" min="0" max="23" value="' + esc(String(s.activeEnd ?? 22)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '</div>';
+    html += '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;color:var(--text-primary)"><input id="hb-control-web" type="checkbox" ' + (s.webAllowed ? 'checked' : '') + '> Allow web checks during heartbeat</label>';
+    html += '<label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;color:var(--text-primary)"><input id="hb-control-tier2" type="checkbox" ' + (s.allowTier2 ? 'checked' : '') + '> Allow Tier 2 actions when explicitly useful</label>';
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn-sm btn-primary" onclick="saveHeartbeatControl()">Save Controls</button><button class="btn-sm" onclick="apiPost(\\x27/api/restart\\x27)">Restart Daemon</button></div>';
+    html += '<div id="hb-control-status" style="font-size:11px;color:var(--text-muted);margin-top:8px">Timing changes apply after daemon restart.</div>';
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Standing Instructions</span><span style="font-size:11px;color:var(--text-muted)">' + esc(d.filePath || '') + '</span></div>';
+    html += '<div class="card-body" style="padding:16px">';
+    html += '<textarea id="hb-control-instructions" rows="18" style="width:100%;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;resize:vertical">' + esc(d.instructions || '') + '</textarea>';
+    html += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="btn-sm" onclick="refreshHeartbeatControl()">Discard</button><button class="btn-sm btn-primary" onclick="saveHeartbeatControl()">Save Instructions</button></div>';
+    html += '</div></div>';
+    html += '</div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:16px">';
+    html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Work Queue</span><button class="btn-sm btn-primary" onclick="openHeartbeatQueueModal(\\x27\\x27)">Queue Work</button></div><div class="card-body" style="padding:0">';
+    if (qItems.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No queued heartbeat work.</div>';
+    } else {
+      html += '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Status</th><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Work</th><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Owner</th></tr></thead><tbody>';
+      qItems.slice().reverse().slice(0, 12).forEach(function(item) {
+        var cls = item.status === 'completed' ? 'badge-green' : item.status === 'failed' ? 'badge-red' : item.status === 'running' ? 'badge-orange' : 'badge-gray';
+        html += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px"><span class="badge ' + cls + '" style="font-size:10px">' + esc(item.status || 'pending') + '</span></td><td style="padding:8px 12px;font-size:13px">' + esc(item.description || '') + '<div style="font-size:11px;color:var(--text-muted)">' + esc(fmtTimeAgo(item.queuedAt)) + '</div></td><td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + esc(item.agentSlug || 'Clementine') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header">Agent Heartbeats</div><div class="card-body" style="padding:0">';
+    if (agents.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No agent heartbeat state yet.</div>';
+    } else {
+      agents.slice(0, 12).forEach(function(a) {
+        html += '<div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">';
+        var lastLabel = a.lastTickAgoMs != null ? formatMs(a.lastTickAgoMs) + ' ago' : 'never';
+        var nextLabel = a.nextCheckInMs != null ? (Number(a.nextCheckInMs) <= 0 ? 'due' : 'in ' + formatMs(a.nextCheckInMs)) : 'unknown';
+        html += '<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.slug || '') + '</div><div style="font-size:11px;color:var(--text-muted)">Last ' + esc(lastLabel) + ' · Next ' + esc(nextLabel) + '</div></div>';
+        html += '<span class="badge ' + (a.isDue ? 'badge-orange' : 'badge-gray') + '" style="font-size:10px">' + esc(a.lastTickKind || (a.isDue ? 'due' : 'waiting')) + '</span>';
+        html += '</div>';
+      });
+    }
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header">Recently Reported Topics</div><div class="card-body" style="padding:0">';
+    if (topics.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No reported heartbeat topics yet.</div>';
+    } else {
+      topics.forEach(function(t) {
+        html += '<div style="padding:10px 14px;border-bottom:1px solid var(--border)"><div style="font-size:13px;font-weight:600">' + esc(t.topic || 'topic') + '</div><div style="font-size:11px;color:var(--text-muted)">' + esc(t.reportedAt ? fmtTimeAgo(t.reportedAt) : '') + (t.agentSlug ? ' · ' + esc(t.agentSlug) : '') + '</div></div>';
+      });
+    }
+    html += '</div></div>';
+    html += '</div>';
+
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load heartbeat controls: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveHeartbeatControl() {
+  var statusEl = document.getElementById('hb-control-status');
+  var body = {
+    intervalMinutes: Number(document.getElementById('hb-control-interval')?.value || 30),
+    activeStart: Number(document.getElementById('hb-control-start')?.value || 8),
+    activeEnd: Number(document.getElementById('hb-control-end')?.value || 22),
+    allowTier2: !!document.getElementById('hb-control-tier2')?.checked,
+    webAllowed: !!document.getElementById('hb-control-web')?.checked,
+    instructions: document.getElementById('hb-control-instructions')?.value || '',
+  };
+  try {
+    var r = await apiFetch('/api/heartbeat/control', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    var d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'Save failed');
+    if (statusEl) { statusEl.textContent = 'Saved. Restart daemon for schedule changes.'; statusEl.style.color = 'var(--green)'; }
+    toast('Heartbeat controls saved', 'success');
+    markRestartRequired('Heartbeat control changes need a Clementine restart before the schedule uses them.');
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'Save failed'; statusEl.style.color = 'var(--red)'; }
+    toast(String(e), 'error');
+  }
+}
 
 function openHeartbeatQueueModal(agentSlug) {
   document.getElementById('hbq-agent-slug').value = agentSlug || '';
@@ -19030,13 +23711,204 @@ async function listenToDigest() {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+async function refreshBudgetHealth() {
+  var container = document.getElementById('budget-health-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/budgets');
+    var d = await r.json();
+    if (!d.ok) {
+      container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load budget health: ' + esc(d.error || 'Unknown error') + '</div>';
+      return;
+    }
+    var context = d.context || {};
+    var mode = context.mode || 'auto';
+    var modeClass = mode === 'off' ? 'badge-green' : mode === 'on' ? 'badge-yellow' : 'badge-blue';
+    var rows = d.budgets || [];
+    var findings = d.findings || [];
+    var recentFailures = d.recentFailures || [];
+    var html = '<div class="card">'
+      + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
+      + '<div style="display:flex;align-items:center;gap:8px"><span>Spend Guards &amp; Context Health</span><span class="badge ' + modeClass + '" style="font-size:10px">1M ' + esc(mode) + '</span></div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
+      + '<button class="btn-sm btn-primary" onclick="applySafeBudgetPreset()">Safe Recovery</button>'
+      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27defaults\\x27)">Default Caps</button>'
+      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27uncapped\\x27)">No Spend Caps</button>'
+      + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27auto\\x27)">Smart Auto</button>'
+      + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27off\\x27)">Force 200K</button>'
+      + '<button class="btn-sm" onclick="forceBudgetOneMillion()">Force 1M</button>'
+      + '<button class="btn-sm" onclick="applyBudgetDoctorFix()">Doctor Fix</button>'
+      + '</div></div>'
+      + '<div class="card-body" style="padding:16px">';
+    html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">Spend guards are per-run dollar caps. They prevent runaway background work, but setting a cap to 0 removes that guard.</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:12px">';
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var inputId = 'budget-cap-' + String(row.key).replace(/[^A-Za-z0-9_-]/g, '-');
+      var rawValue = Number(row.value);
+      var inputValue = Number.isFinite(rawValue) ? String(rawValue) : '';
+      html += '<div style="border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">'
+        + '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0">' + esc(row.label) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(row.hint || row.key) + '</div></div>'
+        + '<span class="badge badge-gray" style="font-size:10px">' + esc(row.source || 'unknown') + '</span>'
+        + '</div>'
+        + '<div style="display:flex;gap:6px;align-items:center;margin-top:10px">'
+        + '<span style="font-size:13px;color:var(--text-muted)">$</span>'
+        + '<input id="' + inputId + '" type="number" min="0" step="0.05" value="' + esc(inputValue) + '" data-budget-key="' + esc(row.key) + '"'
+        + ' style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-primary);color:var(--text-primary);font-size:13px">'
+        + '<button class="btn-sm" onclick="saveBudgetCap(\\x27' + esc(row.key) + '\\x27)">Save</button>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">' + esc(row.key) + ' - ' + esc(row.displayValue || row.value || '') + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    html += '<div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px">'
+      + '<div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-primary)">'
+      + '<div style="font-weight:600;font-size:13px">1M context mode</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + esc(context.summary || '') + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Source: ' + esc(context.source || 'default')
+      + (context.legacyValue ? ' | legacy CLAUDE_CODE_DISABLE_1M_CONTEXT=' + esc(context.legacyValue) + ' from ' + esc(context.legacySource || 'default') : '')
+      + '</div></div>'
+      + '<div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-primary)">'
+      + '<div style="font-weight:600;font-size:13px">What this protects</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Safe Recovery lowers autonomous spend and disables 1M context for accounts seeing credit or entitlement errors.</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Restart the daemon after changing budgets or context mode.</div>'
+      + '</div></div>';
+    if (recentFailures.length) {
+      html += '<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">'
+        + '<div style="font-weight:600;font-size:13px;margin-bottom:6px">Recent chat failures</div>';
+      for (var rf = 0; rf < recentFailures.length; rf++) {
+        var fail = recentFailures[rf] || {};
+        html += '<div style="padding:8px 0;border-bottom:1px solid rgba(127,127,127,0.12)">'
+          + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          + '<span class="badge badge-yellow" style="font-size:10px">' + esc(fail.stage || 'failure') + '</span>'
+          + '<span style="font-size:11px;color:var(--text-muted)">' + esc(fail.createdAt || '') + '</span>'
+          + '</div>'
+          + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + esc(fail.error || '') + '</div>'
+          + (fail.textPreview ? '<div style="font-size:11px;color:var(--text-muted);margin-top:3px">Prompt: ' + esc(fail.textPreview) + '</div>' : '')
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    if (findings.length) {
+      html += '<div style="border-top:1px solid var(--border);padding-top:10px">'
+        + '<div style="font-weight:600;font-size:13px;margin-bottom:6px">Potential causes</div>';
+      for (var j = 0; j < findings.length; j++) {
+        var f = findings[j];
+        var cls = f.severity === 'error' ? 'badge-red' : f.severity === 'warning' ? 'badge-yellow' : 'badge-gray';
+        html += '<div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px solid rgba(127,127,127,0.12)">'
+          + '<span class="badge ' + cls + '" style="font-size:10px;min-width:54px;text-align:center">' + esc(f.severity || 'info') + '</span>'
+          + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.4">'
+          + (f.key ? '<code>' + esc(f.key) + '</code>: ' : '') + esc(f.message || '')
+          + (f.fix ? '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Fix: <code>' + esc(f.fix) + '</code></div>' : '')
+          + '</div></div>';
+      }
+      html += '</div>';
+    } else {
+      html += '<div style="font-size:12px;color:var(--text-muted);border-top:1px solid var(--border);padding-top:10px">No budget or context warnings found.</div>';
+    }
+    html += '</div></div>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load budget health: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function postBudgetAction(url, body) {
+  try {
+    var r = await apiFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    var d = await r.json();
+    if (d.ok) toast(d.message || 'Updated', 'success');
+    else toast(d.error || 'Error', 'error');
+    await refreshBudgetHealth();
+    return d;
+  } catch(e) {
+    toast(String(e), 'error');
+    return null;
+  }
+}
+
+async function applySafeBudgetPreset() {
+  var d = await postBudgetAction('/api/budgets/safe', {});
+  if (d && d.ok) markRestartRequired('Safe Recovery changed spend/context settings. Restart Clementine to apply them to chat and background workers.');
+  refreshSettings();
+}
+
+async function applyBudgetPreset(preset) {
+  if (preset === 'uncapped' && !confirm('Remove spend caps only? This does not disable 1M context. For 1M errors, use Safe Recovery or Force 200K.')) return;
+  var d = await postBudgetAction('/api/budgets/preset', { preset: preset });
+  if (d && d.ok) markRestartRequired('Spend guard changes need a Clementine restart before running workers use the new caps.');
+  refreshSettings();
+}
+
+async function saveBudgetCap(key) {
+  var inputId = 'budget-cap-' + String(key).replace(/[^A-Za-z0-9_-]/g, '-');
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  var value = Number(input.value);
+  if (!Number.isFinite(value) || value < 0) {
+    toast('Budget must be a non-negative dollar amount. Use 0 for no cap.', 'error');
+    return;
+  }
+  var d = await postBudgetAction('/api/budgets/set', { key: key, value: value });
+  if (d && d.ok) markRestartRequired('Budget cap changes need a Clementine restart before running workers use the new value.');
+  refreshSettings();
+}
+
+async function setBudgetContextMode(mode) {
+  var d = await postBudgetAction('/api/budgets/1m', { mode: mode });
+  if (d && d.ok) markRestartRequired('1M context changes need a Clementine restart before new Claude calls use the setting.');
+  refreshSettings();
+}
+
+async function forceBudgetOneMillion() {
+  if (!confirm('Force 1M context on? Sonnet and Pro subscriptions may require Claude Extra Usage.')) return;
+  await setBudgetContextMode('on');
+}
+
+async function applyBudgetDoctorFix() {
+  var d = await postBudgetAction('/api/budgets/doctor-fix', {});
+  if (d && d.ok && d.result && d.result.changed && d.result.changed.length) {
+    markRestartRequired('Doctor Fix changed Clementine configuration. Restart Clementine to apply the fixes.');
+  }
+  refreshSettings();
+}
+
 async function refreshSettings() {
   var container = document.getElementById('settings-content');
+  refreshBudgetHealth();
   try {
     var r = await apiFetch('/api/settings');
     var d = await r.json();
+    var prefResp = await apiFetch('/api/assistant-preferences');
+    var prefData = await prefResp.json();
+    var prefs = prefData.preferences || {};
     var groups = d.groups || [];
     var html = '';
+    function prefSelect(id, value, options) {
+      var out = '<select id="' + id + '" onchange="saveAssistantPreferences()" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">';
+      for (var i = 0; i < options.length; i++) {
+        var opt = options[i];
+        out += '<option value="' + esc(opt) + '"' + (value === opt ? ' selected' : '') + '>' + esc(opt) + '</option>';
+      }
+      return out + '</select>';
+    }
+    html += '<div class="card" style="margin-bottom:16px">'
+      + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">'
+      + '<span>Assistant Experience</span>'
+      + '<span id="assistant-pref-status" style="font-size:11px;color:var(--text-muted)"></span>'
+      + '</div><div class="card-body" style="padding:16px">'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px">'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Proactivity</label>' + prefSelect('pref-proactivity', prefs.proactivity || 'balanced', ['quiet','balanced','proactive','operator']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Response style</label>' + prefSelect('pref-response-style', prefs.responseStyle || 'balanced', ['concise','balanced','detailed']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Progress updates</label>' + prefSelect('pref-progress-visibility', prefs.progressVisibility || 'normal', ['quiet','normal','detailed']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Autonomy</label>' + prefSelect('pref-autonomy', prefs.autonomy || 'balanced', ['ask_first','balanced','act_when_safe']) + '</div>'
+      + '</div></div></div>';
     for (var g of groups) {
       var anySet = g.fields.some(function(f) { return f.isSet; });
       var isAnthropicGroup = g.label === 'Anthropic';
@@ -19107,8 +23979,7 @@ async function refreshSettings() {
       + '</div></div>';
 
     html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">'
-      + '<strong>Note:</strong> Changes to API keys require a daemon restart to take effect. '
-      + 'Use <code>clementine restart</code> after updating channel tokens.'
+      + '<strong>Note:</strong> Changes that require a daemon restart show a Restart Clementine prompt here in the dashboard.'
       + '</div>';
     container.innerHTML = html;
 
@@ -19171,7 +24042,26 @@ async function toggleSetting(el) {
 async function saveSettingValue(key, value) {
   var statusEl = document.getElementById('setting-' + key + '-status');
   try {
-    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    var result = await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' changed. Restart Clementine so the daemon and channel workers use the new value.');
+    }
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
+async function saveAssistantPreferences() {
+  var statusEl = document.getElementById('assistant-pref-status');
+  var body = {
+    proactivity: document.getElementById('pref-proactivity')?.value || 'balanced',
+    responseStyle: document.getElementById('pref-response-style')?.value || 'balanced',
+    progressVisibility: document.getElementById('pref-progress-visibility')?.value || 'normal',
+    autonomy: document.getElementById('pref-autonomy')?.value || 'balanced',
+  };
+  try {
+    await apiJson('PUT', '/api/assistant-preferences', body);
     if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
   } catch(e) {
     if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
@@ -19181,8 +24071,11 @@ async function saveSettingValue(key, value) {
 async function removeSetting(key) {
   if (!confirm('Remove ' + key + ' from .env?')) return;
   try {
-    await apiDelete('/api/settings/' + encodeURIComponent(key));
+    var result = await apiDelete('/api/settings/' + encodeURIComponent(key));
     toast(key + ' removed', 'success');
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' was removed. Restart Clementine so running workers stop using the old value.');
+    }
     refreshSettings();
   } catch(e) { toast('Failed: ' + e, 'error'); }
 }
@@ -19212,8 +24105,11 @@ async function addCustomEnv() {
   if (!key || !value) { toast('Both key and value are required', 'error'); return; }
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) { toast('Invalid key format — use UPPER_SNAKE_CASE', 'error'); return; }
   try {
-    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    var result = await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
     toast(key + ' added', 'success');
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' was added. Restart Clementine so the daemon and channel workers can use it.');
+    }
     keyInput.value = '';
     valInput.value = '';
     refreshSettings();
@@ -19354,46 +24250,95 @@ async function sendChat() {
   sendBtn.disabled = true;
   sendBtn.textContent = 'Thinking...';
 
-  try {
-    const r = await apiFetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg }),
-    });
-    const d = await r.json();
+	  try {
+	    var asstRow = document.createElement('div');
+	    asstRow.className = 'chat-assistant-row';
+	    var chatAv = document.createElement('div');
+	    chatAv.className = 'chat-avatar-sm';
+	    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
+	    asstRow.appendChild(chatAv);
+	    var asstBubble = document.createElement('div');
+	    asstBubble.className = 'chat-bubble assistant';
+	    asstBubble.innerHTML = '<span style="color:var(--text-muted);font-style:italic">connecting...</span>';
+	    var asstMeta = document.createElement('div');
+	    asstMeta.className = 'chat-meta';
+	    asstMeta.textContent = new Date().toLocaleTimeString();
+	    asstRow.appendChild(asstBubble);
+	    container.appendChild(asstRow);
+	    typing.remove();
+	    container.scrollTop = container.scrollHeight;
 
-    typing.remove();
-
-    var asstRow = document.createElement('div');
-    asstRow.className = 'chat-assistant-row';
-    var chatAv = document.createElement('div');
-    chatAv.className = 'chat-avatar-sm';
-    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
-    asstRow.appendChild(chatAv);
-    var asstBubble = document.createElement('div');
-    asstBubble.className = 'chat-bubble assistant';
-    asstBubble.innerHTML = renderMd(d.response || d.error || 'No response');
-    var asstMeta = document.createElement('div');
-    asstMeta.className = 'chat-meta';
-    asstMeta.textContent = new Date().toLocaleTimeString();
-    asstBubble.appendChild(asstMeta);
-    // Recall trace affordance — shows which memory chunks powered this answer.
-    if (d.trace && d.trace.chunkCount > 0) {
-      var traceLink = document.createElement('div');
-      traceLink.className = 'chat-trace-link';
-      traceLink.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-muted);cursor:pointer;user-select:none';
-      traceLink.textContent = '🧠 ' + d.trace.chunkCount + ' source' + (d.trace.chunkCount === 1 ? '' : 's');
-      traceLink.dataset.traceId = String(d.trace.id);
-      traceLink.dataset.expanded = 'false';
-      traceLink.onclick = function() { toggleRecallTrace(traceLink); };
-      asstBubble.appendChild(traceLink);
-    }
-    asstRow.appendChild(asstBubble);
-    container.appendChild(asstRow);
-  } catch(e) {
-    typing.remove();
-    const errBubble = document.createElement('div');
-    errBubble.className = 'chat-bubble assistant';
+	    var finalText = '';
+	    var finalTrace = null;
+	    var sawStream = false;
+	    var r = await fetch('/api/chat/stream', {
+	      method: 'POST',
+	      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _dashToken },
+	      body: JSON.stringify({ message: msg }),
+	    });
+	    if (!r.ok || !r.body) {
+	      var fallback = await r.text();
+	      throw new Error(fallback || ('HTTP ' + r.status));
+	    }
+	    var reader = r.body.getReader();
+	    var decoder = new TextDecoder();
+	    var buffer = '';
+	    function renderAssistantText(text) {
+	      asstBubble.innerHTML = renderMd(text || 'Working...');
+	      container.scrollTop = container.scrollHeight;
+	    }
+	    function appendTrace(trace) {
+	      if (!trace || !trace.chunkCount) return;
+	      var traceLink = document.createElement('div');
+	      traceLink.className = 'chat-trace-link';
+	      traceLink.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-muted);cursor:pointer;user-select:none';
+	      traceLink.textContent = '🧠 ' + trace.chunkCount + ' source' + (trace.chunkCount === 1 ? '' : 's');
+	      traceLink.dataset.traceId = String(trace.id);
+	      traceLink.dataset.expanded = 'false';
+	      traceLink.onclick = function() { toggleRecallTrace(traceLink); };
+	      asstBubble.appendChild(traceLink);
+	    }
+	    function handleEvent(evt) {
+	      if (!evt) return;
+	      sawStream = true;
+	      if (evt.type === 'text') {
+	        finalText = evt.text || '';
+	        renderAssistantText(finalText);
+	      } else if (evt.type === 'progress') {
+	        if (!finalText) renderAssistantText('*' + (evt.status || 'working...') + '*');
+	      } else if (evt.type === 'tool') {
+	        if (!finalText) renderAssistantText('*using ' + (evt.name || 'a tool') + '...*');
+	      } else if (evt.type === 'done') {
+	        finalText = evt.response || finalText || 'No response';
+	        finalTrace = evt.trace || null;
+	        renderAssistantText(finalText);
+	      } else if (evt.type === 'error') {
+	        throw new Error(evt.error || 'Stream error');
+	      }
+	    }
+	    while (true) {
+	      var read = await reader.read();
+	      if (read.done) break;
+	      buffer += decoder.decode(read.value, { stream: true });
+	      var parts = buffer.split('\\n\\n');
+	      buffer = parts.pop() || '';
+	      for (var i = 0; i < parts.length; i++) {
+	        var line = parts[i].split('\\n').find(function(l) { return l.indexOf('data: ') === 0; });
+	        if (!line) continue;
+	        handleEvent(JSON.parse(line.slice(6)));
+	      }
+	    }
+	    if (buffer.trim()) {
+	      var line = buffer.split('\\n').find(function(l) { return l.indexOf('data: ') === 0; });
+	      if (line) handleEvent(JSON.parse(line.slice(6)));
+	    }
+	    if (!sawStream && !finalText) renderAssistantText('No response');
+	    asstBubble.appendChild(asstMeta);
+	    appendTrace(finalTrace);
+	  } catch(e) {
+	    if (typing.parentNode) typing.remove();
+	    const errBubble = document.createElement('div');
+	    errBubble.className = 'chat-bubble assistant';
     errBubble.style.borderLeft = '3px solid var(--red)';
     errBubble.textContent = 'Error: ' + String(e);
     container.appendChild(errBubble);
@@ -19555,6 +24500,8 @@ async function saveUserModelSlot(slot) {
 async function seedUserModel() {
   var seedPanel = document.getElementById('user-model-seed-panel');
   if (!seedPanel) return;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : null;
   seedPanel.style.display = 'block';
   seedPanel.innerHTML =
     '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b)">'
@@ -19565,7 +24512,7 @@ async function seedUserModel() {
     var r = await apiFetch('/api/user-model/seed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({ agentSlug: agentSlug }),
     });
     var d = await r.json();
     if (!d.ok || !d.proposals) {
@@ -19865,7 +24812,7 @@ function openSkillStudio() {
   // Pre-set type to skill before navigating
   var typeSelect = document.getElementById('builder-type');
   if (typeSelect) typeSelect.value = 'skill';
-  navigateTo('builder');
+  navigateTo('build', { tab: 'skills' });
   // Update the UI for skill mode
   updateBuilderMode();
   // Show skill-specific empty state
@@ -19892,6 +24839,7 @@ function updateBuilderMode() {
   var validateBtn = document.getElementById('builder-canvas-validate-btn');
   var dryrunBtn = document.getElementById('builder-canvas-dryrun-btn');
   var paneTitle = document.getElementById('builder-right-pane-title');
+  var realRunBtn = document.getElementById('builder-canvas-real-run-btn');
 
   if (type === 'skill') {
     if (title) title.textContent = 'Skill Studio';
@@ -19913,7 +24861,8 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = '';
     if (dryrunBtn) dryrunBtn.style.display = '';
     if (testBtn) testBtn.style.display = '';
-    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Crons' : 'Workflows');
+    if (realRunBtn) realRunBtn.style.display = type === 'workflow' ? '' : 'none';
+    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflow Builder');
     refreshBuilderCanvasPicker(type);
   } else {
     if (preview) preview.style.display = '';
@@ -19922,6 +24871,7 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = 'none';
     if (dryrunBtn) dryrunBtn.style.display = 'none';
     if (testBtn) testBtn.style.display = 'none';
+    if (realRunBtn) realRunBtn.style.display = 'none';
     if (paneTitle) paneTitle.textContent = 'Live Preview';
     closeBuilderCanvas();
   }
@@ -19951,18 +24901,14 @@ async function refreshBuilderCanvasPicker(type) {
   var picker = document.getElementById('builder-canvas-picker');
   if (!picker) return;
   try {
-    var owner = (document.getElementById('builder-owner') || {}).value || '';
+    var owner = getBuildOwnerFilter();
     var r = await apiFetch('/api/builder/workflows');
     var d = await r.json();
     var items = (d.workflows || []).filter(function(w) {
       if (w.origin !== type) return false;
-      // Owner filter: empty owner = Clementine/global only; named owner =
-      // agent-scoped entries for that slug only. The serializer reports
-      // scope='agent' for entries living under <AGENTS_DIR>/<slug>/.
-      if (owner) return w.scope === 'agent' && w.agentSlug === owner;
-      return w.scope !== 'agent';
+      return buildOwnerMatches(w.agentSlug || '');
     });
-    var ownerLabel = owner ? '@' + owner : 'global';
+    var ownerLabel = owner === BUILD_OWNER_ALL ? 'all agents' : (owner ? '@' + owner : 'global');
     var opts = '<option value="">' + (items.length ? '— pick a ' + type + ' (' + ownerLabel + ') —' : '(none yet for ' + ownerLabel + ')') + '</option>';
     for (var i = 0; i < items.length; i++) {
       var w = items[i];
@@ -20201,7 +25147,7 @@ async function validateBuilderCanvas() {
 async function deleteCurrentBuilderWorkflow() {
   if (!_builderCanvasOpenId) return;
   if (!_builderCanvasOpenId.startsWith('workflow:')) {
-    toast('Cron entries can\\x27t be deleted from here — disable instead.', 'info');
+    toast('Scheduled tasks can\\x27t be deleted from here — disable instead.', 'info');
     return;
   }
   var name = _builderCanvasOpenId.replace(/^workflow:/, '');
@@ -20495,7 +25441,7 @@ var _builderRunStepResults = {};
 
 async function testBuilderCanvas() {
   if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
-  if (_builderActiveRunId) { toast('A test is already running', 'info'); return; }
+  if (_builderActiveRunId) { toast('A mock test is already running', 'info'); return; }
   // Always flush any pending save so the test sees the latest graph
   if (_builderSaveTimer) { clearTimeout(_builderSaveTimer); _builderSaveTimer = null; await _flushBuilderSave(); }
   _clearRunVisualState();
@@ -20507,9 +25453,9 @@ async function testBuilderCanvas() {
     var cancel = document.getElementById('builder-canvas-cancel-btn');
     if (cancel) cancel.style.display = '';
     _setBuilderSaveStatus('saved');  // override status with a more useful one below
-    _setRunFooter('Running test… (' + r.runId.slice(0, 8) + ')');
+    _setRunFooter('Running mock test… (' + r.runId.slice(0, 8) + ')');
   } catch (err) {
-    toast('Test failed to start: ' + err, 'error');
+    toast('Mock test failed to start: ' + err, 'error');
   }
 }
 
@@ -20545,7 +25491,7 @@ function _findNodeElForStepId(stepId) {
 function _onRunEvent(evt) {
   if (!evt || !evt.runId || evt.workflowId !== _builderCanvasOpenId) return;
   if (evt.type === 'run:started') {
-    _setRunFooter('Running test… (' + evt.runId.slice(0, 8) + ')');
+    _setRunFooter('Running mock test… (' + evt.runId.slice(0, 8) + ')');
     return;
   }
   if (evt.type === 'run:step-status') {
@@ -20568,7 +25514,7 @@ function _onRunEvent(evt) {
     _builderActiveRunId = null;
     var cancel = document.getElementById('builder-canvas-cancel-btn');
     if (cancel) cancel.style.display = 'none';
-    _setRunFooter('Test ' + ec + ' in ' + dur + 'ms — click a node for output');
+    _setRunFooter('Mock test ' + ec + ' in ' + dur + 'ms — click a node for output');
     return;
   }
 }
@@ -20675,7 +25621,7 @@ async function editSkillInBuilder(name, agentSlug) {
     if (d.error) { toast(d.error, 'error'); return; }
 
     // Switch to builder page
-    navigateTo('builder');
+    navigateTo('build', { tab: 'skills' });
 
     // Set type to skill
     var typeSelect = document.getElementById('builder-type');
@@ -20728,12 +25674,35 @@ async function editSkillInBuilder(name, agentSlug) {
   }
 }
 
+function builderEmptyStateHtml(type) {
+  if (type === 'skill') {
+    return '<div class="empty-state" style="margin-top:40px">'
+      + '<p style="color:var(--text-muted);margin-bottom:8px;font-size:15px;font-weight:600">Skill Studio</p>'
+      + '<p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">Teach a new skill by describing it, attach reference files, link tools, test it, then save.</p>'
+      + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for deploying to production — run tests, build, push, verify\\x27)">Deploy to prod</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for writing a weekly status report from git commits and calendar\\x27)">Weekly status report</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for onboarding a new team member — set up accounts, send welcome email\\x27)">Onboard team member</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for researching a company before a sales call\\x27)">Company research</button>'
+      + '</div></div>';
+  }
+  return '<div class="empty-state" style="margin-top:40px">'
+    + '<p style="color:var(--text-muted);margin-bottom:12px">Describe the workflow you want to build.</p>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that reviews open PRs, summarizes risk, and sends a digest\\x27)">PR review digest</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that collects leads, scores them against my ICP, and prepares outreach drafts\\x27)">Lead research flow</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that reviews recent notes, extracts open items, and drafts next priorities\\x27)">Weekly review workflow</button>'
+    + '</div></div>';
+}
+
 function resetBuilder() {
   builderArtifact = null;
   builderSending = false;
   _builderLinkedTools = [];
+  var type = (document.getElementById('builder-type') || {}).value || 'workflow';
   var msgs = document.getElementById('builder-messages');
-  if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create an SDR agent that researches leads and drafts outreach emails\\x27)">SDR agent</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button></div></div>';
+  if (msgs) msgs.innerHTML = builderEmptyStateHtml(type);
   var preview = document.getElementById('builder-preview');
   if (preview) preview.innerHTML = '<div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>';
   var saveBtn = document.getElementById('builder-save-btn');
@@ -20747,24 +25716,19 @@ function resetBuilder() {
   _builderAttachments = [];
   renderBuilderAttachments();
   // Tell server to reset session so next message gets the full prefix
-  var type = (document.getElementById('builder-type') || {}).value;
   var agent = (document.getElementById('builder-agent') || {}).value;
   apiJson('POST', '/api/builder/reset', { artifactType: type, agentSlug: agent || undefined }).catch(function(){});
 }
 
 function builderQuick(text) {
   var sel = document.getElementById('builder-type');
-  var lower = text.toLowerCase();
-  if (lower.includes('agent') || lower.includes('hire') || lower.includes('team member') || lower.includes('sdr')) {
-    sel.value = 'agent';
-  } else if (lower.includes('workflow') || lower.includes('pipeline') || lower.includes('multi-step')) {
-    sel.value = 'workflow';
-  } else if (lower.includes('cron') || lower.includes('scheduled') || lower.includes('every')) {
-    sel.value = 'cron';
-  } else {
-    sel.value = 'skill';
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (sel) {
+    sel.value = activeTab === 'skills' ? 'skill' : activeTab === 'crons' ? 'cron' : 'workflow';
   }
-  document.getElementById('builder-input').value = text;
+  if (typeof updateBuilderMode === 'function') updateBuilderMode();
+  var input = document.getElementById('builder-input');
+  if (input) input.value = text;
   sendBuilderChat();
 }
 
@@ -21014,18 +25978,12 @@ function refreshBuilderAgents(preselect) {
   var hidden = document.getElementById('builder-agent');
   var label = document.getElementById('builder-agent-label');
   if (!hidden || !label) return;
-  hidden.value = preselect || '';
-  if (!preselect) {
-    label.textContent = 'Clementine (global)';
+  if (typeof onBuilderOwnerChange === 'function') {
+    onBuilderOwnerChange();
     return;
   }
-  // Look up agent name from sidebar
-  var teamItem = document.querySelector('.team-nav-item[data-slug="' + preselect + '"] span');
-  if (teamItem) {
-    label.textContent = teamItem.textContent;
-  } else {
-    label.textContent = preselect;
-  }
+  hidden.value = preselect || '';
+  label.textContent = preselect || 'Clementine (global)';
 }
 
 // ── Builder Linked Tools ──────────────────
@@ -21152,6 +26110,13 @@ function parseSearchFilters(raw) {
     return '';
   }).replace(/\s+/g, ' ').trim();
   return { q: cleaned, filters: filters };
+}
+
+function runMemoryDetailSearch() {
+  var detail = document.getElementById('memory-detail-search-input');
+  var header = document.getElementById('memory-search-input');
+  if (header && detail) header.value = detail.value;
+  runMemorySearch();
 }
 
 async function runMemorySearch() {
@@ -21492,6 +26457,9 @@ async function submitQuickAddMemory() {
     setTimeout(function() {
       closeQuickAddMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
+      if (typeof refreshCommitments === 'function') refreshCommitments();
+      if (typeof refreshLearnings === 'function') refreshLearnings();
       if (typeof refreshMemory === 'function') refreshMemory();
     }, 600);
   } catch (err) {
@@ -21511,7 +26479,7 @@ async function refreshCoverageStrip() {
     if (!d.ok || !d.health) { el.innerHTML = ''; return; }
     var h = d.health;
     var total = (h.chunks && h.chunks.total) || 0;
-    var de = h.denseEmbeddings || { withDense: 0, total: total, currentModel: '', ready: false };
+    var de = h.denseEmbeddings || { withDense: 0, total: total, currentModel: '', ready: false, installed: false, cacheSize: '0 B' };
     var sparseCovered = (h.chunks && h.chunks.withSparseEmbedding != null) ? h.chunks.withSparseEmbedding : null;
     var densePct = de.total > 0 ? Math.round((de.withDense / de.total) * 100) : 0;
     var sparsePct = (sparseCovered != null && total > 0) ? Math.round((sparseCovered / total) * 100) : null;
@@ -21523,7 +26491,26 @@ async function refreshCoverageStrip() {
     if (sparsePct != null) html += '<span><span style="color:#10b981">●</span> Sparse ' + sparsePct + '%</span>';
     html += '<span><span style="color:' + denseColor + '">●</span> Dense ' + densePct + '%'
       + (modelLabel ? ' <span style="color:var(--text-muted)">(' + esc(modelLabel) + ')</span>' : '') + '</span>';
-    if (de.total > 0 && de.withDense < de.total) {
+    if (!de.installed) {
+      html += '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+        + '<span style="color:#f59e0b">Model not installed</span>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')">Install model</button>'
+        + '</span>';
+    } else if (!de.ready) {
+      html += '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+        + '<span style="color:#f59e0b">Model not verified</span>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')">Verify model</button>'
+        + '</span>';
+    } else if (!de.ready) {
+      html += '<div class="card" style="margin-bottom:16px;border-left:3px solid #f59e0b">';
+      html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="flex:1;min-width:240px">';
+      html += '<div style="font-weight:600;margin-bottom:4px">Embedding model is cached but has not been verified in this daemon</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">Run a quick load check to confirm the local model is usable before relying on dense recall.</div>';
+      html += '</div>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')" title="Load and verify the cached model">Verify model</button>';
+      html += '</div></div>';
+    } else if (de.total > 0 && de.withDense < de.total) {
       var missing = de.total - de.withDense;
       html += '<span style="margin-left:auto;display:flex;gap:6px">'
         + '<span style="color:var(--text-muted)">' + missing.toLocaleString() + ' missing</span>'
@@ -21534,6 +26521,38 @@ async function refreshCoverageStrip() {
       html += '<span style="margin-left:auto;color:var(--text-muted)">All chunks indexed</span>';
     }
     html += '</div>';
+
+    // Second strip: transcripts dense coverage + 7-day recall hit-rate.
+    try {
+      var rc = await apiFetch('/api/memory/coverage');
+      var dc = await rc.json();
+      if (dc.ok) {
+        var tx = dc.transcripts || { embedded: 0, total: 0 };
+        var rec = dc.recall || { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+        var txPct = tx.total > 0 ? Math.round((tx.embedded / tx.total) * 100) : 0;
+        var txColor = txPct >= 95 ? '#10b981' : txPct >= 50 ? '#f59e0b' : '#ef4444';
+        var recallTotal = rec.total || 0;
+        var hit = function(n){ return recallTotal > 0 ? Math.round((n / recallTotal) * 100) : 0; };
+        html += '<div style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-top:8px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;flex-wrap:wrap;font-size:12px">';
+        html += '<span style="color:var(--text-muted)">Conversation recall:</span>';
+        html += '<span><span style="color:' + txColor + '">●</span> Transcripts ' + txPct + '% '
+          + '<span style="color:var(--text-muted)">(' + tx.embedded.toLocaleString() + '/' + tx.total.toLocaleString() + ')</span></span>';
+        if (recallTotal > 0) {
+          html += '<span style="color:var(--text-muted)">|</span>';
+          html += '<span title="Last 7 days">Hit-rate: '
+            + 'semantic ' + hit(rec.semanticOnly) + '% · '
+            + 'lexical ' + hit(rec.lexicalOnly) + '% · '
+            + 'both ' + hit(rec.bothModes) + '% '
+            + '<span style="color:var(--text-muted)">(' + recallTotal.toLocaleString() + ' queries)</span></span>';
+        } else {
+          html += '<span style="color:var(--text-muted)">No recall queries logged in the last 7 days.</span>';
+        }
+        if (tx.total > 0 && tx.embedded < tx.total) {
+          html += '<span style="margin-left:auto;color:var(--text-muted)">' + (tx.total - tx.embedded).toLocaleString() + ' transcripts unembedded — run <code>clementine memory reembed --target transcripts</code></span>';
+        }
+        html += '</div>';
+      }
+    } catch (e) { /* coverage strip is best-effort */ }
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '';
@@ -21594,13 +26613,210 @@ async function refreshRecentWrites() {
   }
 }
 
+async function refreshLearnings() {
+  var el = document.getElementById('panel-learnings');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('learnings-filter-scope');
+    var scope = sel ? sel.value : 'active';
+    var url = '/api/memory/learnings?limit=100' + (scope === 'all' ? '&all=1' : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.facts)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.facts.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No persistent learnings yet. They land automatically when episode consolidation extracts a durable user preference, fact, goal, or workflow pattern.</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:90px">Kind</th>'
+      + '<th>Belief</th>'
+      + '<th style="width:120px">Status</th>'
+      + '<th style="width:140px">Captured</th>'
+      + '<th style="width:140px">Actions</th>'
+      + '</tr></thead><tbody>';
+    var kindColors = { preference: '#a78bfa', fact: '#10b981', goal: '#f59e0b', workflow: '#06b6d4' };
+    for (var i = 0; i < d.facts.length; i++) {
+      var f = d.facts[i];
+      var color = kindColors[f.kind] || 'var(--text-muted)';
+      var statusBadge = '';
+      if (f.status === 'active') statusBadge = '<span style="color:#10b981">active</span>';
+      else if (f.status === 'superseded') statusBadge = '<span style="color:var(--text-muted)">superseded → #' + (f.supersededById || '?') + '</span>';
+      else if (f.status === 'cancelled') statusBadge = '<span style="color:#ef4444">cancelled</span>';
+      else statusBadge = esc(f.status || '');
+      var when = '';
+      try { when = new Date(f.createdAt + 'Z').toLocaleString(); } catch { when = f.createdAt; }
+      var actions = '';
+      if (f.status === 'active') actions = '<button class="btn-sm" onclick="learningAction(' + f.id + ', \\'cancel\\')">Cancel</button>';
+      else if (f.status === 'cancelled') actions = '<button class="btn-sm" onclick="learningAction(' + f.id + ', \\'reinstate\\')">Reinstate</button>';
+      html += '<tr>'
+        + '<td style="font-size:11px;color:' + color + ';font-weight:600">' + esc(f.kind) + '</td>'
+        + '<td style="font-size:12px">' + esc(f.text) + '</td>'
+        + '<td style="font-size:11px">' + statusBadge + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td>' + actions + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function learningAction(id, action) {
+  try {
+    var r = await apiJson('POST', '/api/memory/learnings/action', { id: id, action: action });
+    if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    toast('Learning ' + action, 'success');
+    refreshLearnings();
+  } catch (err) {
+    toast('Failed: ' + String(err), 'error');
+  }
+}
+
+async function refreshCommitments() {
+  var el = document.getElementById('panel-commitments');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('commitments-filter-status');
+    var status = sel ? sel.value : 'open';
+    var r = await apiFetch('/api/memory/commitments?limit=50&status=' + encodeURIComponent(status));
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.commitments)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.commitments.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No commitments. They land automatically when you say things like "I\\'ll fix that tomorrow" or "remind me to call them Friday".</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:80px">Owner</th>'
+      + '<th>Promise</th>'
+      + '<th style="width:140px">Due</th>'
+      + '<th style="width:100px">Source</th>'
+      + '<th style="width:200px">Actions</th>'
+      + '</tr></thead><tbody>';
+    var nowMs = Date.now();
+    for (var i = 0; i < d.commitments.length; i++) {
+      var c = d.commitments[i];
+      var ownerLabel = c.owner === 'clementine' ? 'I' : 'You';
+      var ownerColor = c.owner === 'clementine' ? '#a78bfa' : '#10b981';
+      var dueText = '—';
+      var dueColor = 'var(--text-muted)';
+      if (c.dueAt) {
+        try {
+          var dueMs = new Date(c.dueAt).getTime();
+          var deltaMs = dueMs - nowMs;
+          dueText = new Date(c.dueAt).toLocaleString();
+          if (deltaMs < 0) { dueText = 'OVERDUE — ' + dueText; dueColor = '#ef4444'; }
+          else if (deltaMs < 86_400_000) { dueColor = '#f59e0b'; }
+        } catch { dueText = c.dueAt; }
+      } else if (c.dueHint) {
+        dueText = c.dueHint;
+      }
+      var actions = '';
+      if (c.status === 'open') {
+        actions = '<button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'done\\')">Done</button>'
+          + ' <button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'snooze\\', 24)" title="Snooze 24h">Snooze</button>'
+          + ' <button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'cancelled\\')">Cancel</button>';
+      } else {
+        actions = '<button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'reopen\\')">Reopen</button>';
+      }
+      html += '<tr>'
+        + '<td style="font-size:11px;color:' + ownerColor + ';font-weight:600">' + ownerLabel + '</td>'
+        + '<td style="font-size:12px">' + esc(c.text) + '</td>'
+        + '<td style="font-size:11px;color:' + dueColor + '">' + esc(dueText) + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(c.source) + '</td>'
+        + '<td>' + actions + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function commitmentAction(id, action, hours) {
+  try {
+    var body = { id: id, action: action };
+    if (hours) body.hours = hours;
+    var r = await apiJson('POST', '/api/memory/commitments/action', body);
+    if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    toast('Commitment ' + action, 'success');
+    refreshCommitments();
+  } catch (err) {
+    toast('Failed: ' + String(err), 'error');
+  }
+}
+
+async function refreshRecentEpisodes() {
+  var el = document.getElementById('panel-recent-episodes');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('episodes-filter-since');
+    var since = sel ? sel.value : '7d';
+    var url = '/api/memory/episodes?limit=30' + (since ? '&since=' + encodeURIComponent(since) : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.episodes.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No episodes yet. They land automatically when a session has been idle for ~20 min with at least 3 exchanges.</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:120px">When</th>'
+      + '<th style="width:160px">Session</th>'
+      + '<th>Summary</th>'
+      + '<th style="width:140px">Topics</th>'
+      + '<th style="width:120px">Outcome</th>'
+      + '<th style="width:50px;text-align:right">Open</th>'
+      + '</tr></thead><tbody>';
+    for (var i = 0; i < d.episodes.length; i++) {
+      var ep = d.episodes[i];
+      var when = '';
+      try { when = new Date(ep.createdAt + 'Z').toLocaleString(); } catch { when = ep.createdAt; }
+      var topics = (ep.topics || []).slice(0, 3).map(esc).join(', ');
+      var openCount = (ep.openLoops || []).length;
+      var openColor = openCount > 0 ? '#f59e0b' : 'var(--text-muted)';
+      html += '<tr>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td style="font-size:11px">' + esc(ep.sessionKey) + '</td>'
+        + '<td style="font-size:12px">' + esc(ep.summary) + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + (topics || '—') + '</td>'
+        + '<td style="font-size:11px">' + esc(ep.outcome || '—') + '</td>'
+        + '<td style="text-align:right;font-weight:600;color:' + openColor + '">' + openCount + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
 async function memoryHealthAction(action, extra) {
-  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix', 'reembed-dense': 'dense embedding backfill' };
+  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix', 'install-dense-model': 'local embedding model install/verify', 'reembed-dense': 'dense embedding backfill' };
   if (!confirm('Run ' + (labels[action] || action) + ' now?')) return;
   try {
     var body = Object.assign({ action: action }, extra || {});
     var r = await apiJson('POST', '/api/memory/health/action', body);
     if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    if (action === 'install-dense-model') {
+      toast('Embedding model verified: ' + (r.model || 'local model'), 'success');
+      refreshMemoryHealth();
+      return;
+    }
     if (action === 'reembed-dense' && r.started) {
       toast('Backfill started in background (' + (r.limit || '?') + ' chunks). Refreshing every 10s…', 'info');
       // Poll coverage updates so the user sees progress without manually refreshing.
@@ -21623,28 +26839,118 @@ async function memoryHealthAction(action, extra) {
   }
 }
 
-// ── Vault Files (Brain → Files tab) ──────────────────────────────
-var _vaultFilesCache = null;
-var _vaultFilesFolder = '';   // current folder filter
+// ── Memory tab (Brain → Memory): unified file browser + reader ────
+// 3-pane layout (rail / list / reader). Search merges title+frontmatter
+// matches from /api/vault-files with content matches from /api/memory/search,
+// keyed by source_file. Filters and selected file persist in URL hash.
+var _vaultFilesCache = [];
+var _vaultFilesFolder = '';
+var _vaultFilesType = '';
+var _vaultFilesTag = '';
+var _vaultFilesActive = '';   // currently open relPath
+var _vaultContentMatches = {}; // relPath -> [chunkSnippets]
+var _vaultHoverTimer = null;
+var _vaultHoverCache = {};
+var _vaultSnippetCache = {};  // relPath -> snippet (from head=1)
+
+function vaultParseHash() {
+  var h = (location.hash || '').replace(/^#/, '');
+  var p = h.startsWith('mem/') ? h.slice(4) : '';
+  if (!p) return {};
+  var out = {};
+  p.split('&').forEach(function(kv) {
+    var i = kv.indexOf('=');
+    if (i < 0) return;
+    out[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+  });
+  return out;
+}
+
+function vaultWriteHash() {
+  var parts = [];
+  if (_vaultFilesFolder) parts.push('folder=' + encodeURIComponent(_vaultFilesFolder));
+  if (_vaultFilesType) parts.push('type=' + encodeURIComponent(_vaultFilesType));
+  if (_vaultFilesTag) parts.push('tag=' + encodeURIComponent(_vaultFilesTag));
+  if (_vaultFilesActive) parts.push('file=' + encodeURIComponent(_vaultFilesActive));
+  var newHash = parts.length ? '#mem/' + parts.join('&') : '';
+  if (location.hash !== newHash) {
+    history.replaceState(null, '', location.pathname + location.search + newHash);
+  }
+}
+
+function vaultRestoreFromHash() {
+  var p = vaultParseHash();
+  if (!p || (!p.folder && !p.type && !p.tag && !p.file)) return false;
+  _vaultFilesFolder = p.folder || '';
+  _vaultFilesType = p.type || '';
+  _vaultFilesTag = p.tag || '';
+  _vaultFilesActive = p.file || '';
+  return true;
+}
 
 async function refreshVaultFiles() {
   var listEl = document.getElementById('vault-files-list');
   if (!listEl) return;
-  var q = document.getElementById('vault-files-search')?.value || '';
-  var agent = document.getElementById('vault-files-agent-filter')?.value || '';
-  var since = document.getElementById('vault-files-since')?.value || '30';
-  // Show skeleton while loading
-  listEl.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
+  var q = (document.getElementById('vault-files-search') || {}).value || '';
+  var agent = (document.getElementById('vault-files-agent-filter') || {}).value || '';
+  var since = (document.getElementById('vault-files-since') || {}).value || '9999';
+  listEl.innerHTML = '<div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
   try {
     var url = '/api/vault-files?sinceDays=' + encodeURIComponent(since)
       + (q ? '&q=' + encodeURIComponent(q) : '')
       + (agent ? '&agent=' + encodeURIComponent(agent) : '')
-      + (_vaultFilesFolder ? '&folder=' + encodeURIComponent(_vaultFilesFolder) : '');
-    var r = await apiFetch(url);
-    var d = await r.json();
+      + (_vaultFilesFolder ? '&folder=' + encodeURIComponent(_vaultFilesFolder) : '')
+      + (_vaultFilesType ? '&type=' + encodeURIComponent(_vaultFilesType) : '')
+      + (_vaultFilesTag ? '&tag=' + encodeURIComponent(_vaultFilesTag) : '')
+      + '&limit=300';
+
+    // Run vault-files and content search in parallel when there is a query.
+    var promises = [apiFetch(url).then(function(r) { return r.json(); })];
+    if (q && q.length >= 2) {
+      promises.push(apiFetch('/api/memory/search?q=' + encodeURIComponent(q) + '&limit=40')
+        .then(function(r) { return r.json(); })
+        .catch(function() { return null; }));
+    }
+    var results = await Promise.all(promises);
+    var d = results[0];
+    var contentHits = results[1];
+
     var files = d.files || [];
     _vaultFilesCache = files;
-    // Populate agent filter from ALL files response (use server's full set, not filtered)
+    _vaultContentMatches = {};
+
+    // Bucket content-search hits by source_file. Keep up to 2 snippets per file.
+    if (contentHits && Array.isArray(contentHits.results)) {
+      contentHits.results.forEach(function(row) {
+        var sf = row.source_file || row.path || '';
+        if (!sf) return;
+        // source_file values often look like 'vault/02-People/Jordan.md' OR
+        // a bare relPath. Normalize to relPath.
+        var rel = sf.indexOf('vault/') === 0 ? sf.slice('vault/'.length) : sf;
+        if (!_vaultContentMatches[rel]) _vaultContentMatches[rel] = [];
+        if (_vaultContentMatches[rel].length < 2) {
+          var txt = (row.content || '').replace(/\\s+/g, ' ').slice(0, 200);
+          _vaultContentMatches[rel].push({ snippet: txt, section: row.section || '' });
+        }
+      });
+      // Inject any content-only matches (file did not surface via title/path)
+      // into the file list so the user can still open them.
+      var existing = {};
+      files.forEach(function(f) { existing[f.relPath] = true; });
+      Object.keys(_vaultContentMatches).forEach(function(rel) {
+        if (existing[rel]) return;
+        files.push({
+          path: '', relPath: rel,
+          title: rel.split('/').pop().replace(/\\.md$/, ''),
+          folder: rel.split('/')[0] || '',
+          agentSlug: null, mtime: '', sizeBytes: 0,
+          type: null, category: null, tags: [],
+          _contentOnly: true,
+        });
+      });
+    }
+
+    // Populate agent dropdown from cache (only first time)
     var agentSel = document.getElementById('vault-files-agent-filter');
     if (agentSel && agentSel.options.length <= 2) {
       var slugs = [...new Set(files.map(function(f) { return f.agentSlug; }).filter(Boolean))].sort();
@@ -21655,100 +26961,226 @@ async function refreshVaultFiles() {
         agentSel.appendChild(opt);
       });
     }
-    // Render folder filter chips (using folderCounts from server)
-    var chipsEl = document.getElementById('vault-files-folder-chips');
-    if (chipsEl && d.folderCounts) {
-      var folders = Object.entries(d.folderCounts).sort(function(a, b) { return b[1] - a[1]; });
-      var totalCount = folders.reduce(function(s, p) { return s + p[1]; }, 0);
-      var chipHtml = '<div class="vault-folder-chip' + (_vaultFilesFolder === '' ? ' active' : '') + '" data-folder="" onclick="setVaultFolderFilter(\\x27\\x27)">All <span style="opacity:0.6">' + totalCount + '</span></div>';
-      folders.forEach(function(p) {
-        var folder = p[0]; var count = p[1];
-        if (!folder) return;
-        chipHtml += '<div class="vault-folder-chip' + (_vaultFilesFolder === folder ? ' active' : '') + '" data-folder="' + esc(folder) + '" onclick="setVaultFolderFilter(\\x27' + esc(folder) + '\\x27)">' + esc(folder) + ' <span style="opacity:0.6">' + count + '</span></div>';
-      });
-      chipsEl.innerHTML = chipHtml;
+
+    // Render facet rails
+    renderFacetChips('vault-files-folder-chips', d.folderCounts || {}, _vaultFilesFolder, vaultSetFolder, 30);
+    renderFacetChips('vault-files-type-chips', d.typeCounts || {}, _vaultFilesType, vaultSetType, 20);
+    renderFacetChips('vault-files-tag-chips', d.tagCounts || {}, _vaultFilesTag, vaultSetTag, 20);
+
+    // Meta line
+    var metaEl = document.getElementById('vault-files-list-meta');
+    if (metaEl) {
+      var totalLabel = files.length === d.total ? files.length + ' files' : files.length + ' of ' + d.total + ' files';
+      metaEl.textContent = totalLabel + (q ? ' matching "' + q + '"' : '') + (since !== '9999' ? ' (last ' + since + 'd)' : '');
     }
+
     if (files.length === 0) {
-      listEl.innerHTML = '<div class="empty-cta"><div class="label">No recent files</div><div class="hint">Try a wider time window or different filter.</div></div>';
+      listEl.innerHTML = '<div class="empty-cta" style="padding:30px 14px"><div class="label">No matches</div><div class="hint">Try a wider time window, fewer filters, or a different search.</div></div>';
       return;
     }
-    var html = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Showing ' + files.length + ' of ' + d.total + ' files modified in the last ' + since + ' days.</div>';
-    html += '<div style="display:flex;flex-direction:column;gap:1px;border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;background:var(--bg-card)">';
+
+    var html = '';
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
-      var agentBadge = f.agentSlug
-        ? '<span style="font-size:10px;background:var(--clementine-bg);color:var(--clementine);padding:2px 7px;border-radius:var(--radius-xs);font-weight:500">' + esc(f.agentSlug) + '</span>'
-        : '<span style="font-size:10px;background:var(--bg-tertiary);color:var(--text-muted);padding:2px 7px;border-radius:var(--radius-xs)">shared</span>';
-      var typeBadge = f.type ? '<span style="font-size:10px;color:var(--text-muted);margin-right:6px">' + esc(f.type) + '</span>' : '';
-      html += '<div class="vault-file-row clickable-row" data-path="' + esc(f.relPath) + '" style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg-secondary);border-bottom:1px solid var(--border-light);font-size:13px">'
-        + '<div style="flex:1;min-width:0">'
-          + '<div style="font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(f.title) + '</div>'
-          + '<div style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px">' + esc(f.relPath) + '</div>'
-        + '</div>'
-        + '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
-          + typeBadge + agentBadge
-          + '<span style="font-size:11px;color:var(--text-muted);min-width:60px;text-align:right">' + esc(timeAgo(f.mtime)) + '</span>'
-        + '</div>'
+      var matches = _vaultContentMatches[f.relPath];
+      var pills = '';
+      if (f.type) pills += '<span class="vault-pill type">' + esc(f.type) + '</span>';
+      (f.tags || []).slice(0, 3).forEach(function(t) {
+        pills += '<span class="vault-pill tag">' + esc(t) + '</span>';
+      });
+      if (matches && matches.length) pills += '<span class="vault-pill match">' + matches.length + ' match' + (matches.length > 1 ? 'es' : '') + '</span>';
+      var when = f.mtime ? esc(timeAgo(f.mtime)) : '';
+      var snippetHtml = '';
+      if (matches && matches.length) {
+        snippetHtml = '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;border-left:2px solid var(--clementine);padding-left:8px;line-height:1.5">' + esc(matches[0].snippet) + '…</div>';
+      }
+      html += '<div class="vault-mem-row' + (_vaultFilesActive === f.relPath ? ' active' : '') + '" data-path="' + esc(f.relPath) + '">'
+        + '<div class="vault-mem-row-title">' + esc(f.title) + '</div>'
+        + '<div class="vault-mem-row-meta">' + pills + (pills && when ? '<span style="opacity:0.5">·</span>' : '') + (when ? '<span>' + when + '</span>' : '') + '</div>'
+        + '<div class="vault-mem-row-path">' + esc(f.relPath) + '</div>'
+        + snippetHtml
         + '</div>';
     }
-    html += '</div>';
     listEl.innerHTML = html;
-    // Wire row clicks
-    listEl.querySelectorAll('.vault-file-row').forEach(function(row) {
-      row.onclick = function() { openVaultFile(row.getAttribute('data-path')); };
+    listEl.querySelectorAll('.vault-mem-row').forEach(function(row) {
+      row.addEventListener('click', function() { openVaultFile(row.getAttribute('data-path')); });
+      row.addEventListener('mouseenter', function(ev) { vaultStartHover(row.getAttribute('data-path'), ev); });
+      row.addEventListener('mouseleave', vaultEndHover);
     });
+
+    // Re-open the previously active file (or any file from hash on first load)
+    if (_vaultFilesActive && files.some(function(f) { return f.relPath === _vaultFilesActive; })) {
+      openVaultFile(_vaultFilesActive, true);
+    }
   } catch (err) {
     listEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:13px">Failed to load: ' + esc(String(err)) + '</div>';
   }
 }
 
-async function openVaultFile(relPath) {
+function renderFacetChips(elId, counts, current, onPick, maxItems) {
+  var el = document.getElementById(elId);
+  if (!el) return;
+  var entries = Object.entries(counts).sort(function(a, b) { return b[1] - a[1]; });
+  if (entries.length === 0) { el.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 8px">(none)</div>'; return; }
+  var totalCount = entries.reduce(function(s, p) { return s + p[1]; }, 0);
+  var html = '<div class="vault-facet-row' + (current === '' ? ' active' : '') + '" data-val="">All <span class="vault-facet-count">' + totalCount + '</span></div>';
+  entries.slice(0, maxItems).forEach(function(p) {
+    var k = p[0]; var c = p[1];
+    if (!k) return;
+    html += '<div class="vault-facet-row' + (current === k ? ' active' : '') + '" data-val="' + esc(k) + '">'
+      + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(k) + '</span>'
+      + '<span class="vault-facet-count">' + c + '</span>'
+      + '</div>';
+  });
+  el.innerHTML = html;
+  el.querySelectorAll('.vault-facet-row').forEach(function(row) {
+    row.addEventListener('click', function() { onPick(row.getAttribute('data-val')); });
+  });
+}
+
+function vaultSetFolder(v) { _vaultFilesFolder = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+function vaultSetType(v)   { _vaultFilesType   = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+function vaultSetTag(v)    { _vaultFilesTag    = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+// Backwards-compat name used elsewhere.
+function setVaultFolderFilter(folder) { vaultSetFolder(folder); }
+
+async function openVaultFile(relPath, skipHashUpdate) {
   if (!relPath) return;
-  // Build/reuse a slide-out drawer for content preview
-  var drawer = document.getElementById('vault-file-drawer');
-  if (!drawer) {
-    drawer = document.createElement('div');
-    drawer.id = 'vault-file-drawer';
-    drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:560px;max-width:92vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
-    drawer.innerHTML =
-      '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
-        + '<div style="flex:1;min-width:0">'
-          + '<div id="vault-file-drawer-title" style="font-weight:600;font-size:15px;letter-spacing:-0.01em"></div>'
-          + '<div id="vault-file-drawer-path" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>'
-        + '</div>'
-        + '<button class="btn-icon btn-sm" onclick="closeVaultFileDrawer()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
-      + '</div>'
-      + '<div id="vault-file-drawer-body" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:13px;line-height:1.55"></div>';
-    document.body.appendChild(drawer);
-  }
-  var titleEl = document.getElementById('vault-file-drawer-title');
-  var pathEl = document.getElementById('vault-file-drawer-path');
-  var body = document.getElementById('vault-file-drawer-body');
-  if (titleEl) titleEl.textContent = relPath.split('/').pop().replace(/\\.md$/, '');
-  if (pathEl) pathEl.textContent = relPath;
-  if (body) body.innerHTML = '<div class="skel-block"><div class="skel-row"></div><div class="skel-row med"></div><div class="skel-row short"></div></div>';
-  drawer.style.transform = 'translateX(0)';
+  _vaultFilesActive = relPath;
+  if (!skipHashUpdate) vaultWriteHash();
+  // Visually mark active row
+  document.querySelectorAll('#vault-files-list .vault-mem-row').forEach(function(r) {
+    r.classList.toggle('active', r.getAttribute('data-path') === relPath);
+  });
+  var headerEl = document.getElementById('vault-reader-header');
+  var bodyEl = document.getElementById('vault-reader-body');
+  if (!headerEl || !bodyEl) return;
+  headerEl.innerHTML = '<div style="font-weight:600;font-size:15px">' + esc(relPath.split('/').pop().replace(/\\.md$/, '')) + '</div>'
+    + '<div style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px">' + esc(relPath) + '</div>';
+  bodyEl.innerHTML = '<div class="skel-block"><div class="skel-row"></div><div class="skel-row med"></div><div class="skel-row short"></div></div>';
   try {
     var r = await apiFetch('/api/vault-file?path=' + encodeURIComponent(relPath));
     var d = await r.json();
-    if (d.error) {
-      body.innerHTML = '<div style="color:var(--red)">' + esc(d.error) + '</div>';
-      return;
-    }
-    body.innerHTML = renderMd(d.content);
+    if (d.error) { bodyEl.innerHTML = '<div style="color:var(--red)">' + esc(d.error) + '</div>'; return; }
+    var raw = d.content || '';
+    var fm = vaultExtractFrontmatter(raw);
+    var bodyMd = fm.body;
+    var fmCard = vaultRenderFmCard(fm.data);
+    var rendered = renderMd(bodyMd);
+    var toc = vaultBuildToc(bodyMd);
+    bodyEl.innerHTML = fmCard + '<div class="vault-reader-body">' + rendered + '</div>' + toc;
   } catch (err) {
-    body.innerHTML = '<div style="color:var(--red)">Failed: ' + esc(String(err)) + '</div>';
+    bodyEl.innerHTML = '<div style="color:var(--red)">Failed: ' + esc(String(err)) + '</div>';
   }
 }
 
+// Back-compat (legacy drawer-style call sites). The drawer is gone, but the
+// inline reader covers the same job.
 function closeVaultFileDrawer() {
-  var drawer = document.getElementById('vault-file-drawer');
-  if (drawer) drawer.style.transform = 'translateX(100%)';
+  _vaultFilesActive = '';
+  vaultWriteHash();
+  var headerEl = document.getElementById('vault-reader-header');
+  var bodyEl = document.getElementById('vault-reader-body');
+  if (headerEl) headerEl.innerHTML = '<div style="font-weight:600;font-size:15px">No file selected</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px">Pick a file from the list to read it here.</div>';
+  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Tip: hover a row for a peek, click to open.</div>';
+  document.querySelectorAll('#vault-files-list .vault-mem-row.active').forEach(function(r) { r.classList.remove('active'); });
 }
 
-function setVaultFolderFilter(folder) {
-  _vaultFilesFolder = folder || '';
-  refreshVaultFiles();
+function vaultExtractFrontmatter(raw) {
+  // Lightweight client-side YAML frontmatter parse — enough for display.
+  if (!raw || raw.indexOf('---') !== 0) return { data: {}, body: raw || '' };
+  var end = raw.indexOf('\\n---', 3);
+  if (end < 0) return { data: {}, body: raw };
+  var fmText = raw.slice(3, end).replace(/^\\n/, '');
+  var body = raw.slice(end + 4).replace(/^\\n/, '');
+  var data = {};
+  fmText.split(/\\n/).forEach(function(line) {
+    var m = line.match(/^([A-Za-z0-9_\\-]+)\\s*:\\s*(.*)$/);
+    if (!m) return;
+    var k = m[1]; var v = m[2].trim();
+    if (v.startsWith('[') && v.endsWith(']')) {
+      v = v.slice(1, -1).split(',').map(function(s) { return s.trim().replace(/^["\\x27]|["\\x27]$/g, ''); }).filter(Boolean);
+    } else {
+      v = v.replace(/^["\\x27]|["\\x27]$/g, '');
+    }
+    data[k] = v;
+  });
+  return { data: data, body: body };
+}
+
+function vaultRenderFmCard(data) {
+  var keys = Object.keys(data || {});
+  if (keys.length === 0) return '';
+  var html = '<div class="vault-reader-fm">';
+  keys.forEach(function(k) {
+    var v = data[k];
+    var display = Array.isArray(v)
+      ? v.map(function(x) { return '<span class="vault-pill tag" style="margin-right:4px">' + esc(String(x)) + '</span>'; }).join('')
+      : esc(String(v));
+    html += '<div class="k">' + esc(k) + '</div><div class="v">' + display + '</div>';
+  });
+  html += '</div>';
+  return html;
+}
+
+function vaultBuildToc(md) {
+  var lines = (md || '').split('\\n');
+  var headings = [];
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^(#{2,3})\\s+(.+?)\\s*$/);
+    if (!m) continue;
+    var lvl = m[1].length;
+    var txt = m[2];
+    var slug = txt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    headings.push({ lvl: lvl, txt: txt, slug: slug });
+  }
+  if (headings.length < 2) return '';
+  var html = '<div class="vault-reader-toc"><div class="vault-reader-toc-title">On this page</div>';
+  headings.forEach(function(h) {
+    html += '<a class="lvl-' + h.lvl + '" href="#' + esc(h.slug) + '">' + esc(h.txt) + '</a>';
+  });
+  html += '</div>';
+  return html;
+}
+
+function vaultStartHover(relPath, ev) {
+  if (!relPath || relPath === _vaultFilesActive) return;
+  clearTimeout(_vaultHoverTimer);
+  var x = ev.clientX, y = ev.clientY;
+  _vaultHoverTimer = setTimeout(async function() {
+    var pop = document.getElementById('vault-hover-popover');
+    if (!pop) return;
+    var data = _vaultHoverCache[relPath];
+    if (!data) {
+      try {
+        var r = await apiFetch('/api/vault-file?head=1&path=' + encodeURIComponent(relPath));
+        data = await r.json();
+        _vaultHoverCache[relPath] = data;
+      } catch { return; }
+    }
+    if (!data || data.error) return;
+    var fm = data.frontmatter || {};
+    var fmHtml = '';
+    Object.keys(fm).slice(0, 5).forEach(function(k) {
+      var v = fm[k];
+      var dv = Array.isArray(v) ? v.join(', ') : String(v);
+      fmHtml += '<div style="display:flex;gap:6px"><span style="color:var(--text-muted);min-width:60px">' + esc(k) + '</span><span>' + esc(dv) + '</span></div>';
+    });
+    pop.innerHTML = '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + esc(relPath.split('/').pop().replace(/\\.md$/, '')) + '</div>'
+      + (fmHtml ? '<div style="margin-bottom:6px">' + fmHtml + '</div>' : '')
+      + '<div style="color:var(--text-secondary)">' + esc(data.snippet || '(empty)') + '</div>';
+    var px = Math.min(window.innerWidth - 360, x + 16);
+    var py = Math.min(window.innerHeight - 200, y + 16);
+    pop.style.left = px + 'px';
+    pop.style.top = py + 'px';
+    pop.style.display = 'block';
+  }, 250);
+}
+
+function vaultEndHover() {
+  clearTimeout(_vaultHoverTimer);
+  var pop = document.getElementById('vault-hover-popover');
+  if (pop) pop.style.display = 'none';
 }
 
 // ── Goals: inline create form ────────────────────────────────────
@@ -21780,7 +27212,7 @@ async function submitNewGoal() {
 
 // ── Workflows: open Builder for a brand-new workflow ─────────────
 function openBuilderForNewWorkflow() {
-  navigateTo('builder');
+  navigateTo('build', { tab: 'workflows' });
   setTimeout(function() {
     var typeSel = document.getElementById('builder-type');
     if (typeSel) { typeSel.value = 'workflow'; updateBuilderMode(); }
@@ -21800,9 +27232,8 @@ function openBuilderForNewWorkflow() {
 // ── Unleashed: open the start-task picker ────────────────────────
 function openStartUnleashedTask() {
   // Reuse the existing cron list — pick a cron job, run it in unleashed mode.
-  // For v1 just route to Automations where the existing controls live.
-  navigateTo('automations');
-  toast('Pick a cron job and click "Run unleashed" — kicks off long-running mode.', 'info');
+  navigateTo('build', { tab: 'crons' });
+  toast('Open a scheduled task, set Mode to Unleashed, then run it.', 'info');
 }
 
 async function refreshMemoryHealth() {
@@ -21842,7 +27273,7 @@ async function refreshMemoryHealth() {
 
     // Dense embedding coverage — the leading indicator for retrieval quality.
     // <50% means the agent is mostly searching on TF-IDF and missing semantic matches.
-    var de = h.denseEmbeddings || { withDense: 0, total: 0, models: [], currentModel: '', ready: false };
+    var de = h.denseEmbeddings || { withDense: 0, total: 0, models: [], currentModel: '', ready: false, installed: false, cacheSize: '0 B' };
     var densePct = de.total > 0 ? ((de.withDense / de.total) * 100).toFixed(1) : '0.0';
     var denseColor = de.total === 0 ? 'var(--text-muted)'
       : (de.withDense / Math.max(1, de.total)) >= 0.95 ? 'var(--success, #10b981)'
@@ -21853,12 +27284,22 @@ async function refreshMemoryHealth() {
       + '<div class="metric-hero-value" style="color:' + denseColor + '">' + densePct + '%</div>'
       + '<div class="metric-hero-label">Semantic Coverage</div>'
       + '<div class="metric-hero-sub">' + (de.withDense || 0) + ' of ' + (de.total || 0)
-      + ' chunks &middot; ' + esc(modelLabel) + '</div></div>';
+      + ' chunks &middot; ' + esc(modelLabel) + ' &middot; model ' + (de.installed ? esc(de.cacheSize || 'cached') : 'not installed') + '</div></div>';
 
     html += '</div>';
 
     // Coverage call-to-action — only render when there's work to do.
-    if (de.total > 0 && de.withDense < de.total) {
+    if (!de.installed) {
+      html += '<div class="card" style="margin-bottom:16px;border-left:3px solid #f59e0b">';
+      html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="flex:1;min-width:240px">';
+      html += '<div style="font-weight:600;margin-bottom:4px">Local embedding model is not installed yet</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">Install once to enable dense semantic recall without waiting for the first chat or backfill to download it.</div>';
+      if (de.cacheDir) html += '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(de.cacheDir) + '</div>';
+      html += '</div>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')" title="Download and verify the local dense embedding model">Install model</button>';
+      html += '</div></div>';
+    } else if (de.total > 0 && de.withDense < de.total) {
       var missing = de.total - de.withDense;
       html += '<div class="card" style="margin-bottom:16px;border-left:3px solid ' + denseColor + '">';
       html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
@@ -22589,6 +28030,34 @@ async function refreshHomeDigest() {
       savedEl.textContent = minutes >= 60 ? (minutes / 60).toFixed(1) + 'h' : (minutes + 'm');
       savedEl.classList.toggle('muted', minutes === 0);
     }
+    var tokenEl = document.getElementById('kpi-tokens-7d');
+    if (tokenEl) {
+      var token7d = k.tokens7d || 0;
+      tokenEl.textContent = formatTokens(token7d);
+      tokenEl.classList.toggle('muted', token7d === 0);
+      var tokenTile = tokenEl.closest('.kpi-tile');
+      if (tokenTile) {
+        tokenTile.classList.toggle('alert', token7d >= 1000000);
+        tokenTile.classList.toggle('muted', token7d === 0);
+      }
+    }
+    try {
+      var opsRes = await apiFetch('/api/build/operations?hours=168&limit=10');
+      var ops = await opsRes.json();
+      if (ops && ops.ok !== false && ops.summary) {
+        var attentionCount = ops.summary.needsAttention || 0;
+        var runningCount = ops.summary.runningNow || 0;
+        var activeEl = document.getElementById('kpi-active-runs');
+        var activeTile = activeEl ? activeEl.closest('.kpi-tile') : null;
+        var activeLabel = activeTile ? activeTile.querySelector('.kpi-label') : null;
+        if (activeEl) activeEl.textContent = String(attentionCount > 0 ? attentionCount : runningCount);
+        if (activeLabel) activeLabel.textContent = attentionCount > 0 ? 'Needs attention' : 'Active runs';
+        if (activeTile) {
+          activeTile.classList.toggle('alert', attentionCount > 0 || runningCount > 0);
+          activeTile.classList.toggle('muted', attentionCount === 0 && runningCount === 0);
+        }
+      }
+    } catch(e) { /* Build operations signal is optional on home. */ }
     setKpi('kpi-approvals', k.pendingApprovals || 0, (k.pendingApprovals || 0) > 0);
     setKpi('kpi-overdue', k.overdueTasks || 0, (k.overdueTasks || 0) > 0);
 
@@ -22630,7 +28099,7 @@ async function refreshHomeDigest() {
     if (runsBody) {
       var runs = d.todayRuns || [];
       if (!runs.length) {
-        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Crons</a>.</div>';
+        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Scheduled Tasks</a>.</div>';
       } else {
         var html2 = '';
         for (var n = 0; n < runs.length; n++) {
@@ -22771,7 +28240,7 @@ async function refreshHomeRail() {
   try {
     var ru = await apiFetch('/api/unleashed');
     var du = await ru.json();
-    var active = (du.tasks || []).filter(function(t) { return t.status === 'running'; });
+    var active = (du.tasks || []).filter(function(t) { return t.live === true || t.runtimeState === 'active'; });
     var ae = document.getElementById('rail-active');
     var ac = document.getElementById('rail-active-count');
     if (ac) {
@@ -22780,7 +28249,7 @@ async function refreshHomeRail() {
     }
     if (ae) {
       ae.innerHTML = active.map(function(t) {
-        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27workflows\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
+        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
       }).join('');
     }
     _setRailEmpty('rail-active', active.length === 0);
@@ -24460,6 +29929,7 @@ async function applyBrokenJobFix(jobName) {
     if (res && res.ok) {
       toast('Applied ' + (res.appliedOps || []).length + ' op(s) to ' + jobName, 'success');
       refreshBrokenJobs();
+      if (typeof refreshCron === 'function') refreshCron();
     } else {
       toast('Apply failed: ' + ((res && (res.message || res.error)) || 'unknown'), 'error');
     }
@@ -24475,6 +29945,7 @@ async function dismissBrokenJobDiagnosis(jobName) {
     if (res && res.ok) {
       toast('Diagnosis dismissed', 'info');
       refreshBrokenJobs();
+      if (typeof refreshCron === 'function') refreshCron();
     } else {
       toast('Failed to dismiss: ' + ((res && res.error) || 'unknown'), 'error');
     }
@@ -26532,6 +32003,7 @@ async function refreshSalesforce() {
 
 // ── Initial load — single batch request instead of 12+ parallel fetches ──
 (async function initDashboard() {
+  renderRestartRequiredBanner();
   try {
     var r = await apiFetch('/api/init');
     var d = await r.json();
@@ -26603,6 +32075,7 @@ try {
         if (currentPage === 'home') refreshSessions();
       }
       if (evt.type === 'daemon_restarted') {
+        clearRestartRequired();
         toast('Daemon restarted \u2014 refreshing data...', 'info');
         setTimeout(function() { refreshAll(); }, 1500);
       }

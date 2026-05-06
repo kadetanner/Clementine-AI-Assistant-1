@@ -65,6 +65,42 @@ import { CronRunLog, logToDailyNote, todayISO } from './cron-scheduler.js';
 const logger = pino({ name: 'clementine.heartbeat' });
 const PROACTIVE_DECISION_DEDUPE_MS = 24 * 60 * 60 * 1000;
 
+export function buildInsightCheckCronCall(prompt: string): {
+  jobName: 'insight-check';
+  jobPrompt: string;
+  tier: 1;
+  maxTurns: 1;
+  model: 'haiku';
+  opts: { disableAllTools: true };
+} {
+  return {
+    jobName: 'insight-check',
+    jobPrompt: prompt,
+    tier: 1,
+    maxTurns: 1,
+    model: 'haiku',
+    opts: { disableAllTools: true },
+  };
+}
+
+export function buildConsolidationCronCall(prompt: string): {
+  jobName: 'consolidation-llm';
+  jobPrompt: string;
+  tier: 1;
+  maxTurns: 1;
+  model: 'haiku';
+  opts: { disableAllTools: true };
+} {
+  return {
+    jobName: 'consolidation-llm',
+    jobPrompt: prompt,
+    tier: 1,
+    maxTurns: 1,
+    model: 'haiku',
+    opts: { disableAllTools: true },
+  };
+}
+
 // ── HeartbeatScheduler ────────────────────────────────────────────────
 
 export class HeartbeatScheduler {
@@ -83,6 +119,8 @@ export class HeartbeatScheduler {
   private denseBackfillInFlight = false;
   private lastSalienceDecayDate = '';
   private lastMemoryPulseDate = '';
+  private lastEpisodicConsolidationAt = 0;
+  private episodicConsolidationInFlight = false;
 
   /** Wire up the cron scheduler so daily plan suggestions can be applied. */
   setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
@@ -179,7 +217,10 @@ export class HeartbeatScheduler {
     // Passes the gateway so freshly-broken jobs get a diagnostic LLM call
     // (cached 24h) before the DM goes out.
     import('./failure-monitor.js').then(({ runFailureSweep }) => {
-      runFailureSweep((text) => this.dispatcher.send(text, {}), this.gateway).catch(err => {
+      const replySessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
+        ? `discord:user:${DISCORD_OWNER_ID}`
+        : undefined;
+      runFailureSweep((text) => this.dispatcher.send(text, {}), this.gateway, Date.now(), { replySessionKey }).catch(err => {
         logger.warn({ err }, 'Failure sweep failed');
       });
     }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
@@ -197,6 +238,13 @@ export class HeartbeatScheduler {
     // Pinned + soft-deleted + superseded chunks are exempt. One UPDATE per
     // day, gated by a date stamp on HeartbeatState.
     this.maybeRunSalienceDecay();
+
+    // Episodic consolidation — turn idle sessions' raw transcripts into
+    // durable, indexed episodes. ~5 min cooldown, capped at 3 sessions per
+    // pass to bound LLM cost. Best-effort; never blocks the tick.
+    this.maybeRunEpisodicConsolidation().catch(err => {
+      logger.debug({ err }, 'Episodic consolidation pass failed (non-fatal)');
+    });
 
     // Claim verification sweep — auto-verify pending claims whose due
     // times have passed (e.g. "I scheduled X for 8am" → check at 9am).
@@ -339,12 +387,20 @@ export class HeartbeatScheduler {
 
         // LLM callback for summarization/principle extraction
         const llmCall = async (prompt: string): Promise<string> => {
+          const cronCall = buildConsolidationCronCall(prompt);
           const result = await this.gateway.handleCronJob(
-            'consolidation-llm',
-            prompt,
-            1,
-            1,
-            'haiku',
+            cronCall.jobName,
+            cronCall.jobPrompt,
+            cronCall.tier,
+            cronCall.maxTurns,
+            cronCall.model,
+            undefined,
+            'standard',
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            cronCall.opts,
           );
           return result || '';
         };
@@ -936,6 +992,42 @@ export class HeartbeatScheduler {
   }
 
   /**
+   * Episodic consolidation pass. Turns idle session transcript ranges into
+   * durable episodes via a small Haiku call per session. Same shape as
+   * maybeIdleDenseBackfill: in-flight guard, cooldown, chat-lane busy check,
+   * bounded work per pass. Skipped silently when there's nothing eligible
+   * (which is the common case).
+   */
+  private async maybeRunEpisodicConsolidation(): Promise<void> {
+    if (this.episodicConsolidationInFlight) return;
+    const sinceLastMs = Date.now() - this.lastEpisodicConsolidationAt;
+    if (sinceLastMs < 5 * 60 * 1000) return;
+
+    const { lanes } = await import('./lanes.js');
+    if (lanes.status().chat.active > 0) return;
+
+    const store = this.gateway.getMemoryStore();
+    if (!store) return;
+
+    this.episodicConsolidationInFlight = true;
+    this.lastEpisodicConsolidationAt = Date.now();
+    try {
+      const { runEpisodicConsolidationPass } = await import('./episodic-consolidation.js');
+      const result = await runEpisodicConsolidationPass(store, {
+        idleMinutes: 20,
+        minExchanges: 3,
+        maxSessionsPerPass: 3,
+        failBackoffMinutes: 60,
+      });
+      if (result.consolidated > 0 || result.failed > 0) {
+        logger.info(result, 'Episodic consolidation pass complete');
+      }
+    } finally {
+      this.episodicConsolidationInFlight = false;
+    }
+  }
+
+  /**
    * Daily salience decay. Multiplies salience by 0.95 on chunks unaccessed
    * for >30 days. Date-gated (one pass per calendar day), persisted in
    * HeartbeatState. Pinned chunks exempt; soft-deleted and superseded skipped.
@@ -1066,21 +1158,26 @@ export class HeartbeatScheduler {
     const prompt = buildInsightPrompt(signals);
     if (!prompt) return;
 
-    // Run lightweight LLM call via gateway. Log success AND failure to the
-    // cron run log so the failure monitor can see hourly breakage.
-    // maxTurns bumped 1 → 3 because the agent needs to fan out ~4 parallel
-    // tool calls (activity_history, outlook_inbox, goal_list, task_list)
-    // before composing its rating — at 1 turn it always crashes with
-    // "Reached maximum number of turns".
+    // Run a no-tool classifier call via gateway. gatherInsightSignals()
+    // already assembled the local signal list; attaching MCP schemas here can
+    // make the prompt too large before the model ever evaluates urgency.
     const icStartedAt = new Date();
     let response: string | null = null;
     try {
+      const cronCall = buildInsightCheckCronCall(prompt);
       response = await this.gateway.handleCronJob(
-        'insight-check',
-        prompt,
-        1,   // tier 1
-        3,   // max 3 turns (parallel tool fan-out + synthesis)
-        'haiku',
+        cronCall.jobName,
+        cronCall.jobPrompt,
+        cronCall.tier,
+        cronCall.maxTurns,
+        cronCall.model,
+        undefined,
+        'standard',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        cronCall.opts,
       );
       this.runLog.append({
         jobName: 'insight-check',
@@ -1113,15 +1210,38 @@ export class HeartbeatScheduler {
     // Urgency-based delivery
     const hour = new Date().getHours();
     const inActiveHours = hour >= HEARTBEAT_ACTIVE_START && hour < HEARTBEAT_ACTIVE_END;
+    const ownerSessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
+      ? `discord:user:${DISCORD_OWNER_ID}`
+      : undefined;
 
     if (insight.urgency >= 5) {
       // Critical: send immediately regardless of hours
-      await this.dispatcher.send(`**[Proactive alert]** ${insight.message}`);
+      const text = `**[Proactive alert]** ${insight.message}`;
+      if (ownerSessionKey) {
+        this.gateway.recordProactiveEvent({
+          type: 'insight',
+          sessionKey: ownerSessionKey,
+          title: 'Proactive alert',
+          summary: insight.message,
+          text,
+        });
+      }
+      await this.dispatcher.send(text);
       recordInsightSent(insightState);
       this.saveState();
     } else if (insight.urgency >= 4 && inActiveHours) {
       // Important: send during active hours
-      await this.dispatcher.send(`**[Heads up]** ${insight.message}`);
+      const text = `**[Heads up]** ${insight.message}`;
+      if (ownerSessionKey) {
+        this.gateway.recordProactiveEvent({
+          type: 'insight',
+          sessionKey: ownerSessionKey,
+          title: 'Heads up',
+          summary: insight.message,
+          text,
+        });
+      }
+      await this.dispatcher.send(text);
       recordInsightSent(insightState);
       this.saveState();
     }

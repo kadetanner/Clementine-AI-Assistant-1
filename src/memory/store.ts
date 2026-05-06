@@ -20,6 +20,7 @@ import type {
   Feedback,
   MemoryExtraction,
   SearchResult,
+  SessionLineageEntry,
   SessionSummary,
   SyncStats,
   TranscriptTurn,
@@ -33,6 +34,62 @@ import { HotCache } from './hot-cache.js';
 import { WriteQueue, type WriteQueueOpts } from './write-queue.js';
 
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+
+export type MemoryPromotionDecision = 'pending' | 'promoted' | 'rejected' | 'superseded';
+
+export interface MemoryPromotionCandidate {
+  id: number;
+  candidateKind: string;
+  sourceTable: string;
+  sourceId: number | null;
+  sessionKey: string | null;
+  agentSlug: string | null;
+  contentPreview: string;
+  confidence: number;
+  salience: number;
+  reason: string | null;
+  decision: MemoryPromotionDecision;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+export interface MemoryPromotionCandidateInput {
+  candidateKind: string;
+  sourceTable?: string;
+  sourceId?: number | null;
+  sessionKey?: string | null;
+  agentSlug?: string | null;
+  contentPreview: string;
+  confidence?: number;
+  salience?: number;
+  reason?: string | null;
+}
+
+export interface SearchContextOptions {
+  limit?: number;
+  recencyLimit?: number;
+  agentSlug?: string;
+  category?: string;
+  topic?: string;
+  strict?: boolean;
+  sessionKey?: string;
+  messageId?: string;
+  skipTrace?: boolean;
+  /** Pre-computed dense query vector. When omitted, searchContextAsync may compute one. */
+  queryDenseVec?: Float32Array;
+  /** Set false to keep retrieval on FTS/sparse/recency only even when dense is warm. */
+  useDense?: boolean;
+}
+
+export type RecallBackendCounts = { fts: number; vector: number; graph: number; recency: number };
+
+export interface RecallEvidence {
+  chunkId: number;
+  matchType: string;
+  score: number;
+  sourceFile?: string;
+  section?: string;
+}
 
 export class MemoryStore {
   private dbPath: string;
@@ -69,6 +126,34 @@ export class MemoryStore {
   constructor(dbPath: string, vaultDir: string) {
     this.dbPath = dbPath;
     this.vaultDir = vaultDir;
+  }
+
+  private static confidenceMultiplier(confidence: number | null | undefined): number {
+    const conf = Math.max(0, Math.min(1, confidence ?? 1));
+    return conf >= 1 ? 1 : 0.5 + 0.5 * conf;
+  }
+
+  private static formatBytes(n: number): string {
+    if (!Number.isFinite(n) || n < 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  private static dirSizeBytes(dir: string): number {
+    if (!existsSync(dir)) return 0;
+    let total = 0;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) total += MemoryStore.dirSizeBytes(full);
+        else if (entry.isFile()) total += statSync(full).size;
+      }
+    } catch {
+      return total;
+    }
+    return total;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -154,6 +239,29 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_key);
       CREATE INDEX IF NOT EXISTS idx_transcripts_created ON transcripts(created_at);
 
+      CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+        session_key, role, content, model, created_at,
+        content='transcripts', content_rowid='id',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_ai AFTER INSERT ON transcripts BEGIN
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        VALUES (new.id, new.session_key, new.role, new.content, new.model, new.created_at);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_ad AFTER DELETE ON transcripts BEGIN
+        INSERT INTO transcripts_fts(transcripts_fts, rowid, session_key, role, content, model, created_at)
+        VALUES ('delete', old.id, old.session_key, old.role, old.content, old.model, old.created_at);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_au AFTER UPDATE ON transcripts BEGIN
+        INSERT INTO transcripts_fts(transcripts_fts, rowid, session_key, role, content, model, created_at)
+        VALUES ('delete', old.id, old.session_key, old.role, old.content, old.model, old.created_at);
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        VALUES (new.id, new.session_key, new.role, new.content, new.model, new.created_at);
+      END;
+
       CREATE TABLE IF NOT EXISTS session_summaries (
         id INTEGER PRIMARY KEY,
         session_key TEXT NOT NULL,
@@ -164,7 +272,32 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_session_summaries_key ON session_summaries(session_key);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at);
+
+      CREATE TABLE IF NOT EXISTS session_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        parent_session_id TEXT,
+        child_session_id TEXT,
+        reason TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        exchange_count INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_lineage_key ON session_lineage(session_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_session_lineage_parent ON session_lineage(parent_session_id);
     `);
+
+    try {
+      this.conn.exec(`
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        SELECT id, session_key, role, content, model, created_at
+        FROM transcripts
+        WHERE id NOT IN (SELECT rowid FROM transcripts_fts)
+      `);
+    } catch {
+      // FTS backfill is best-effort; triggers keep new rows indexed.
+    }
 
     // ── Migrations ────────────────────────────────────────────────
     // Add salience column to chunks
@@ -406,6 +539,54 @@ export class MemoryStore {
       );
       CREATE INDEX IF NOT EXISTS idx_extractions_session ON memory_extractions(session_key);
       CREATE INDEX IF NOT EXISTS idx_extractions_status ON memory_extractions(status);
+    `);
+
+    // Memory event ledger — compact proof that each major input stream has
+    // crossed into the memory system. This is intentionally smaller than the
+    // source payload tables; it powers health checks and lets us spot gaps
+    // like "transcripts are saved but never indexed".
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_type TEXT NOT NULL,
+        source_id INTEGER,
+        session_key TEXT,
+        agent_slug TEXT,
+        content_hash TEXT NOT NULL,
+        content_preview TEXT NOT NULL,
+        indexed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_events_source
+        ON memory_events(source_type, source_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_events_session
+        ON memory_events(session_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_events_created
+        ON memory_events(created_at DESC);
+    `);
+
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS memory_promotion_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_kind TEXT NOT NULL,
+        source_table TEXT NOT NULL DEFAULT 'memory_extractions',
+        source_id INTEGER,
+        session_key TEXT,
+        agent_slug TEXT,
+        content_preview TEXT NOT NULL,
+        confidence REAL DEFAULT 0.5,
+        salience REAL DEFAULT 1.0,
+        reason TEXT,
+        decision TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        decided_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_promotion_candidates_decision
+        ON memory_promotion_candidates(decision, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_promotion_candidates_session
+        ON memory_promotion_candidates(session_key);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_promotion_candidates_source
+        ON memory_promotion_candidates(source_table, source_id) WHERE source_id IS NOT NULL;
     `);
 
     // Add agent_slug column to memory_extractions
@@ -732,6 +913,12 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source ON ingestion_runs(source_slug, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_ingestion_runs_status ON ingestion_runs(status);
     `);
+    try {
+      this.conn.exec('ALTER TABLE ingestion_runs ADD COLUMN records_unchanged INTEGER NOT NULL DEFAULT 0');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE ingestion_runs ADD COLUMN recall_check_status TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
 
     // Ingested rows — structured overlay on chunks for SQL aggregates.
     // chunk_id FK makes this an INDEX on top of chunks, not a silo.
@@ -791,6 +978,18 @@ export class MemoryStore {
     try {
       this.conn.exec('ALTER TABLE recall_traces ADD COLUMN match_types TEXT DEFAULT NULL');
     } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN backend_counts TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN evidence_json TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN confidence REAL DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN empty_reason TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
 
     // Dense neural embeddings (transformers.js — arctic-embed-m by default).
     // Parallel to the existing chunks.embedding (TF-IDF, 512-dim) so we can
@@ -807,6 +1006,140 @@ export class MemoryStore {
     try {
       this.conn.exec('CREATE INDEX idx_chunks_has_dense ON chunks(id) WHERE embedding_dense IS NOT NULL');
     } catch { /* already exists */ }
+
+    // Dense neural embeddings on transcripts. Parallel to chunks.embedding_dense
+    // but for raw conversation history. Enables paraphrased recall over past
+    // chats — "what did we decide about auth?" can match a turn that said
+    // "session token middleware" without lexical overlap. Backfilled by
+    // backfillTranscriptDenseEmbeddings(); not embedded at insert time so the
+    // hot insert path stays sync.
+    try {
+      this.conn.exec('ALTER TABLE transcripts ADD COLUMN embedding_dense BLOB');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE transcripts ADD COLUMN embedding_dense_model TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_transcripts_has_dense ON transcripts(id) WHERE embedding_dense IS NOT NULL');
+    } catch { /* already exists */ }
+
+    // Recall telemetry — every conversation-recall query logs hit counts and
+    // top score so the dashboard can show whether dense retrieval actually
+    // earns its keep on this corpus.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS recall_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        query TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        semantic_hits INTEGER DEFAULT 0,
+        lexical_hits INTEGER DEFAULT 0,
+        fused_hits INTEGER DEFAULT 0,
+        top_score REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_recall_telemetry_created ON recall_telemetry(created_at DESC);
+    `);
+
+    // Episodes — durable, retrievable summaries of past sessions. Each
+    // episode is one chunked range of transcripts; the LLM extracts
+    // {summary, topics, entities, outcome, openLoops}. The summary text is
+    // also written into chunks so hybrid recall picks it up. transcript_ids
+    // is a JSON array; we don't normalize because the lineage is read-only.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        topics TEXT,
+        entities TEXT,
+        outcome TEXT,
+        open_loops TEXT,
+        transcript_ids TEXT,
+        chunk_id INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_key, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at DESC);
+    `);
+
+    // Per-session consolidation cursor — tracks how far the LLM has
+    // summarized so we don't re-consolidate the same turns. Failure tracking
+    // (fail_count + last_attempted_at) lets us back off cleanly when the
+    // model rejects a session repeatedly without spamming retries.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS consolidation_cursors (
+        session_key TEXT PRIMARY KEY,
+        last_transcript_id INTEGER NOT NULL DEFAULT 0,
+        last_attempted_at TEXT,
+        last_success_at TEXT,
+        fail_count INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
+    // Learned facts — durable beliefs and preferences extracted from
+    // consolidated episodes. Distinct from chunks (which are vault-level
+    // knowledge) and from user_model_blocks (which is a free-form
+    // accumulation buffer). Supersession is first-class: when a new fact
+    // contradicts an old one, the old row's status becomes 'superseded'
+    // and superseded_by_id links to the replacement, so the dashboard can
+    // show the lineage and the prompt-injection path can filter to active.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS learned_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        source_episode_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT DEFAULT (datetime('now')),
+        superseded_at TEXT,
+        superseded_by_id INTEGER,
+        cancelled_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_learned_facts_active ON learned_facts(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_learned_facts_kind ON learned_facts(kind, status);
+    `);
+
+    // Episode supersession — when a new episode replaces a prior one's
+    // conclusion (e.g., yesterday "decided X", today "actually switching
+    // to Y"). Lets recall prefer the canonical / current record.
+    try {
+      this.conn.exec('ALTER TABLE episodes ADD COLUMN superseded_by_id INTEGER');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE episodes ADD COLUMN superseded_at TEXT');
+    } catch { /* column already exists */ }
+
+    // Commitments — first-class promises in either direction. owner = 'user'
+    // for "I'll fix that tomorrow" turns, 'clementine' for things she
+    // committed to do. fingerprint = sha1(session_key|owner|normalized_text)
+    // makes the explicit detector and the LLM episode extractor share an
+    // idempotent insert path so one promise doesn't get double-recorded.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS commitments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint TEXT NOT NULL UNIQUE,
+        source TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        text TEXT NOT NULL,
+        session_key TEXT,
+        transcript_id INTEGER,
+        episode_id INTEGER,
+        due_at TEXT,
+        due_hint TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT DEFAULT (datetime('now')),
+        completed_at TEXT,
+        snoozed_until TEXT,
+        notes TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments(status, due_at);
+      CREATE INDEX IF NOT EXISTS idx_commitments_session ON commitments(session_key, status);
+      CREATE INDEX IF NOT EXISTS idx_commitments_owner ON commitments(owner, status);
+    `);
 
     // Soft-delete via a separate table — keeps the chunks_au trigger
     // out of the path so we don't have to fight with the FTS5 contentless
@@ -1677,7 +2010,7 @@ export class MemoryStore {
     try {
       let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                   c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic,
-                  c.pinned, bm25(chunks_fts) as score
+                  c.pinned, c.confidence, bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
            LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
@@ -1714,6 +2047,7 @@ export class MemoryStore {
         category: string | null;
         topic: string | null;
         pinned: number | null;
+        confidence: number | null;
         score: number;
       }>;
 
@@ -1732,6 +2066,7 @@ export class MemoryStore {
         category: row.category,
         topic: row.topic,
         pinned: row.pinned === 1,
+        confidence: row.confidence ?? 1,
       }));
     } catch {
       return [];
@@ -1761,6 +2096,7 @@ export class MemoryStore {
       agent_slug: string | null;
       category: string | null;
       topic: string | null;
+      confidence: number | null;
     };
 
     const now = Date.now();
@@ -1771,7 +2107,7 @@ export class MemoryStore {
       // chunk were indistinguishable. Decay lets recent results actually
       // compete with FTS and vector matches during rerank.
       const daysOld = row.updated_at ? (now - Date.parse(row.updated_at)) / 86_400_000 : 0;
-      const decayed = temporalDecay(daysOld);
+      const decayed = temporalDecay(daysOld) * MemoryStore.confidenceMultiplier(row.confidence);
       return {
         sourceFile: row.source_file,
         section: row.section,
@@ -1786,6 +2122,7 @@ export class MemoryStore {
         agentSlug: row.agent_slug ?? null,
         category: row.category,
         topic: row.topic,
+        confidence: row.confidence ?? 1,
       };
     };
 
@@ -1811,7 +2148,7 @@ export class MemoryStore {
       if (strict) {
         const rows = this.conn.prepare(
           `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
            FROM chunks c${sdJoin}
            WHERE (c.agent_slug = ? OR c.agent_slug IS NULL)${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
            ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1821,7 +2158,7 @@ export class MemoryStore {
 
       const agentRows = this.conn.prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE c.agent_slug = ?${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1829,7 +2166,7 @@ export class MemoryStore {
 
       const globalRows = this.conn.prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE c.agent_slug IS NULL${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1841,7 +2178,7 @@ export class MemoryStore {
     const rows = this.conn
       .prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE 1=1${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC
@@ -1932,7 +2269,7 @@ export class MemoryStore {
       .prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                 c.salience, c.agent_slug, c.category, c.topic, c.updated_at,
-                c.last_outcome_score, c.pinned
+                c.last_outcome_score, c.pinned, c.confidence
          FROM chunks c
          LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
          WHERE c.source_file IN (${filePh})
@@ -1954,6 +2291,7 @@ export class MemoryStore {
       updated_at: string;
       last_outcome_score: number | null;
       pinned: number | null;
+      confidence: number | null;
     }>;
 
     const seedScoreMax = Math.max(...seeds.map((s) => s.score), 1);
@@ -1967,7 +2305,7 @@ export class MemoryStore {
         sourceFile: r.source_file,
         section: r.section,
         content: r.content,
-        score: seedScoreMax * boost * (1 + (r.salience ?? 0)),
+        score: seedScoreMax * boost * (1 + (r.salience ?? 0)) * MemoryStore.confidenceMultiplier(r.confidence),
         chunkType: r.chunk_type,
         matchType: 'graph',
         lastUpdated: r.updated_at,
@@ -1978,6 +2316,7 @@ export class MemoryStore {
         category: r.category,
         topic: r.topic,
         pinned: !!r.pinned,
+        confidence: r.confidence ?? 1,
       });
       if (out.length >= maxNeighbors) break;
     }
@@ -1996,21 +2335,7 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | {
-      limit?: number;
-      recencyLimit?: number;
-      agentSlug?: string;
-      category?: string;
-      topic?: string;
-      strict?: boolean;
-      sessionKey?: string;
-      messageId?: string;
-      skipTrace?: boolean;
-      /** Pre-computed dense query vector. When provided, use the dense
-       *  embedding column for vector search. Caller computes this via
-       *  embedDense() (async) so this method can stay sync. */
-      queryDenseVec?: Float32Array;
-    } = 3,
+    limitOrOpts: number | SearchContextOptions = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
@@ -2065,6 +2390,7 @@ export class MemoryStore {
       if (outcome !== 0) {
         r.score *= 1.0 + 0.3 * outcome;
       }
+      r.score *= MemoryStore.confidenceMultiplier(r.confidence);
       // Temporal decay — without this, a 2-year-old chunk with the same BM25
       // score ranks identically to one from yesterday. Half-life of 30 days
       // (matches TEMPORAL_DECAY_HALF_LIFE_DAYS in config). Applied to a
@@ -2132,7 +2458,24 @@ export class MemoryStore {
 
     // 5. Log recall trace if session context provided. Skipped for internal
     // calls (e.g. consolidation, dedup checks) by passing skipTrace=true.
-    if (sessionKey && !skipTrace && finalResults.length > 0) {
+    if (sessionKey && !skipTrace) {
+      const backendCounts: RecallBackendCounts = {
+        fts: ftsResults.length,
+        vector: vectorResults.length,
+        graph: graphResults.length,
+        recency: recentResults.length,
+      };
+      const evidence: RecallEvidence[] = finalResults.slice(0, 8).map((r) => ({
+        chunkId: r.chunkId,
+        matchType: r.matchType,
+        score: r.score,
+        sourceFile: r.sourceFile,
+        section: r.section,
+      }));
+      const topScore = finalResults[0]?.score ?? 0;
+      const confidence = finalResults.length > 0
+        ? Math.max(0.1, Math.min(1, topScore / (Math.abs(topScore) + 1)))
+        : 0;
       this.logRecallTrace({
         sessionKey,
         messageId: messageId ?? null,
@@ -2141,10 +2484,43 @@ export class MemoryStore {
         scores: finalResults.map(r => r.score),
         agentSlug: agentSlug ?? null,
         matchTypes: finalResults.map(r => r.matchType),
+        backendCounts,
+        evidence,
+        confidence,
+        emptyReason: finalResults.length === 0 ? 'no_backend_matches' : null,
+        allowEmpty: finalResults.length === 0,
       });
     }
 
     return finalResults;
+  }
+
+  /**
+   * Dense-aware wrapper around searchContext. The core search method stays
+   * synchronous for existing callers/tests; this async entry point computes
+   * the dense query embedding when the model is already warm.
+   */
+  async searchContextAsync(
+    query: string,
+    limitOrOpts: number | SearchContextOptions = 3,
+    recencyLimitArg: number = 5,
+  ): Promise<SearchResult[]> {
+    const opts: SearchContextOptions = typeof limitOrOpts === 'object'
+      ? { ...limitOrOpts }
+      : { limit: limitOrOpts, recencyLimit: recencyLimitArg };
+
+    if (opts.useDense !== false && !opts.queryDenseVec) {
+      try {
+        if (embeddingsModule.isDenseReady()) {
+          const denseVec = await embeddingsModule.embedDense(query, true);
+          if (denseVec) opts.queryDenseVec = denseVec;
+        }
+      } catch {
+        // Dense recall is opportunistic; searchContext still has FTS/sparse fallback.
+      }
+    }
+
+    return this.searchContext(query, opts);
   }
 
   /**
@@ -2160,8 +2536,13 @@ export class MemoryStore {
     scores: number[];
     agentSlug?: string | null;
     matchTypes?: string[];
+    backendCounts?: RecallBackendCounts | null;
+    evidence?: RecallEvidence[];
+    confidence?: number | null;
+    emptyReason?: string | null;
+    allowEmpty?: boolean;
   }): void {
-    if (opts.chunkIds.length === 0) return;
+    if (opts.chunkIds.length === 0 && !opts.allowEmpty) return;
     if (this.writeQueue) {
       this.writeQueue.enqueue({
         kind: 'recall',
@@ -2172,6 +2553,11 @@ export class MemoryStore {
         scores: [...opts.scores],
         agentSlug: opts.agentSlug ?? null,
         matchTypes: opts.matchTypes ? [...opts.matchTypes] : undefined,
+        backendCounts: opts.backendCounts ?? undefined,
+        evidence: opts.evidence ? [...opts.evidence] : undefined,
+        confidence: opts.confidence ?? undefined,
+        emptyReason: opts.emptyReason ?? undefined,
+        allowEmpty: opts.allowEmpty,
       });
       return;
     }
@@ -2187,12 +2573,19 @@ export class MemoryStore {
     scores: number[];
     agentSlug?: string | null;
     matchTypes?: string[];
+    backendCounts?: RecallBackendCounts | null;
+    evidence?: RecallEvidence[];
+    confidence?: number | null;
+    emptyReason?: string | null;
+    allowEmpty?: boolean;
   }): void {
-    if (opts.chunkIds.length === 0) return;
+    if (opts.chunkIds.length === 0 && !opts.allowEmpty) return;
     try {
       this.conn.prepare(
-        `INSERT INTO recall_traces (session_key, message_id, query, chunk_ids, scores, agent_slug, match_types)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO recall_traces
+         (session_key, message_id, query, chunk_ids, scores, agent_slug, match_types,
+          backend_counts, evidence_json, confidence, empty_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         opts.sessionKey,
         opts.messageId ?? null,
@@ -2201,6 +2594,10 @@ export class MemoryStore {
         JSON.stringify(opts.scores),
         opts.agentSlug ?? null,
         opts.matchTypes ? JSON.stringify(opts.matchTypes) : null,
+        opts.backendCounts ? JSON.stringify(opts.backendCounts) : null,
+        opts.evidence ? JSON.stringify(opts.evidence) : null,
+        opts.confidence ?? null,
+        opts.emptyReason ?? null,
       );
     } catch {
       // Non-fatal — recall trace logging never breaks retrieval
@@ -2217,10 +2614,15 @@ export class MemoryStore {
     query: string;
     chunkIds: number[];
     scores: number[];
+    backendCounts: RecallBackendCounts | null;
+    evidence: RecallEvidence[];
+    confidence: number | null;
+    emptyReason: string | null;
     retrievedAt: string;
   }> {
     const rows = this.conn.prepare(
-      `SELECT id, message_id, query, chunk_ids, scores, retrieved_at
+      `SELECT id, message_id, query, chunk_ids, scores, backend_counts,
+              evidence_json, confidence, empty_reason, retrieved_at
        FROM recall_traces
        WHERE session_key = ?
        ORDER BY retrieved_at DESC, id DESC
@@ -2231,6 +2633,10 @@ export class MemoryStore {
       query: string;
       chunk_ids: string;
       scores: string;
+      backend_counts: string | null;
+      evidence_json: string | null;
+      confidence: number | null;
+      empty_reason: string | null;
       retrieved_at: string;
     }>;
 
@@ -2240,6 +2646,10 @@ export class MemoryStore {
       query: r.query,
       chunkIds: this._parseJsonArray<number>(r.chunk_ids),
       scores: this._parseJsonArray<number>(r.scores),
+      backendCounts: this._parseJsonObject<RecallBackendCounts>(r.backend_counts),
+      evidence: this._parseJsonArray<RecallEvidence>(r.evidence_json ?? '[]'),
+      confidence: r.confidence,
+      emptyReason: r.empty_reason,
       retrievedAt: r.retrieved_at,
     }));
   }
@@ -2254,6 +2664,10 @@ export class MemoryStore {
     messageId: string | null;
     query: string;
     retrievedAt: string;
+    backendCounts: RecallBackendCounts | null;
+    evidence: RecallEvidence[];
+    confidence: number | null;
+    emptyReason: string | null;
     chunks: Array<{
       id: number;
       sourceFile: string;
@@ -2267,7 +2681,8 @@ export class MemoryStore {
     }>;
   } | null {
     const trace = this.conn.prepare(
-      `SELECT id, session_key, message_id, query, chunk_ids, scores, retrieved_at
+      `SELECT id, session_key, message_id, query, chunk_ids, scores,
+              backend_counts, evidence_json, confidence, empty_reason, retrieved_at
        FROM recall_traces WHERE id = ?`,
     ).get(traceId) as {
       id: number;
@@ -2276,6 +2691,10 @@ export class MemoryStore {
       query: string;
       chunk_ids: string;
       scores: string;
+      backend_counts: string | null;
+      evidence_json: string | null;
+      confidence: number | null;
+      empty_reason: string | null;
       retrieved_at: string;
     } | undefined;
     if (!trace) return null;
@@ -2307,6 +2726,10 @@ export class MemoryStore {
       messageId: trace.message_id,
       query: trace.query,
       retrievedAt: trace.retrieved_at,
+      backendCounts: this._parseJsonObject<RecallBackendCounts>(trace.backend_counts),
+      evidence: this._parseJsonArray<RecallEvidence>(trace.evidence_json ?? '[]'),
+      confidence: trace.confidence,
+      emptyReason: trace.empty_reason,
       chunks: ordered,
     };
   }
@@ -2437,6 +2860,16 @@ export class MemoryStore {
       return Array.isArray(parsed) ? (parsed as T[]) : [];
     } catch {
       return [];
+    }
+  }
+
+  private _parseJsonObject<T>(json: string | null | undefined): T | null {
+    if (!json) return null;
+    try {
+      const parsed = JSON.parse(json);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as T) : null;
+    } catch {
+      return null;
     }
   }
 
@@ -2660,7 +3093,7 @@ export class MemoryStore {
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
         const conf = row.confidence ?? 1;
-        if (conf < 1) score *= (0.5 + 0.5 * conf);
+        score *= MemoryStore.confidenceMultiplier(conf);
         // Soft isolation: apply boost (only when not strict)
         if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
         // Temporal decay — same policy as FTS scoring (Phase 9d). Without
@@ -2688,6 +3121,7 @@ export class MemoryStore {
           agentSlug: row.agent_slug ?? undefined,
           category: row.category,
           topic: row.topic,
+          confidence: conf,
         });
       } catch { continue; }
     }
@@ -2742,7 +3176,7 @@ export class MemoryStore {
         // Confidence multiplier: tentative chunks (low confidence) lose ranking
         // weight without being hidden. confidence=1.0 → no effect, 0.5 → 0.75×.
         const conf = row.confidence ?? 1;
-        if (conf < 1) score *= (0.5 + 0.5 * conf);
+        score *= MemoryStore.confidenceMultiplier(conf);
         if (row.salience > 0) score *= (1.0 + row.salience);
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
@@ -2765,6 +3199,7 @@ export class MemoryStore {
           agentSlug: row.agent_slug ?? undefined,
           category: row.category,
           topic: row.topic,
+          confidence: conf,
         });
       } catch { continue; }
     }
@@ -2984,7 +3419,15 @@ export class MemoryStore {
         'INSERT INTO transcripts (session_key, role, content, model) VALUES (?, ?, ?, ?)',
       );
     }
-    this._stmtInsertTranscript.run(sessionKey, role, content, model);
+    const info = this._stmtInsertTranscript.run(sessionKey, role, content, model);
+    this.recordMemoryEvent({
+      sourceType: 'transcript',
+      sourceId: info.lastInsertRowid as number,
+      sessionKey,
+      agentSlug: null,
+      content: `${role}: ${content}`,
+      indexed: true,
+    });
   }
 
   /**
@@ -3088,8 +3531,9 @@ export class MemoryStore {
     limit: number = 20,
     sessionKey: string = '',
   ): TranscriptTurn[] {
-    const queryLower = `%${query.toLowerCase()}%`;
+    const sanitized = MemoryStore.sanitizeFtsQuery(query);
     let rows: Array<{
+      id: number;
       session_key: string;
       role: string;
       content: string;
@@ -3097,10 +3541,39 @@ export class MemoryStore {
       created_at: string;
     }>;
 
+    if (sanitized) {
+      try {
+        const params: unknown[] = [sanitized];
+        let sql = `SELECT t.id, t.session_key, t.role, t.content, t.model, t.created_at
+           FROM transcripts_fts f
+           JOIN transcripts t ON t.id = f.rowid
+           WHERE transcripts_fts MATCH ?`;
+        if (sessionKey) {
+          sql += ' AND t.session_key = ?';
+          params.push(sessionKey);
+        }
+        sql += ' ORDER BY t.created_at DESC, t.id DESC LIMIT ?';
+        params.push(limit);
+        rows = this.conn.prepare(sql).all(...params) as typeof rows;
+
+        return rows.map((row) => ({
+          id: row.id,
+          sessionKey: row.session_key,
+          role: row.role,
+          content: row.content.slice(0, 2000),
+          model: row.model,
+          createdAt: row.created_at,
+        }));
+      } catch {
+        // Fall back to LIKE for malformed FTS queries or legacy SQLite builds.
+      }
+    }
+
+    const queryLower = `%${query.toLowerCase()}%`;
     if (sessionKey) {
       rows = this.conn
         .prepare(
-          `SELECT session_key, role, content, model, created_at
+          `SELECT id, session_key, role, content, model, created_at
            FROM transcripts
            WHERE session_key = ? AND LOWER(content) LIKE ?
            ORDER BY created_at DESC LIMIT ?`,
@@ -3109,7 +3582,7 @@ export class MemoryStore {
     } else {
       rows = this.conn
         .prepare(
-          `SELECT session_key, role, content, model, created_at
+          `SELECT id, session_key, role, content, model, created_at
            FROM transcripts
            WHERE LOWER(content) LIKE ?
            ORDER BY created_at DESC LIMIT ?`,
@@ -3118,11 +3591,899 @@ export class MemoryStore {
     }
 
     return rows.map((row) => ({
+      id: row.id,
       sessionKey: row.session_key,
       role: row.role,
       content: row.content.slice(0, 2000), // Truncate for readability
       model: row.model,
       createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Dense-embedding search over transcripts. Counterpart to searchTranscripts
+   * (FTS5) — returns turns ranked by cosine similarity to a pre-computed query
+   * vector. Caller computes the vector via embeddingsModule.embedDense(text, true)
+   * so the retrieval-instruction prefix is applied; returning empty here is
+   * expected when no transcripts have been backfilled yet.
+   */
+  searchTranscriptsByDense(
+    queryVec: Float32Array,
+    limit: number = 20,
+    sessionKey: string = '',
+  ): Array<{ turn: TranscriptTurn; score: number }> {
+    const params: Array<string | number> = [];
+    let sql = `SELECT id, session_key, role, content, model, created_at, embedding_dense
+                 FROM transcripts WHERE embedding_dense IS NOT NULL`;
+    if (sessionKey) {
+      sql += ' AND session_key = ?';
+      params.push(sessionKey);
+    }
+    let rows: Array<{
+      id: number;
+      session_key: string;
+      role: string;
+      content: string;
+      model: string;
+      created_at: string;
+      embedding_dense: Buffer;
+    }>;
+    try {
+      rows = this.conn.prepare(sql).all(...params) as typeof rows;
+    } catch {
+      return [];
+    }
+
+    const scored: Array<{ turn: TranscriptTurn; score: number }> = [];
+    const nowMs = Date.now();
+    for (const row of rows) {
+      try {
+        const vec = embeddingsModule.deserializeEmbedding(row.embedding_dense);
+        const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
+        if (sim < 0.3) continue;
+        let score = sim;
+        if (row.created_at) {
+          const daysOld = Math.max(0, (nowMs - new Date(row.created_at).getTime()) / 86_400_000);
+          // Gentler decay than chunks: conversations stay relevant longer.
+          score *= Math.max(0.5, temporalDecay(daysOld, 60));
+        }
+        scored.push({
+          turn: {
+            id: row.id,
+            sessionKey: row.session_key,
+            role: row.role,
+            content: row.content.slice(0, 2000),
+            model: row.model,
+            createdAt: row.created_at,
+          },
+          score,
+        });
+      } catch { /* skip malformed embeddings */ }
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * Backfill dense embeddings on transcripts that don't yet have one (or that
+   * were embedded by a different model). Mirrors backfillDenseEmbeddings() on
+   * chunks.
+   */
+  async backfillTranscriptDenseEmbeddings(opts: {
+    limit?: number;
+    onProgress?: (done: number, total: number) => void;
+    forceModel?: string;
+  } = {}): Promise<{ embedded: number; skipped: number; failed: number; model: string }> {
+    const currentModel = embeddingsModule.currentDenseModel();
+    const targetModel = opts.forceModel ?? currentModel;
+
+    const candidates = this.conn.prepare(
+      `SELECT id, role, content
+       FROM transcripts
+       WHERE (embedding_dense IS NULL OR embedding_dense_model IS NULL OR embedding_dense_model != ?)
+         AND length(content) >= 1
+       ORDER BY created_at DESC
+       ${opts.limit ? 'LIMIT ?' : ''}`,
+    ).all(...[targetModel, ...(opts.limit ? [opts.limit] : [])]) as Array<{ id: number; role: string; content: string }>;
+
+    const total = candidates.length;
+    let embedded = 0;
+    let failed = 0;
+
+    const updateStmt = this.conn.prepare(
+      `UPDATE transcripts SET embedding_dense = ?, embedding_dense_model = ? WHERE id = ?`,
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      try {
+        // Prepend role so role-specific phrasing ("user said …" vs "assistant
+        // said …") clusters distinctly without conflating the speakers.
+        const passageText = `${c.role}: ${c.content}`.slice(0, 4000);
+        const vec = await embeddingsModule.embedDense(passageText, false);
+        if (vec) {
+          updateStmt.run(embeddingsModule.serializeEmbedding(vec), targetModel, c.id);
+          embedded++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+      if (opts.onProgress && (i + 1) % 25 === 0) {
+        opts.onProgress(i + 1, total);
+      }
+    }
+    if (opts.onProgress) opts.onProgress(total, total);
+
+    return { embedded, skipped: 0, failed, model: targetModel };
+  }
+
+  /**
+   * Coverage stats for transcript dense embeddings — analogous to chunks
+   * coverage, surfaced in the dashboard.
+   */
+  getTranscriptDenseCoverage(): { total: number; embedded: number; model: string | null } {
+    const totalRow = this.conn.prepare('SELECT COUNT(*) as cnt FROM transcripts').get() as { cnt: number };
+    const embeddedRow = this.conn
+      .prepare('SELECT COUNT(*) as cnt FROM transcripts WHERE embedding_dense IS NOT NULL')
+      .get() as { cnt: number };
+    const modelRow = this.conn
+      .prepare(`SELECT COALESCE(embedding_dense_model, '(unknown)') as model
+                FROM transcripts WHERE embedding_dense IS NOT NULL
+                GROUP BY embedding_dense_model ORDER BY COUNT(*) DESC LIMIT 1`)
+      .get() as { model: string } | undefined;
+    return {
+      total: totalRow?.cnt ?? 0,
+      embedded: embeddedRow?.cnt ?? 0,
+      model: modelRow?.model ?? null,
+    };
+  }
+
+  /**
+   * Log a conversation-recall hit for telemetry. Caller pre-computes hit
+   * counts; this method is a fast best-effort insert that swallows errors
+   * because telemetry must never break the chat path.
+   */
+  logRecallTelemetry(entry: {
+    sessionKey: string;
+    query: string;
+    mode: 'hybrid' | 'dense' | 'lexical';
+    semanticHits: number;
+    lexicalHits: number;
+    fusedHits: number;
+    topScore: number;
+  }): void {
+    try {
+      this.conn
+        .prepare(
+          `INSERT INTO recall_telemetry
+           (session_key, query, mode, semantic_hits, lexical_hits, fused_hits, top_score)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          entry.sessionKey,
+          entry.query.slice(0, 500),
+          entry.mode,
+          entry.semanticHits,
+          entry.lexicalHits,
+          entry.fusedHits,
+          entry.topScore,
+        );
+    } catch { /* telemetry must not break chat */ }
+  }
+
+  /**
+   * Aggregate recall telemetry over a recent window for the dashboard.
+   */
+  getRecallTelemetrySummary(windowDays: number = 7): {
+    total: number;
+    semanticOnly: number;
+    lexicalOnly: number;
+    bothModes: number;
+    avgTopScore: number;
+  } {
+    try {
+      const row = this.conn
+        .prepare(
+          `SELECT COUNT(*) as total,
+                  SUM(CASE WHEN semantic_hits > 0 AND lexical_hits = 0 THEN 1 ELSE 0 END) as semantic_only,
+                  SUM(CASE WHEN lexical_hits > 0 AND semantic_hits = 0 THEN 1 ELSE 0 END) as lexical_only,
+                  SUM(CASE WHEN semantic_hits > 0 AND lexical_hits > 0 THEN 1 ELSE 0 END) as both_modes,
+                  AVG(top_score) as avg_top_score
+           FROM recall_telemetry
+           WHERE created_at > datetime('now', ?)`,
+        )
+        .get(`-${Math.max(1, windowDays)} days`) as {
+          total: number;
+          semantic_only: number | null;
+          lexical_only: number | null;
+          both_modes: number | null;
+          avg_top_score: number | null;
+        };
+      return {
+        total: row?.total ?? 0,
+        semanticOnly: row?.semantic_only ?? 0,
+        lexicalOnly: row?.lexical_only ?? 0,
+        bothModes: row?.both_modes ?? 0,
+        avgTopScore: row?.avg_top_score ?? 0,
+      };
+    } catch {
+      return { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+    }
+  }
+
+  // ── Episodes (durable session summaries) ──────────────────────────
+
+  /**
+   * Find sessions whose latest turn is older than `idleMinutes` minutes,
+   * have at least `minExchanges` user/assistant turns combined since the
+   * last consolidation cursor, and aren't already up-to-date. Returns one
+   * row per session ranked oldest-idle first so we consolidate the
+   * least-fresh first when bounded by maxResults.
+   */
+  getIdleSessionsForEpisodicConsolidation(opts: {
+    idleMinutes: number;
+    minExchanges: number;
+    maxResults: number;
+    failBackoffMinutes?: number;
+  }): Array<{
+    sessionKey: string;
+    startTranscriptId: number;
+    endTranscriptId: number;
+    startedAt: string;
+    endedAt: string;
+    exchanges: number;
+  }> {
+    const idleMin = Math.max(1, opts.idleMinutes);
+    const minEx = Math.max(1, opts.minExchanges);
+    const max = Math.max(1, opts.maxResults);
+    const backoff = Math.max(0, opts.failBackoffMinutes ?? 60);
+    try {
+      // Per-session: last cursor (or 0), count of new turns, MIN/MAX(id)
+      // bounding the new range, and the timestamps. The fail-backoff
+      // suppresses sessions whose last_attempted_at is recent enough that
+      // the cursor's fail_count > 0 indicates we should wait.
+      const rows = this.conn.prepare(`
+        SELECT
+          t.session_key AS session_key,
+          MIN(t.id) AS start_id,
+          MAX(t.id) AS end_id,
+          MIN(t.created_at) AS started_at,
+          MAX(t.created_at) AS ended_at,
+          COUNT(*) AS exchanges
+        FROM transcripts t
+        LEFT JOIN consolidation_cursors c ON c.session_key = t.session_key
+        WHERE t.id > COALESCE(c.last_transcript_id, 0)
+          AND (
+            c.fail_count IS NULL
+            OR c.fail_count = 0
+            OR c.last_attempted_at IS NULL
+            OR c.last_attempted_at < datetime('now', ?)
+          )
+        GROUP BY t.session_key
+        HAVING COUNT(*) >= ?
+           AND MAX(t.created_at) < datetime('now', ?)
+        ORDER BY MAX(t.created_at) ASC
+        LIMIT ?
+      `).all(`-${backoff} minutes`, minEx, `-${idleMin} minutes`, max) as Array<{
+        session_key: string;
+        start_id: number;
+        end_id: number;
+        started_at: string;
+        ended_at: string;
+        exchanges: number;
+      }>;
+      return rows.map(r => ({
+        sessionKey: r.session_key,
+        startTranscriptId: r.start_id,
+        endTranscriptId: r.end_id,
+        startedAt: r.started_at,
+        endedAt: r.ended_at,
+        exchanges: r.exchanges,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Persist a consolidated episode and bump the per-session cursor so the
+   * same range isn't re-consolidated on the next pass. The summary text is
+   * also indexed into chunks (returned as chunkId) so hybrid recall surfaces
+   * episodes alongside raw transcripts.
+   */
+  insertEpisode(entry: {
+    sessionKey: string;
+    startedAt: string;
+    endedAt: string;
+    summary: string;
+    topics: string[];
+    entities: string[];
+    outcome: string;
+    openLoops: string[];
+    transcriptIds: number[];
+    chunkId?: number | null;
+  }): { episodeId: number; chunkId: number | null } {
+    const result = this.conn
+      .prepare(
+        `INSERT INTO episodes
+         (session_key, started_at, ended_at, summary, topics, entities, outcome, open_loops, transcript_ids, chunk_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.sessionKey,
+        entry.startedAt,
+        entry.endedAt,
+        entry.summary,
+        JSON.stringify(entry.topics ?? []),
+        JSON.stringify(entry.entities ?? []),
+        entry.outcome ?? '',
+        JSON.stringify(entry.openLoops ?? []),
+        JSON.stringify(entry.transcriptIds ?? []),
+        entry.chunkId ?? null,
+      );
+    return {
+      episodeId: result.lastInsertRowid as number,
+      chunkId: entry.chunkId ?? null,
+    };
+  }
+
+  /**
+   * Mark a consolidation pass result on the per-session cursor. On success
+   * we advance last_transcript_id and reset fail_count; on failure we bump
+   * fail_count + last_attempted_at so the backoff-aware idle scan skips
+   * this session for a while.
+   */
+  updateConsolidationCursor(
+    sessionKey: string,
+    update: { lastTranscriptId?: number; success: boolean },
+  ): void {
+    const existing = this.conn
+      .prepare('SELECT session_key FROM consolidation_cursors WHERE session_key = ?')
+      .get(sessionKey) as { session_key: string } | undefined;
+    if (!existing) {
+      this.conn
+        .prepare(
+          `INSERT INTO consolidation_cursors
+           (session_key, last_transcript_id, last_attempted_at, last_success_at, fail_count)
+           VALUES (?, ?, datetime('now'), ?, ?)`,
+        )
+        .run(
+          sessionKey,
+          update.success ? (update.lastTranscriptId ?? 0) : 0,
+          update.success ? new Date().toISOString() : null,
+          update.success ? 0 : 1,
+        );
+      return;
+    }
+    if (update.success) {
+      this.conn
+        .prepare(
+          `UPDATE consolidation_cursors
+           SET last_transcript_id = ?, last_attempted_at = datetime('now'),
+               last_success_at = datetime('now'), fail_count = 0
+           WHERE session_key = ?`,
+        )
+        .run(update.lastTranscriptId ?? 0, sessionKey);
+    } else {
+      this.conn
+        .prepare(
+          `UPDATE consolidation_cursors
+           SET last_attempted_at = datetime('now'), fail_count = fail_count + 1
+           WHERE session_key = ?`,
+        )
+        .run(sessionKey);
+    }
+  }
+
+  /** Read the consolidation cursor for a session — used in tests and for diagnostics. */
+  getConsolidationCursor(sessionKey: string): {
+    sessionKey: string;
+    lastTranscriptId: number;
+    lastAttemptedAt: string | null;
+    lastSuccessAt: string | null;
+    failCount: number;
+  } | null {
+    const row = this.conn
+      .prepare('SELECT * FROM consolidation_cursors WHERE session_key = ?')
+      .get(sessionKey) as
+      | { session_key: string; last_transcript_id: number; last_attempted_at: string | null; last_success_at: string | null; fail_count: number }
+      | undefined;
+    if (!row) return null;
+    return {
+      sessionKey: row.session_key,
+      lastTranscriptId: row.last_transcript_id,
+      lastAttemptedAt: row.last_attempted_at,
+      lastSuccessAt: row.last_success_at,
+      failCount: row.fail_count,
+    };
+  }
+
+  /**
+   * List recent episodes for the dashboard. JSON columns are parsed back
+   * into arrays so callers don't have to.
+   */
+  listRecentEpisodes(opts: { limit?: number; sessionKey?: string; sinceIso?: string } = {}): Array<{
+    id: number;
+    sessionKey: string;
+    startedAt: string;
+    endedAt: string;
+    summary: string;
+    topics: string[];
+    entities: string[];
+    outcome: string;
+    openLoops: string[];
+    transcriptIds: number[];
+    chunkId: number | null;
+    createdAt: string;
+  }> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 30, 200));
+    const params: unknown[] = [];
+    let where = '';
+    if (opts.sessionKey) {
+      where += where ? ' AND' : ' WHERE';
+      where += ' session_key = ?';
+      params.push(opts.sessionKey);
+    }
+    if (opts.sinceIso) {
+      where += where ? ' AND' : ' WHERE';
+      where += ' created_at >= ?';
+      params.push(opts.sinceIso);
+    }
+    params.push(limit);
+    const rows = this.conn
+      .prepare(`SELECT * FROM episodes${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params) as Array<{
+        id: number;
+        session_key: string;
+        started_at: string;
+        ended_at: string;
+        summary: string;
+        topics: string | null;
+        entities: string | null;
+        outcome: string | null;
+        open_loops: string | null;
+        transcript_ids: string | null;
+        chunk_id: number | null;
+        created_at: string;
+      }>;
+    const parseArray = (v: string | null): string[] => {
+      if (!v) return [];
+      try { const x = JSON.parse(v); return Array.isArray(x) ? x.map(String) : []; } catch { return []; }
+    };
+    const parseNumArray = (v: string | null): number[] => {
+      if (!v) return [];
+      try { const x = JSON.parse(v); return Array.isArray(x) ? x.filter(n => Number.isFinite(n)).map(Number) : []; } catch { return []; }
+    };
+    return rows.map(row => ({
+      id: row.id,
+      sessionKey: row.session_key,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      summary: row.summary,
+      topics: parseArray(row.topics),
+      entities: parseArray(row.entities),
+      outcome: row.outcome ?? '',
+      openLoops: parseArray(row.open_loops),
+      transcriptIds: parseNumArray(row.transcript_ids),
+      chunkId: row.chunk_id,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // ── Entity registry ───────────────────────────────────────────────
+
+  /**
+   * Pull a flattened, deduplicated snapshot of named topics + entities the
+   * agent already knows about, ranked by mention frequency. Sources:
+   *   - chunks.topic         (curated knowledge — the strongest signal)
+   *   - episodes.topics      (LLM-extracted topic phrases per session)
+   *   - episodes.entities    (LLM-extracted named things)
+   *
+   * Used by the entity-registry module to detect when a user turn mentions
+   * something we have prior context on, so recall can fire proactively.
+   */
+  getEntityRegistrySnapshot(opts: { minCount?: number; maxItems?: number } = {}): Array<{
+    name: string;
+    display: string;
+    kind: 'topic' | 'entity';
+    count: number;
+  }> {
+    const minCount = Math.max(1, opts.minCount ?? 1);
+    const maxItems = Math.max(1, Math.min(opts.maxItems ?? 500, 5000));
+
+    const counts = new Map<string, { display: string; kind: 'topic' | 'entity'; count: number }>();
+    const accept = (raw: string, kind: 'topic' | 'entity') => {
+      if (!raw) return;
+      const display = raw.trim();
+      if (display.length < 3 || display.length > 80) return;
+      const name = display.toLowerCase();
+      const existing = counts.get(name);
+      if (existing) {
+        existing.count++;
+        // Topics from chunks outrank LLM-derived ones for kind classification.
+        if (kind === 'topic') existing.kind = 'topic';
+      } else {
+        counts.set(name, { display, kind, count: 1 });
+      }
+    };
+
+    try {
+      const topicRows = this.conn
+        .prepare(
+          `SELECT topic, COUNT(*) as cnt FROM chunks
+           WHERE topic IS NOT NULL AND length(trim(topic)) > 0
+           GROUP BY topic`,
+        )
+        .all() as Array<{ topic: string; cnt: number }>;
+      for (const r of topicRows) {
+        const existing = counts.get(r.topic.trim().toLowerCase());
+        if (existing) existing.count += r.cnt - 1; // already added 1 above
+        accept(r.topic, 'topic');
+        if (existing) {
+          // Increment with the SQL-derived count (offset by the 1 accept added).
+          const e = counts.get(r.topic.trim().toLowerCase());
+          if (e) e.count = Math.max(e.count, r.cnt);
+        }
+      }
+    } catch { /* chunks.topic column missing or query fails */ }
+
+    try {
+      const epRows = this.conn
+        .prepare(`SELECT topics, entities FROM episodes`)
+        .all() as Array<{ topics: string | null; entities: string | null }>;
+      for (const row of epRows) {
+        if (row.topics) {
+          try {
+            const arr = JSON.parse(row.topics);
+            if (Array.isArray(arr)) for (const t of arr) if (typeof t === 'string') accept(t, 'topic');
+          } catch { /* skip malformed JSON */ }
+        }
+        if (row.entities) {
+          try {
+            const arr = JSON.parse(row.entities);
+            if (Array.isArray(arr)) for (const e of arr) if (typeof e === 'string') accept(e, 'entity');
+          } catch { /* skip malformed JSON */ }
+        }
+      }
+    } catch { /* episodes table missing */ }
+
+    const all = [...counts.entries()]
+      .map(([name, v]) => ({ name, display: v.display, kind: v.kind, count: v.count }))
+      .filter(e => e.count >= minCount);
+    all.sort((a, b) => b.count - a.count || a.name.length - b.name.length);
+    return all.slice(0, maxItems);
+  }
+
+  // ── Learned facts (durable cross-session learnings) ──────────────
+
+  /**
+   * Insert a learned fact, deduping on fingerprint. Caller computes
+   * fingerprint deterministically (sha1 of kind|normalized_text) so the
+   * episode extractor can't double-record the same belief across passes.
+   */
+  upsertLearnedFact(entry: {
+    fingerprint: string;
+    kind: 'preference' | 'fact' | 'goal' | 'workflow';
+    text: string;
+    sourceEpisodeId?: number | null;
+  }): { id: number; created: boolean } {
+    const existing = this.conn
+      .prepare('SELECT id FROM learned_facts WHERE fingerprint = ?')
+      .get(entry.fingerprint) as { id: number } | undefined;
+    if (existing) return { id: existing.id, created: false };
+    const result = this.conn
+      .prepare(
+        `INSERT INTO learned_facts (fingerprint, kind, text, source_episode_id)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(entry.fingerprint, entry.kind, entry.text, entry.sourceEpisodeId ?? null);
+    return { id: result.lastInsertRowid as number, created: true };
+  }
+
+  /**
+   * Mark `oldId` as superseded by `newId` and stamp the supersession time.
+   * Idempotent — re-running on an already-superseded row is a no-op.
+   */
+  supersedeLearnedFact(oldId: number, newId: number): boolean {
+    const result = this.conn
+      .prepare(
+        `UPDATE learned_facts
+         SET status = 'superseded', superseded_by_id = ?, superseded_at = datetime('now')
+         WHERE id = ? AND status = 'active'`,
+      )
+      .run(newId, oldId);
+    return result.changes > 0;
+  }
+
+  /** Cancel / reactivate a learned fact (dashboard action). */
+  setLearnedFactStatus(id: number, status: 'active' | 'cancelled'): boolean {
+    if (status === 'cancelled') {
+      const result = this.conn
+        .prepare(`UPDATE learned_facts SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?`)
+        .run(id);
+      return result.changes > 0;
+    }
+    const result = this.conn
+      .prepare(`UPDATE learned_facts SET status = 'active', cancelled_at = NULL WHERE id = ?`)
+      .run(id);
+    return result.changes > 0;
+  }
+
+  /**
+   * List active (non-superseded, non-cancelled) learned facts. Used by the
+   * router to inject [Persistent learnings] into prompts and by the
+   * episode extractor to feed contradiction-detection context to the LLM.
+   */
+  listActiveLearnedFacts(opts: { kind?: string; limit?: number } = {}): Array<{
+    id: number;
+    fingerprint: string;
+    kind: 'preference' | 'fact' | 'goal' | 'workflow';
+    text: string;
+    sourceEpisodeId: number | null;
+    createdAt: string;
+  }> {
+    const params: unknown[] = [];
+    let where = "status = 'active'";
+    if (opts.kind) { where += ' AND kind = ?'; params.push(opts.kind); }
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 500));
+    params.push(limit);
+    const rows = this.conn
+      .prepare(`SELECT id, fingerprint, kind, text, source_episode_id, created_at
+                FROM learned_facts WHERE ${where}
+                ORDER BY created_at DESC LIMIT ?`)
+      .all(...params) as Array<{
+        id: number; fingerprint: string; kind: string; text: string;
+        source_episode_id: number | null; created_at: string;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      fingerprint: r.fingerprint,
+      kind: r.kind as 'preference' | 'fact' | 'goal' | 'workflow',
+      text: r.text,
+      sourceEpisodeId: r.source_episode_id,
+      createdAt: r.created_at,
+    }));
+  }
+
+  /** List all (active + superseded + cancelled) for the dashboard. */
+  listAllLearnedFacts(opts: { limit?: number } = {}): Array<{
+    id: number; kind: string; text: string; status: string;
+    sourceEpisodeId: number | null; createdAt: string;
+    supersededAt: string | null; supersededById: number | null; cancelledAt: string | null;
+  }> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    const rows = this.conn
+      .prepare(`SELECT id, kind, text, status, source_episode_id, created_at,
+                       superseded_at, superseded_by_id, cancelled_at
+                FROM learned_facts ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as Array<{
+        id: number; kind: string; text: string; status: string;
+        source_episode_id: number | null; created_at: string;
+        superseded_at: string | null; superseded_by_id: number | null; cancelled_at: string | null;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      kind: r.kind,
+      text: r.text,
+      status: r.status,
+      sourceEpisodeId: r.source_episode_id,
+      createdAt: r.created_at,
+      supersededAt: r.superseded_at,
+      supersededById: r.superseded_by_id,
+      cancelledAt: r.cancelled_at,
+    }));
+  }
+
+  /**
+   * Find an active learned fact whose text fuzzy-matches the supplied
+   * phrase. Used by the consolidation extractor to resolve `supersedes`
+   * hints emitted by the LLM ("user prefers detailed responses") to the
+   * actual stored row id, even if the wording isn't identical. Match is
+   * case-insensitive substring with a word-overlap bias.
+   */
+  findActiveLearnedFactByPhrase(phrase: string): { id: number; text: string; kind: string } | null {
+    const needle = phrase.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+    if (!needle || needle.length < 4) return null;
+    const rows = this.conn
+      .prepare(`SELECT id, kind, text FROM learned_facts WHERE status = 'active' ORDER BY created_at DESC LIMIT 200`)
+      .all() as Array<{ id: number; kind: string; text: string }>;
+    let best: { id: number; text: string; kind: string; score: number } | null = null;
+    const needleTokens = new Set(needle.split(' ').filter(t => t.length >= 4));
+    for (const r of rows) {
+      const candidate = r.text.toLowerCase();
+      let score = 0;
+      if (candidate.includes(needle)) score += 5;
+      else if (needle.includes(candidate)) score += 4;
+      let overlap = 0;
+      for (const t of needleTokens) if (candidate.includes(t)) overlap++;
+      score += overlap;
+      if (overlap === 0 && score === 0) continue;
+      if (!best || score > best.score) best = { id: r.id, text: r.text, kind: r.kind, score };
+    }
+    return best && best.score >= 2 ? { id: best.id, text: best.text, kind: best.kind } : null;
+  }
+
+  // ── Commitments ───────────────────────────────────────────────────
+
+  /**
+   * Insert a commitment, deduping on the fingerprint. If a row with the
+   * same fingerprint already exists, the existing id is returned and no
+   * write occurs — keeps the regex detector + LLM extractor from creating
+   * duplicates of the same promise.
+   */
+  upsertCommitment(entry: {
+    fingerprint: string;
+    source: string;
+    owner: 'user' | 'clementine';
+    text: string;
+    sessionKey?: string | null;
+    transcriptId?: number | null;
+    episodeId?: number | null;
+    dueAt?: string | null;
+    dueHint?: string | null;
+  }): { id: number; created: boolean } {
+    const existing = this.conn
+      .prepare('SELECT id FROM commitments WHERE fingerprint = ?')
+      .get(entry.fingerprint) as { id: number } | undefined;
+    if (existing) {
+      return { id: existing.id, created: false };
+    }
+    const result = this.conn
+      .prepare(
+        `INSERT INTO commitments
+         (fingerprint, source, owner, text, session_key, transcript_id, episode_id, due_at, due_hint)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.fingerprint,
+        entry.source,
+        entry.owner,
+        entry.text,
+        entry.sessionKey ?? null,
+        entry.transcriptId ?? null,
+        entry.episodeId ?? null,
+        entry.dueAt ?? null,
+        entry.dueHint ?? null,
+      );
+    return { id: result.lastInsertRowid as number, created: true };
+  }
+
+  /**
+   * List commitments with optional filters. Sorted by due_at ASC NULLS LAST
+   * so overdue + soon-due float to the top.
+   */
+  listCommitments(opts: {
+    status?: 'open' | 'done' | 'cancelled';
+    sessionKey?: string;
+    owner?: 'user' | 'clementine';
+    overdueOnly?: boolean;
+    dueBeforeIso?: string;
+    limit?: number;
+  } = {}): Array<{
+    id: number;
+    fingerprint: string;
+    source: string;
+    owner: 'user' | 'clementine';
+    text: string;
+    sessionKey: string | null;
+    transcriptId: number | null;
+    episodeId: number | null;
+    dueAt: string | null;
+    dueHint: string | null;
+    status: 'open' | 'done' | 'cancelled';
+    createdAt: string;
+    completedAt: string | null;
+    snoozedUntil: string | null;
+  }> {
+    const params: unknown[] = [];
+    const where: string[] = [];
+    if (opts.status) { where.push('status = ?'); params.push(opts.status); }
+    if (opts.sessionKey) { where.push('session_key = ?'); params.push(opts.sessionKey); }
+    if (opts.owner) { where.push('owner = ?'); params.push(opts.owner); }
+    if (opts.overdueOnly) {
+      where.push("due_at IS NOT NULL AND due_at < datetime('now') AND status = 'open'");
+    } else if (opts.dueBeforeIso) {
+      where.push('due_at IS NOT NULL AND due_at <= ?');
+      params.push(opts.dueBeforeIso);
+    }
+    // Suppress snoozed rows from "open" view unless caller asked for status explicitly.
+    // Wrapping both sides in datetime() so ISO-8601 strings (with T/Z/millis) and
+    // SQLite's space-separated `datetime('now')` format compare correctly.
+    if (opts.status === 'open' || (!opts.status && !opts.overdueOnly)) {
+      where.push("(snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))");
+    }
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 500));
+    const sql = `SELECT * FROM commitments
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY (due_at IS NULL) ASC, due_at ASC, created_at DESC
+                 LIMIT ?`;
+    params.push(limit);
+    const rows = this.conn.prepare(sql).all(...params) as Array<{
+      id: number; fingerprint: string; source: string; owner: string;
+      text: string; session_key: string | null; transcript_id: number | null;
+      episode_id: number | null; due_at: string | null; due_hint: string | null;
+      status: string; created_at: string; completed_at: string | null;
+      snoozed_until: string | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      fingerprint: r.fingerprint,
+      source: r.source,
+      owner: r.owner as 'user' | 'clementine',
+      text: r.text,
+      sessionKey: r.session_key,
+      transcriptId: r.transcript_id,
+      episodeId: r.episode_id,
+      dueAt: r.due_at,
+      dueHint: r.due_hint,
+      status: r.status as 'open' | 'done' | 'cancelled',
+      createdAt: r.created_at,
+      completedAt: r.completed_at,
+      snoozedUntil: r.snoozed_until,
+    }));
+  }
+
+  /**
+   * Update commitment status. 'done' / 'cancelled' set completed_at; 'snooze'
+   * (with snoozeIso) bumps snoozed_until without changing status so the row
+   * stays open but suppressed from greeting until the snooze expires.
+   */
+  updateCommitmentStatus(
+    id: number,
+    update: { status?: 'open' | 'done' | 'cancelled'; snoozeUntilIso?: string; notes?: string },
+  ): boolean {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (update.status) {
+      sets.push('status = ?');
+      vals.push(update.status);
+      if (update.status === 'done' || update.status === 'cancelled') {
+        sets.push("completed_at = datetime('now')");
+      }
+    }
+    if (update.snoozeUntilIso !== undefined) {
+      sets.push('snoozed_until = ?');
+      vals.push(update.snoozeUntilIso);
+    }
+    if (update.notes !== undefined) {
+      sets.push('notes = ?');
+      vals.push(update.notes);
+    }
+    if (sets.length === 0) return false;
+    vals.push(id);
+    const result = this.conn.prepare(`UPDATE commitments SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    return result.changes > 0;
+  }
+
+  /**
+   * Fetch a slice of transcripts by id range for consolidation. Used by
+   * the consolidation module to materialize the conversation it's about
+   * to summarize.
+   */
+  getTranscriptsByIdRange(sessionKey: string, startId: number, endId: number): TranscriptTurn[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, session_key, role, content, model, created_at
+         FROM transcripts
+         WHERE session_key = ? AND id >= ? AND id <= ?
+         ORDER BY id ASC`,
+      )
+      .all(sessionKey, startId, endId) as Array<{
+        id: number;
+        session_key: string;
+        role: string;
+        content: string;
+        model: string;
+        created_at: string;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      sessionKey: r.session_key,
+      role: r.role,
+      content: r.content,
+      model: r.model,
+      createdAt: r.created_at,
     }));
   }
 
@@ -3161,6 +4522,87 @@ export class MemoryStore {
 
     return rows.map((row) => ({
       sessionKey: row.session_key,
+      summary: row.summary,
+      exchangeCount: row.exchange_count,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Get recent session summaries scoped to one conversation.
+   */
+  getRecentSummariesForSession(sessionKey: string, limit: number = 3): SessionSummary[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, summary, exchange_count, created_at
+         FROM session_summaries
+         WHERE session_key = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(sessionKey, limit) as Array<{
+      session_key: string;
+      summary: string;
+      exchange_count: number;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      sessionKey: row.session_key,
+      summary: row.summary,
+      exchangeCount: row.exchange_count,
+      createdAt: row.created_at,
+    }));
+  }
+
+  recordSessionLineage(input: {
+    sessionKey: string;
+    parentSessionId?: string | null;
+    childSessionId?: string | null;
+    reason: string;
+    summary: string;
+    exchangeCount?: number;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO session_lineage
+           (session_key, parent_session_id, child_session_id, reason, summary, exchange_count)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.sessionKey,
+        input.parentSessionId ?? null,
+        input.childSessionId ?? null,
+        input.reason,
+        input.summary,
+        input.exchangeCount ?? 0,
+      );
+  }
+
+  getSessionLineage(sessionKey: string, limit: number = 5): SessionLineageEntry[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, parent_session_id, child_session_id, reason, summary, exchange_count, created_at
+         FROM session_lineage
+         WHERE session_key = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(sessionKey, limit) as Array<{
+      session_key: string;
+      parent_session_id: string | null;
+      child_session_id: string | null;
+      reason: string;
+      summary: string;
+      exchange_count: number;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      sessionKey: row.session_key,
+      parentSessionId: row.parent_session_id,
+      childSessionId: row.child_session_id,
+      reason: row.reason,
       summary: row.summary,
       exchangeCount: row.exchange_count,
       createdAt: row.created_at,
@@ -3485,7 +4927,59 @@ export class MemoryStore {
       input.content,
       input.tags ?? '',
     );
-    return info.lastInsertRowid as number;
+    const id = info.lastInsertRowid as number;
+    this.recordMemoryEvent({
+      sourceType: 'artifact',
+      sourceId: id,
+      sessionKey: input.sessionKey ?? null,
+      agentSlug: input.agentSlug ?? null,
+      content: `${input.toolName}\n${input.summary}\n${input.content}`,
+      indexed: true,
+    });
+    return id;
+  }
+
+  recordMemoryEvent(input: {
+    sourceType: string;
+    sourceId?: number | null;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+    content: string;
+    indexed?: boolean;
+  }): void {
+    try {
+      const content = String(input.content ?? '');
+      const contentHash = createHash('sha256').update(content).digest('hex').slice(0, 16);
+      const preview = content.replace(/\s+/g, ' ').trim().slice(0, 500);
+      this.conn.prepare(
+        `INSERT INTO memory_events
+         (source_type, source_id, session_key, agent_slug, content_hash, content_preview, indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ${input.indexed === false ? 'NULL' : "datetime('now')"})`,
+      ).run(
+        input.sourceType,
+        input.sourceId ?? null,
+        input.sessionKey ?? null,
+        input.agentSlug ?? null,
+        contentHash,
+        preview,
+      );
+    } catch {
+      // Ledger writes are observability only; never fail the source write.
+    }
+  }
+
+  getMemoryEventStats(): {
+    total: number;
+    indexed: number;
+    bySourceType: Array<{ sourceType: string; count: number }>;
+  } {
+    const total = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events').get() as { c: number }).c;
+    const indexed = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events WHERE indexed_at IS NOT NULL').get() as { c: number }).c;
+    const bySourceType = this.conn
+      .prepare(`SELECT source_type AS sourceType, COUNT(*) AS count
+                FROM memory_events GROUP BY source_type ORDER BY count DESC`)
+      .all() as Array<{ sourceType: string; count: number }>;
+    return { total, indexed, bySourceType };
   }
 
   /**
@@ -3727,6 +5221,8 @@ export class MemoryStore {
     recordsWritten?: number;
     recordsSkipped?: number;
     recordsFailed?: number;
+    recordsUnchanged?: number;
+    recallCheckStatus?: string | null;
     overviewNotePath?: string | null;
     errorsJson?: string | null;
     status?: 'running' | 'ok' | 'error' | 'partial';
@@ -3738,6 +5234,8 @@ export class MemoryStore {
     if (patch.recordsWritten !== undefined) { sets.push('records_written = ?'); params.push(patch.recordsWritten); }
     if (patch.recordsSkipped !== undefined) { sets.push('records_skipped = ?'); params.push(patch.recordsSkipped); }
     if (patch.recordsFailed !== undefined) { sets.push('records_failed = ?'); params.push(patch.recordsFailed); }
+    if (patch.recordsUnchanged !== undefined) { sets.push('records_unchanged = ?'); params.push(patch.recordsUnchanged); }
+    if (patch.recallCheckStatus !== undefined) { sets.push('recall_check_status = ?'); params.push(patch.recallCheckStatus); }
     if (patch.overviewNotePath !== undefined) { sets.push('overview_note_path = ?'); params.push(patch.overviewNotePath); }
     if (patch.errorsJson !== undefined) { sets.push('errors_json = ?'); params.push(patch.errorsJson); }
     if (patch.status !== undefined) { sets.push('status = ?'); params.push(patch.status); }
@@ -3750,20 +5248,23 @@ export class MemoryStore {
   listIngestionRuns(sourceSlug?: string, limit = 50): Array<{
     id: number; sourceSlug: string; startedAt: string; finishedAt: string | null;
     recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number;
+    recordsUnchanged: number; recallCheckStatus: string | null;
     overviewNotePath: string | null; errorsJson: string | null; status: string;
   }> {
     let sql = `SELECT id, source_slug, started_at, finished_at, records_in, records_written,
-                      records_skipped, records_failed, overview_note_path, errors_json, status
+                      records_skipped, records_failed, records_unchanged, recall_check_status,
+                      overview_note_path, errors_json, status
                FROM ingestion_runs`;
     const params: any[] = [];
     if (sourceSlug) { sql += ` WHERE source_slug = ?`; params.push(sourceSlug); }
-    sql += ` ORDER BY started_at DESC LIMIT ?`;
+    sql += ` ORDER BY started_at DESC, id DESC LIMIT ?`;
     params.push(limit);
     const rows = this.conn.prepare(sql).all(...params) as any[];
     return rows.map((r) => ({
       id: r.id, sourceSlug: r.source_slug, startedAt: r.started_at, finishedAt: r.finished_at,
       recordsIn: r.records_in, recordsWritten: r.records_written,
       recordsSkipped: r.records_skipped, recordsFailed: r.records_failed,
+      recordsUnchanged: r.records_unchanged ?? 0, recallCheckStatus: r.recall_check_status ?? null,
       overviewNotePath: r.overview_note_path, errorsJson: r.errors_json, status: r.status,
     }));
   }
@@ -3941,6 +5442,7 @@ export class MemoryStore {
     transcriptRetentionDays?: number;
     behavioralRetentionDays?: number;
     recallTraceRetentionDays?: number;
+    memoryEventRetentionDays?: number;
   } = {}): {
     episodicPruned: number;
     accessLogPruned: number;
@@ -3950,6 +5452,7 @@ export class MemoryStore {
     reflectionsPruned: number;
     usageLogPruned: number;
     recallTracesPruned: number;
+    memoryEventsPruned: number;
   } {
     const maxAge = opts.maxAgeDays ?? 90;
     const threshold = opts.salienceThreshold ?? 0.01;
@@ -3963,6 +5466,7 @@ export class MemoryStore {
     // 90-day window is enough to debug "why did the agent answer that way last
     // week" without letting the table grow unbounded.
     const recallRetention = opts.recallTraceRetentionDays ?? 90;
+    const memoryEventRetention = opts.memoryEventRetentionDays ?? 180;
 
     // Prune stale episodic chunks (not vault-sourced content)
     const episodicResult = this.conn
@@ -4023,6 +5527,16 @@ export class MemoryStore {
       // Table may not exist on first boot before initialize() runs the new schema
     }
 
+    let memoryEventsPruned = 0;
+    try {
+      const memoryEventsResult = this.conn
+        .prepare(`DELETE FROM memory_events WHERE created_at < datetime('now', ?)`)
+        .run(`-${memoryEventRetention} days`);
+      memoryEventsPruned = memoryEventsResult.changes;
+    } catch {
+      // Table may not exist on first boot before initialize() runs the new schema
+    }
+
     return {
       episodicPruned: episodicResult.changes,
       accessLogPruned: accessResult.changes,
@@ -4032,6 +5546,7 @@ export class MemoryStore {
       reflectionsPruned: reflectionsResult.changes,
       usageLogPruned: usageResult.changes,
       recallTracesPruned,
+      memoryEventsPruned,
     };
   }
 
@@ -4883,11 +6398,86 @@ export class MemoryStore {
 
   // ── Memory Extractions ──────────────────────────────────────────
 
+  private normalizeToolName(toolName: string): string {
+    return toolName.replace(/^mcp__.+?__/, '');
+  }
+
+  private clampScore(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+    return Math.max(0, Math.min(1, value));
+  }
+
+  private previewFromToolInput(toolInput: string): {
+    contentPreview: string;
+    confidence: number;
+    salience: number;
+    reason: string | null;
+    action: string | null;
+  } | null {
+    try {
+      const parsed = JSON.parse(toolInput) as Record<string, unknown>;
+      const contentParts = [
+        parsed.content,
+        parsed.text,
+        parsed.memory,
+        parsed.summary,
+        parsed.title,
+        parsed.task,
+        parsed.name,
+      ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+      const contentPreview = contentParts.join(' - ').replace(/\s+/g, ' ').trim().slice(0, 600);
+      if (contentPreview.length < 12) return null;
+      const confidence = this.clampScore(parsed.confidence, 0.5);
+      const salienceRaw = typeof parsed.salience_hint === 'number' ? parsed.salience_hint : parsed.salience;
+      const salience = this.clampScore(salienceRaw, 0.6);
+      return {
+        contentPreview,
+        confidence,
+        salience,
+        reason: typeof parsed.reason === 'string' && parsed.reason.trim() ? parsed.reason.trim().slice(0, 400) : null,
+        action: typeof parsed.action === 'string' && parsed.action.trim() ? parsed.action.trim() : null,
+      };
+    } catch {
+      const contentPreview = toolInput.replace(/\s+/g, ' ').trim().slice(0, 600);
+      if (contentPreview.length < 12) return null;
+      return { contentPreview, confidence: 0.4, salience: 0.5, reason: null, action: null };
+    }
+  }
+
+  private classifyPromotionCandidate(toolName: string, contentPreview: string, action: string | null): string {
+    const lower = `${action ?? ''} ${contentPreview}`.toLowerCase();
+    if (toolName === 'task_add') return 'task';
+    if (toolName === 'note_create' || toolName === 'note_take') return 'note';
+    if (/\b(prefers?|preference|always|never|don't|dont|do not|likes?|wants?|style|tone)\b/.test(lower)) return 'preference';
+    if (/\b(client|customer|partner|team|teammate|manager|boss|friend|family|spouse|wife|husband|relationship|contact)\b/.test(lower)) return 'relationship';
+    if (/\b(process|procedure|workflow|checklist|playbook|steps?)\b/.test(lower)) return 'procedure';
+    return 'fact';
+  }
+
+  private maybeRecordPromotionCandidateFromExtraction(extraction: Omit<MemoryExtraction, 'id'>, sourceId: number): void {
+    if (extraction.status !== 'active') return;
+    const toolName = this.normalizeToolName(extraction.toolName);
+    if (!['memory_write', 'note_create', 'note_take', 'task_add', 'user_model'].includes(toolName)) return;
+    const parsed = this.previewFromToolInput(extraction.toolInput);
+    if (!parsed) return;
+    this.recordMemoryPromotionCandidate({
+      candidateKind: this.classifyPromotionCandidate(toolName, parsed.contentPreview, parsed.action),
+      sourceTable: 'memory_extractions',
+      sourceId,
+      sessionKey: extraction.sessionKey,
+      agentSlug: extraction.agentSlug ?? null,
+      contentPreview: parsed.contentPreview,
+      confidence: parsed.confidence,
+      salience: parsed.salience,
+      reason: parsed.reason ?? `Captured from ${toolName}`,
+    });
+  }
+
   /**
    * Log a memory extraction event for transparency tracking.
    */
   logExtraction(extraction: Omit<MemoryExtraction, 'id'>): void {
-    this.conn
+    const result = this.conn
       .prepare(
         `INSERT INTO memory_extractions
          (session_key, user_message, tool_name, tool_input, extracted_at, status, agent_slug)
@@ -4902,6 +6492,86 @@ export class MemoryStore {
         extraction.status,
         extraction.agentSlug ?? null,
       );
+    const sourceId = Number(result.lastInsertRowid);
+    if (Number.isFinite(sourceId) && sourceId > 0) {
+      this.maybeRecordPromotionCandidateFromExtraction(extraction, sourceId);
+    }
+  }
+
+  recordMemoryPromotionCandidate(input: MemoryPromotionCandidateInput): number {
+    const confidence = this.clampScore(input.confidence, 0.5);
+    const salience = this.clampScore(input.salience, 0.6);
+    const result = this.conn
+      .prepare(
+        `INSERT OR IGNORE INTO memory_promotion_candidates
+         (candidate_kind, source_table, source_id, session_key, agent_slug, content_preview, confidence, salience, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.candidateKind,
+        input.sourceTable ?? 'memory_extractions',
+        input.sourceId ?? null,
+        input.sessionKey ?? null,
+        input.agentSlug ?? null,
+        input.contentPreview.slice(0, 600),
+        confidence,
+        salience,
+        input.reason ?? null,
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  listMemoryPromotionCandidates(limit: number = 50, decision: MemoryPromotionDecision = 'pending'): MemoryPromotionCandidate[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, candidate_kind, source_table, source_id, session_key, agent_slug,
+                content_preview, confidence, salience, reason, decision, created_at, decided_at
+         FROM memory_promotion_candidates
+         WHERE decision = ?
+         ORDER BY salience DESC, confidence DESC, created_at DESC
+         LIMIT ?`,
+      )
+      .all(decision, limit) as Array<{
+        id: number;
+        candidate_kind: string;
+        source_table: string;
+        source_id: number | null;
+        session_key: string | null;
+        agent_slug: string | null;
+        content_preview: string;
+        confidence: number;
+        salience: number;
+        reason: string | null;
+        decision: MemoryPromotionDecision;
+        created_at: string;
+        decided_at: string | null;
+      }>;
+
+    return rows.map(row => ({
+      id: row.id,
+      candidateKind: row.candidate_kind,
+      sourceTable: row.source_table,
+      sourceId: row.source_id,
+      sessionKey: row.session_key,
+      agentSlug: row.agent_slug,
+      contentPreview: row.content_preview,
+      confidence: row.confidence,
+      salience: row.salience,
+      reason: row.reason,
+      decision: row.decision,
+      createdAt: row.created_at,
+      decidedAt: row.decided_at,
+    }));
+  }
+
+  decideMemoryPromotionCandidate(id: number, decision: Exclude<MemoryPromotionDecision, 'pending'>, reason?: string): void {
+    this.conn
+      .prepare(
+        `UPDATE memory_promotion_candidates
+         SET decision = ?, decided_at = datetime('now'), reason = COALESCE(?, reason)
+         WHERE id = ?`,
+      )
+      .run(decision, reason ?? null, id);
   }
 
   /**
@@ -5609,14 +7279,18 @@ export class MemoryStore {
   markConsolidated(chunkIds: number[]): void {
     if (chunkIds.length === 0) return;
 
-    const placeholders = chunkIds.map(() => '?').join(',');
-    this.conn
-      .prepare(
-        `UPDATE chunks
-         SET consolidated = 1, salience = MAX(salience - 0.3, 0.0)
-         WHERE id IN (${placeholders})`,
-      )
-      .run(...chunkIds);
+    const batchSize = 500;
+    for (let i = 0; i < chunkIds.length; i += batchSize) {
+      const batch = chunkIds.slice(i, i + batchSize);
+      const placeholders = batch.map(() => '?').join(',');
+      this.conn
+        .prepare(
+          `UPDATE chunks
+           SET consolidated = 1, salience = MAX(salience - 0.3, 0.0)
+           WHERE id IN (${placeholders})`,
+        )
+        .run(...batch);
+    }
   }
 
   // ── Autonomy log ───────────────────────────────────────────────────
@@ -5726,6 +7400,8 @@ export class MemoryStore {
     chunksByCategory: Array<{ category: string | null; count: number }>;
     tableRowCounts: Record<string, number>;
     recentActivity: { recallTracesLast7d: number; recallTracesLast30d: number; extractionSkipsLast30d: number };
+    retrievalProof: { tracesLast7d: number; emptyTracesLast7d: number; tracedChunksLast7d: number };
+    memoryEvents: { total: number; indexed: number; bySourceType: Array<{ sourceType: string; count: number }> };
     topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
     userModelSlots: { total: number; populated: number; global: number; agentScoped: number };
     staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
@@ -5742,6 +7418,11 @@ export class MemoryStore {
       models: Array<{ model: string; count: number }>;
       currentModel: string;
       ready: boolean;
+      cacheDir: string;
+      cacheExists: boolean;
+      cacheBytes: number;
+      cacheSize: string;
+      installed: boolean;
     };
   } {
     const topLimit = opts.topCitedLimit ?? 10;
@@ -5793,6 +7474,7 @@ export class MemoryStore {
       'transcripts',
       'session_summaries',
       'memory_extractions',
+      'memory_events',
       'chunk_soft_deletes',
       'chunk_history',
       'sdk_session_entries',
@@ -5817,6 +7499,19 @@ export class MemoryStore {
         .get() as { c: number }).c,
       extractionSkipsLast30d: (this.conn
         .prepare(`SELECT COUNT(*) AS c FROM memory_extractions WHERE status LIKE 'skipped:%' AND extracted_at >= datetime('now', '-30 days')`)
+        .get() as { c: number }).c,
+    };
+
+    const retrievalProof = {
+      tracesLast7d: recentActivity.recallTracesLast7d,
+      emptyTracesLast7d: (this.conn
+        .prepare(`SELECT COUNT(*) AS c FROM recall_traces
+                  WHERE retrieved_at >= datetime('now', '-7 days')
+                    AND json_array_length(chunk_ids) = 0`)
+        .get() as { c: number }).c,
+      tracedChunksLast7d: (this.conn
+        .prepare(`SELECT COALESCE(SUM(json_array_length(chunk_ids)), 0) AS c
+                  FROM recall_traces WHERE retrieved_at >= datetime('now', '-7 days')`)
         .get() as { c: number }).c,
     };
 
@@ -5886,6 +7581,8 @@ export class MemoryStore {
       chunksByCategory: byCategory,
       tableRowCounts,
       recentActivity,
+      retrievalProof,
+      memoryEvents: this.getMemoryEventStats(),
       topCitedLast30d: topCited.map((r) => ({
         chunkId: r.chunk_id,
         sourceFile: r.source_file,
@@ -5914,12 +7611,19 @@ export class MemoryStore {
                     FROM chunks WHERE embedding_dense IS NOT NULL
                     GROUP BY embedding_dense_model ORDER BY count DESC`)
           .all() as Array<{ model: string; count: number }>);
+        const cacheDir = embeddingsModule.denseModelCacheDir();
+        const cacheBytes = MemoryStore.dirSizeBytes(cacheDir);
         return {
           withDense,
           total: chunkAgg.total,
           models,
           currentModel: embeddingsModule.currentDenseModel(),
           ready: embeddingsModule.isDenseReady(),
+          cacheDir,
+          cacheExists: existsSync(cacheDir),
+          cacheBytes,
+          cacheSize: MemoryStore.formatBytes(cacheBytes),
+          installed: cacheBytes >= 1024 * 1024,
         };
       })(),
     };
@@ -5953,7 +7657,7 @@ export class MemoryStore {
    * Stored as JSON in `chunks.derived_from` so the dashboard can show
    * "view source memories" — abstractions become auditable.
    */
-  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): void {
+  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): number {
     const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
     const derivedJson = derivedFromIds && derivedFromIds.length > 0 ? JSON.stringify(derivedFromIds) : null;
     const result = this.conn
@@ -5963,14 +7667,17 @@ export class MemoryStore {
       )
       .run(sourceFile, section, content, hash, derivedJson);
 
+    const chunkId = result.lastInsertRowid as number;
+
     // Immediately compute embedding so the summary is vector-searchable right away
     if (embeddingsModule.isReady()) {
       const vec = embeddingsModule.embed(content);
       if (vec) {
         this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?')
-          .run(embeddingsModule.serializeEmbedding(vec), result.lastInsertRowid);
+          .run(embeddingsModule.serializeEmbedding(vec), chunkId);
       }
     }
+    return chunkId;
   }
 
   // ── SDR Operational Data ─────────────────────────────────────────

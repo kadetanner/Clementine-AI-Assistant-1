@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { classifyIntent } from '../src/agent/intent-classifier.js';
-import { decideTurnPolicy } from '../src/agent/turn-policy.js';
+import { decideTurn, decideTurnPolicy } from '../src/agent/turn-policy.js';
 
 function policy(text: string, hasRecentContext = false) {
   return decideTurnPolicy({
+    text,
+    intent: classifyIntent(text, hasRecentContext ? [{ user: 'old', assistant: 'old answer' }] : undefined),
+    hasRecentContext,
+  });
+}
+
+function decision(text: string, hasRecentContext = false) {
+  return decideTurn({
     text,
     intent: classifyIntent(text, hasRecentContext ? [{ user: 'old', assistant: 'old answer' }] : undefined),
     hasRecentContext,
@@ -18,6 +26,28 @@ describe('turn policy', () => {
     expect(p.disableAllTools).toBe(true);
     expect(p.enableTeams).toBe(false);
     expect(p.maxTurns).toBeLessThanOrEqual(3);
+  });
+
+  it('isolates standalone greetings from stale action context', () => {
+    const p = policy('hey', true);
+
+    expect(p.reason).toBe('standalone-greeting');
+    expect(p.retrievalTier).toBe('none');
+    expect(p.disableAllTools).toBe(true);
+    expect(p.suppressSessionResume).toBe(true);
+    expect(p.suppressContextInjection).toBe(true);
+  });
+
+  it('isolates common standalone greeting variants', () => {
+    expect(policy('hey there', true).reason).toBe('standalone-greeting');
+    expect(policy('hi Clementine!', true).reason).toBe('standalone-greeting');
+  });
+
+  it('does not isolate greetings that include an explicit task', () => {
+    const p = policy('hey can you check the logs', true);
+
+    expect(p.suppressSessionResume).toBeUndefined();
+    expect(p.disableAllTools).toBe(false);
   });
 
   it('does not fast-path explicit memory continuity requests', () => {
@@ -35,6 +65,30 @@ describe('turn policy', () => {
     expect(p.enableTeams).toBe(false);
   });
 
+  it('keeps operational diagnostics tool-enabled even when phrased as a short question', () => {
+    const p = policy('Can you diagnose what is happening with the Cron lease');
+
+    expect(p.reason).toBe('task-or-tool-request');
+    expect(p.retrievalTier).toBe('search');
+    expect(p.disableAllTools).toBe(false);
+  });
+
+  it('keeps background status follow-ups off the lightweight path when context exists', () => {
+    const p = policy("How's it coming along?", true);
+
+    expect(p.reason).toBe('background-status-followup');
+    expect(p.retrievalTier).toBe('search');
+    expect(p.disableAllTools).toBe(false);
+  });
+
+  it('keeps vague operational issue follow-ups interactive instead of background or GitHub-routed', () => {
+    const d = decision('How do we fix that issue?', true);
+
+    expect(d.mode).toBe('tool_llm');
+    expect(d.toolRoute.bundles).toEqual([]);
+    expect(d.policy.retrievalTier).toBe('search');
+  });
+
   it('promotes broad analysis to the full context path with teams enabled', () => {
     const p = policy('analyze the entire agentic flow across all conversations and recommend improvements');
 
@@ -49,5 +103,28 @@ describe('turn policy', () => {
     expect(p.retrievalTier).toBe('full');
     expect(p.disableAllTools).toBe(false);
     expect(p.enableTeams).toBe(true);
+  });
+
+  it('classifies casual fast paths as lightweight LLM turns', () => {
+    const d = decision('thanks');
+
+    expect(d.mode).toBe('lightweight_llm');
+    expect(d.userVisibleStatus).toBe('answering');
+    expect(d.policy.disableAllTools).toBe(true);
+  });
+
+  it('surfaces routed tool turns explicitly', () => {
+    const d = decision('check the Outlook inbox for Ross follow-up replies');
+
+    expect(d.mode).toBe('tool_llm');
+    expect(d.userVisibleStatus).toBe('checking tools');
+    expect(d.toolRoute.bundles).toEqual(['email_outlook']);
+  });
+
+  it('routes explicit sustained-work requests to background mode', () => {
+    const d = decision('keep working on the repo audit in the background until it is done');
+
+    expect(d.mode).toBe('background');
+    expect(d.userVisibleStatus).toBe('working in background');
   });
 });

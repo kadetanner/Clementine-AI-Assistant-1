@@ -13,6 +13,7 @@ import {
 } from '../config.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
+import { detectApprovalReply } from '../agent/local-turn.js';
 
 const logger = pino({ name: 'clementine.telegram' });
 
@@ -84,6 +85,13 @@ class TelegramStreamingMessage {
     this.pendingText = text;
     if (Date.now() - this.lastEdit >= STREAM_UPDATE_INTERVAL) {
       await this.flush();
+    }
+  }
+
+  setStatus(status: string): void {
+    if (!this.pendingText) this.pendingText = `_${status}_`;
+    if (Date.now() - this.lastEdit >= STREAM_UPDATE_INTERVAL) {
+      this.flush().catch(() => { /* best-effort */ });
     }
   }
 
@@ -162,14 +170,12 @@ export async function startTelegram(
     const sessionKey = `telegram:user:${userId}`;
 
     // ── Approval responses ──────────────────────────────────────────
-    const lower = text.toLowerCase().trim();
-    if (['yes', 'no', 'approve', 'deny', 'go', 'skip', 'always'].includes(lower)) {
+    const approvalReply = detectApprovalReply(text);
+    if (approvalReply !== null) {
       const approvals = gateway.getPendingApprovals();
       if (approvals.length > 0) {
-        const result: boolean | string = lower === 'always' ? 'always' :
-          (lower === 'yes' || lower === 'approve' || lower === 'go');
-        gateway.resolveApproval(approvals[approvals.length - 1], result);
-        const approved = result !== false;
+        gateway.resolveApproval(approvals[approvals.length - 1], approvalReply);
+        const approved = approvalReply !== false;
         await ctx.reply(approved ? '✅ Approved.' : '❌ Denied.');
         return;
       }
@@ -183,6 +189,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {
@@ -216,6 +226,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {
@@ -253,6 +267,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {

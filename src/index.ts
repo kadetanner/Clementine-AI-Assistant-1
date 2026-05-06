@@ -64,6 +64,9 @@ function killPid(pid: number): void {
 
 function stopLaunchdService(): boolean {
   if (process.platform !== 'darwin') return false;
+  if (process.env.XPC_SERVICE_NAME === LAUNCHD_LABEL || process.env.CLEMENTINE_LAUNCHD_MANAGED === '1') {
+    return false;
+  }
   const home = process.env.HOME ?? '';
   const plist = path.join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
   if (!existsSync(plist)) return false;
@@ -691,12 +694,31 @@ async function asyncMain(): Promise<void> {
       const llmCall = async (prompt: string): Promise<string> => {
         try {
           let result = '';
-          const stream = query({ prompt, options: { model: 'claude-haiku-4-5-20251001', maxTurns: 1, systemPrompt: 'You are a memory consolidation assistant. Be concise.' } });
+          const stream = query({
+            prompt,
+            options: config.normalizeClaudeSdkOptionsForOneMillionContext({
+              model: 'claude-haiku-4-5-20251001',
+              maxTurns: 1,
+              systemPrompt: 'You are a memory consolidation assistant. Be concise.',
+            }),
+          });
           for await (const msg of stream) {
-            if (msg.type === 'result') result = (msg as any).result ?? '';
+            if (msg.type === 'result') {
+              if ((msg as any).is_error) {
+                const errorText = Array.isArray((msg as any).errors)
+                  ? (msg as any).errors.join('; ')
+                  : String((msg as any).result ?? '');
+                if (config.looksLikeClaudeOneMillionContextError(errorText)) config.applyOneMillionContextRecovery();
+                return '';
+              }
+              result = (msg as any).result ?? '';
+            }
           }
           return result;
-        } catch { return ''; }
+        } catch (err) {
+          if (config.looksLikeClaudeOneMillionContextError(err)) config.applyOneMillionContextRecovery();
+          return '';
+        }
       };
       maintenanceInterval = startPeriodicMaintenance(memStore, llmCall);
     }

@@ -58,6 +58,19 @@ import {
   recentDecisions,
   recordDecisionOutcome,
 } from '../agent/proactive-ledger.js';
+import {
+  formatCreditBlock,
+  getBackgroundCreditBlock,
+  isCreditBalanceError,
+  markBackgroundCreditBlocked,
+} from './credit-guard.js';
+import { isRunHealthFailure } from './job-health.js';
+import {
+  analyzeLongTaskPreflight,
+  compactLongTaskPreflight,
+  shouldDowngradeUnleashed,
+  formatLongTaskPromptPrefix,
+} from './long-task-preflight.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -339,6 +352,7 @@ const TRANSIENT_PATTERNS = [
 ];
 
 export function classifyError(err: unknown): 'transient' | 'permanent' {
+  if (isCreditBalanceError(err)) return 'permanent';
   const msg = String(err);
   return TRANSIENT_PATTERNS.some((re) => re.test(msg)) ? 'transient' : 'permanent';
 }
@@ -437,7 +451,8 @@ export class CronRunLog {
     const recent = this.readRecent(jobName, 10);
     let count = 0;
     for (const entry of recent) {
-      if (entry.status === 'ok') break;
+      if (entry.status === 'skipped') continue;
+      if (!isRunHealthFailure(entry)) break;
       count++;
     }
     return count;
@@ -642,7 +657,7 @@ export class CronScheduler {
       if (isDeepMode(jobName)) return;                 // (1) deep-mode router
       if (jobName.startsWith('bg:')) return;           // (2) background-task dispatcher
       if (this.jobs.some(j => j.name === jobName)) return; // (3) registered cron job
-      if (result && result !== '__NOTHING__') {
+      if (result && !CronScheduler.isCronNoise(result)) {
         const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
         // Strip system metadata for clean conversational delivery
         const cleanResult = result
@@ -657,10 +672,13 @@ export class CronScheduler {
     this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
       if (phase <= 1) return; // Don't spam for the first phase — wait for real progress
       if (/TASK_COMPLETE:/i.test(output)) return; // Final delivery handled by unleashed complete callback
+      if (this.jobs.some(j => j.name === jobName)) return; // Registered cron jobs deliver through their run result path.
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       const cleanOutput = output
         .replace(/^STATUS SUMMARY:?\s*/im, '')
+        .trim()
         .slice(0, 500);
+      if (!cleanOutput || CronScheduler.isCronNoise(cleanOutput)) return;
       // For deep-mode runs, target the originating session so the progress
       // update lands in the same Discord DM / Slack thread / dashboard window.
       const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
@@ -676,6 +694,7 @@ export class CronScheduler {
       const now = Date.now();
       const lastSent = lastProgressSent.get(jobName) ?? 0;
       if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
+      if (!summary.trim() || CronScheduler.isCronNoise(summary)) return;
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
@@ -889,6 +908,21 @@ export class CronScheduler {
   }
 
   private async runJob(job: CronJobDefinition): Promise<void> {
+    const creditBlock = getBackgroundCreditBlock();
+    if (creditBlock) {
+      logger.warn({ job: job.name, until: creditBlock.until }, 'Cron job skipped — Claude credit block active');
+      this._logRun({
+        jobName: job.name,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'skipped',
+        durationMs: 0,
+        attempt: 0,
+        outputPreview: formatCreditBlock(creditBlock),
+      });
+      return;
+    }
+
     // Agent status check — skip if agent is paused/terminated
     if (job.agentSlug) {
       const agentMgr = this.gateway?.getAgentManager?.();
@@ -1078,11 +1112,6 @@ export class CronScheduler {
       logger.debug({ job: job.name, overrideLen: userOverride.length }, 'Applied user prompt overrides');
     }
 
-    // Compute effective timeout: advisor override > standard default
-    const effectiveTimeoutMs = job.mode !== 'unleashed'
-      ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
-      : undefined;
-
     // Persist advisor decision for analytics
     if (advisorApplied) {
       try {
@@ -1104,7 +1133,6 @@ export class CronScheduler {
     });
     this.persistRunningJobs(this.runMetadata);
     this.emitStatusChange();
-    this.logAutonomy('started', job, { model: job.model, mode: job.mode, tier: job.tier });
 
     try {
       logger.info(`Running cron job: ${job.name}${job.agentSlug ? ` (agent: ${job.agentSlug})` : ''}`);
@@ -1114,12 +1142,6 @@ export class CronScheduler {
       if (job.agentSlug) {
         this.gateway.setSessionProfile(cronSessionKey, job.agentSlug);
       }
-
-      // Unleashed tasks handle their own retries/phases internally — never retry the whole task
-      const priorErrors = this.runLog.consecutiveErrors(job.name);
-      const maxAttempts = job.mode === 'unleashed'
-        ? 1
-        : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
 
       // ── Inject context field if present ──
       let jobPrompt = job.prompt;
@@ -1157,6 +1179,95 @@ export class CronScheduler {
           }
         } catch { /* non-fatal */ }
       }
+
+      // Long-task preflight is ADVISORY ONLY. We log the risk + inject a
+      // checkpoint-discipline prompt prefix so the agent paces itself, but
+      // we do NOT auto-override the model/mode, never DM the owner asking
+      // to approve an Opus 1M upgrade, and never pre-block the run.
+      //
+      // Sonnet runs every job by default. Opus 1M is opt-in: set
+      // `model: claude-opus-4-7[1m]` in CRON.md per-job, or flip
+      // CLEMENTINE_1M_CONTEXT_MODE=on for global enable.
+      // ── Auto-downgrade unleashed → standard ────────────────────────
+      // CRON.md `mode: unleashed` is a CEILING, not a floor. If the
+      // job's history shows it's a quiet probe that completes in 1
+      // phase with __NOTHING__ or short output, the multi-phase
+      // wrapper is wasteful overhead — each phase is a fresh SDK
+      // query with full system prompt + tool schemas in cache_creation.
+      // For a "did anything new come in?" cron firing every 2 hours,
+      // that's 12+ unleashed runs/day at ~$1/each instead of standard
+      // mode at ~$0.05/each.
+      if (job.mode === 'unleashed') {
+        const downgrade = shouldDowngradeUnleashed(this.runLog.readRecent(job.name, 5));
+        if (downgrade.downgrade) {
+          job = { ...job, mode: 'standard' };
+          logger.info({
+            job: job.name,
+            reason: downgrade.reason,
+            quietRatio: downgrade.quietRatio,
+            avgDurationMs: downgrade.avgDurationMs,
+          }, 'Cron mode downgraded unleashed → standard based on run history');
+          this.logAutonomy('mode_downgrade', job, {
+            from: 'unleashed',
+            to: 'standard',
+            reason: downgrade.reason,
+            quietRatio: downgrade.quietRatio,
+            avgDurationMs: downgrade.avgDurationMs,
+          });
+        }
+      }
+
+      let longTaskPreflight: CronRunEntry['longTaskPreflight'] | undefined;
+      const preflight = analyzeLongTaskPreflight(job, jobPrompt, this.runLog.readRecent(job.name, 5));
+      if (preflight.risk !== 'normal') {
+        longTaskPreflight = compactLongTaskPreflight(preflight);
+        logger.warn({
+          job: job.name,
+          risk: preflight.risk,
+          route: preflight.route,
+          estimatedInputTokens: preflight.estimatedInputTokens,
+          projectedContextTokens: preflight.projectedContextTokens,
+          model: job.model,
+          mode: job.mode,
+          reasons: preflight.reasons,
+          advisory: true,
+        }, 'Long-task preflight (advisory) flagged cron job');
+        this.logAutonomy('long_task_preflight', job, {
+          risk: preflight.risk,
+          route: preflight.route,
+          estimatedInputTokens: preflight.estimatedInputTokens,
+          projectedContextTokens: preflight.projectedContextTokens,
+          model: job.model,
+          mode: job.mode,
+          requiresUserRefinement: false,
+          advisory: true,
+        });
+        jobPrompt = [
+          formatLongTaskPromptPrefix(preflight),
+          jobPrompt,
+        ].filter(Boolean).join('\n\n');
+      }
+
+      // Compute effective timeout after preflight because it may promote a
+      // large standard job into checkpointed unleashed mode.
+      const effectiveTimeoutMs = job.mode !== 'unleashed'
+        ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
+        : undefined;
+
+      // Unleashed tasks handle their own retries/phases internally — never retry the whole task.
+      // Compute this after preflight because preflight may promote a standard
+      // long task into unleashed mode.
+      const priorErrors = this.runLog.consecutiveErrors(job.name);
+      const maxAttempts = job.mode === 'unleashed'
+        ? 1
+        : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
+
+      this.logAutonomy('started', job, {
+        model: job.model,
+        mode: job.mode,
+        tier: job.tier,
+        longTaskPreflight,
+      });
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
@@ -1218,6 +1329,7 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
             terminalReason,
+            longTaskPreflight,
           };
 
           if (response && !CronScheduler.isCronNoise(response)) {
@@ -1289,7 +1401,20 @@ export class CronScheduler {
             terminalReason: errTerminalReason,
             attempt,
             advisorApplied,
+            longTaskPreflight,
           });
+
+          if (isCreditBalanceError(err)) {
+            const { block, created } = markBackgroundCreditBlocked(err);
+            logger.error({ err, job: job.name, until: block.until }, 'Cron hit Claude credit exhaustion — pausing background jobs');
+            if (created) {
+              await this.dispatcher.send(
+                `${job.name} hit Claude credit exhaustion. Background jobs are paused until ${block.until} so they stop draining/retrying. Interactive chat may also fail until credits are available.`,
+                { agentSlug: job.agentSlug },
+              );
+            }
+            return;
+          }
 
           // Permanent error — stop immediately
           if (errorType === 'permanent') {
@@ -1351,7 +1476,7 @@ export class CronScheduler {
       } else if (consErrors >= 5) {
         // Check if recovery probe just succeeded
         const lastRun = this.runLog.readRecent(job.name, 1)[0];
-        if (lastRun?.status === 'ok') {
+        if (lastRun && !isRunHealthFailure(lastRun)) {
           this.logAdvisorEvent('circuit-recovery', job.name, `Circuit breaker recovered after ${consErrors} errors`);
           this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit recovery notification'));
         }
@@ -1555,7 +1680,7 @@ export class CronScheduler {
     return response;
   }
 
-  private static isCronNoise(response: string): boolean {
+  static isCronNoise(response: string): boolean {
     const trimmed = response.trim();
     if (trimmed === '__NOTHING__') return true;
 
@@ -1576,9 +1701,16 @@ export class CronScheduler {
       'nothing new to report',
       'all clear',
       'no updates',
+      'no response requested',
       'completing silently',
     ];
-    if (noisePatterns.some((p) => lower.startsWith(p) || lower === p)) return true;
+    for (const p of noisePatterns) {
+      if (lower === p) return true;
+      if (lower.startsWith(p)) {
+        const rest = lower.slice(p.length).trim();
+        if (!rest || /^[.!)]/.test(rest) || /^(today|right now|at this time|so far)\b/.test(rest)) return true;
+      }
+    }
 
     return false;
   }

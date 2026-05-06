@@ -2,16 +2,18 @@
  * Clementine — Connector Feed recipes.
  *
  * Each recipe is a blueprint for a one-click "auto-seed feed" that turns an
- * authenticated Claude Desktop connector (Google Drive, Gmail, Outlook, etc.)
- * into a scheduled data feed that writes into the brain's ingest folder.
+ * authenticated tool source (Claude Desktop connector, Composio toolkit, or
+ * local MCP server) into a scheduled data feed that writes distilled notes
+ * into the brain's ingest folder.
  *
  * A feed materializes as:
  *   1. A CRON.md job entry with `managed: connector-feed` frontmatter
  *   2. (optional) A source registry row tying the target folder to the run
  *
  * The cron prompt tells the Claude Code agent to use the integration's MCP
- * tools to pull records, then call `brain_ingest_folder` to commit them —
- * which writes markdown files and runs the distillation pipeline in one step.
+ * tools to pull records, compare them with current memory when appropriate,
+ * then call `brain_ingest_folder` to commit them — which writes distilled
+ * markdown notes and indexes them in one step.
  *
  * Field syntax in prompt templates:
  *   {{fieldKey}}   — user-supplied value
@@ -60,7 +62,7 @@ export interface ConnectorRecipe {
   description: string;
   /** Emoji shown next to the label. */
   icon: string;
-  /** Matches the key in ~/.clementine/claude-integrations.json */
+  /** Matches the tool source name; "*" recipes are offered for every source. */
   integration: string;
   /** Tools we rely on for this recipe. Used only to warn if the integration
    *  hasn't surfaced them yet in claude-integrations.json. */
@@ -86,17 +88,121 @@ function slugify(s: string): string {
     .slice(0, 40) || 'feed';
 }
 
+function inferToolServer(toolName: string): string {
+  const match = String(toolName).match(/^mcp__([^_]+(?:_[^_]+)*)__/);
+  return match?.[1] ?? 'tool';
+}
+
 const COMMIT_INSTRUCTIONS = `When you have the records collected, call the \`brain_ingest_folder\` MCP tool with:
 - \`slug\`: "{{slug}}"
 - \`records\`: an array of \`{title, externalId, content, metadata}\` objects (one per item). \`externalId\` should be the source provider's stable id so re-runs dedup. \`metadata\` can include any fields you want preserved (url, modifiedAt, author).
 
-That tool writes each record to \`{{targetFolder}}/\` and runs the brain's distillation pipeline. You do NOT need to use Write — brain_ingest_folder handles file creation. Finish by reporting a one-line summary like "Ingested N new records, M unchanged".
+That tool runs the brain's distillation pipeline and writes the final notes to \`{{targetFolder}}/\`. You do NOT need to use Write — brain_ingest_folder handles note creation and indexing. Finish by reporting a one-line summary like "Ingested N new records, M unchanged".
 
 If the tool returns an error, include the error text in your summary.`;
+
+const MEMORY_DELTA_INSTRUCTIONS = `Before committing, call \`memory_recall\` for the feed slug/topic and use the returned chunks as the current memory state for this source. Keep records that are new, materially changed, or contain a new finding. Drop exact duplicates and rows that add no useful information. The ingestion pipeline will write markdown, chunk it, and index it for recall; do not call \`memory_write\` for these feed records.`;
 
 // ── Recipes ────────────────────────────────────────────────────────────
 
 export const RECIPES: ConnectorRecipe[] = [
+  {
+    id: 'tool-backed-memory-seed',
+    label: 'Seed memory from this tool',
+    description: 'Pick one tool, fetch records from it, compare them with current memory, and save only new or changed findings.',
+    icon: '🔌',
+    integration: '*',
+    requiredTools: [],
+    fields: [
+      {
+        key: 'topic',
+        label: 'Memory topic',
+        placeholder: 'customers, calls, leads, deals, meetings...',
+        required: true,
+        help: 'Used to search current memory and name this feed.',
+      },
+      {
+        key: 'toolName',
+        label: 'Tool to call',
+        required: true,
+        help: 'Pick the exact tool this feed should call each time it runs.',
+      },
+      {
+        key: 'callGoal',
+        label: 'What should Clementine fetch?',
+        placeholder: 'Fetch updated HubSpot contacts modified since the last run...',
+        required: true,
+        help: 'Describe the records to fetch, filters to apply, and any pagination bounds.',
+      },
+      {
+        key: 'variablesJson',
+        label: 'Tool variables (JSON)',
+        placeholder: '{"listId":"123","limit":100,"updatedAfter":"last_run"}',
+        help: 'Optional. Use {} if the tool needs no arguments.',
+      },
+      {
+        key: 'recordStrategy',
+        label: 'How to save each result',
+        placeholder: 'One record per contact. Use email as stable id. Summarize lifecycle stage, owner, last activity, and new changes.',
+        help: 'Tell Clementine what counts as one memory record and which field is the stable id.',
+      },
+      {
+        key: 'slug',
+        label: 'Memory bucket name (optional)',
+        placeholder: 'hubspot-contacts',
+        help: 'Optional. Leave blank to derive one from the connector and topic.',
+      },
+      {
+        key: 'limit',
+        label: 'Max records per run',
+        placeholder: '100',
+        defaultValue: '100',
+      },
+    ],
+    defaultSchedule: '0 8 * * *',
+    tier: 2,
+    slugFromValues: (v) => `tool-${slugify(v.slug || `${v.toolSourceName || inferToolServer(v.toolName || '')}-${v.topic || v.toolName || 'feed'}`)}`,
+    buildPrompt: (v, ctx) => {
+      const sourceName = v.toolSourceName || inferToolServer(v.toolName || '');
+      const sourceKind = v.toolSourceKind || 'mcp';
+      const sourceLabel = v.toolSourceLabel || sourceName;
+      const topic = v.topic || 'tool-backed memory';
+      const limit = v.limit || '100';
+      return `You are running a generic tool-backed memory seed feed.
+
+Tool source:
+- Label: "${sourceLabel}"
+- Source name: "${sourceName}"
+- Source kind: "${sourceKind}"
+- Tool: \`${v.toolName}\`
+
+Goal: ${v.callGoal || `Call ${v.toolName} and ingest useful returned data into memory.`}
+
+Tool variables JSON:
+\`\`\`json
+${(v.variablesJson || '{}').trim() || '{}'}
+\`\`\`
+
+How to save each result:
+${v.recordStrategy || 'Convert the tool response into one memory record per returned entity or event. Use the provider stable id when available; otherwise use a deterministic hash of the source, topic, and meaningful record key.'}
+
+Steps:
+1. Call exactly this selected tool: \`${v.toolName}\`. Use the Tool variables JSON and the Goal above as the tool-call inputs. If the tool schema needs differently named arguments, map the provided variables to that schema. Do not switch to a different external tool unless this tool returns a clear instruction that another tool is required to read the selected records.
+2. If the tool supports pagination or modified-since filters, prefer new/updated records and stop after ${limit} records. If no modified-since filter is available, fetch the most relevant ${limit} records.
+3. Normalize the tool result into candidate records. Preserve stable ids, URLs, timestamps, owners/authors, status fields, and provider metadata. Skip empty or purely administrative records.
+4. ${MEMORY_DELTA_INSTRUCTIONS}
+   Use this recall query: \`source:${ctx.slug} ${topic} ${sourceLabel} ${v.toolName}\`.
+5. Compare the normalized candidates with recalled memory. Keep only candidates that are new, materially changed, or produce a new useful finding. Drop exact duplicates and trivial timestamp-only changes unless the timestamp itself is the useful fact.
+6. For each kept candidate, build one record:
+   - \`title\`: a compact human label including the topic and record name/id.
+   - \`externalId\`: \`${sourceName}:${topic}:<providerStableIdOrDeterministicHash>\`.
+   - \`content\`: markdown containing the current facts, the new/changed finding, and a "Source data" section with relevant returned fields.
+   - \`metadata\`: \`{provider:"${sourceName}", toolSource:"${sourceKind}", toolName:"${v.toolName}", topic:"${topic}", fetchedAt, sourceUrl, updatedAt}\` plus any provider-specific keys worth preserving.
+7. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
+`;
+    },
+  },
+
   {
     id: 'gdrive-watch-folder',
     label: 'Google Drive: watch a folder',
@@ -205,6 +311,76 @@ Steps:
    - \`content\`: a markdown bullet list of each event (time, title, attendees, location)
    - \`metadata\`: \`{date, eventCount}\`
 3. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
+`,
+  },
+
+  {
+    id: 'googlesheets-range',
+    label: 'Google Sheets: range to memory',
+    description: 'Pull rows from a Google Sheet range through Composio, compare with current memory, and ingest new findings.',
+    icon: '📊',
+    integration: 'googlesheets',
+    requiredTools: ['GOOGLESHEETS'],
+    fields: [
+      {
+        key: 'spreadsheet',
+        label: 'Spreadsheet ID or URL',
+        placeholder: 'https://docs.google.com/spreadsheets/d/... or spreadsheet id',
+        required: true,
+        help: 'Use the stable spreadsheet ID or full Sheets URL. Names are less reliable because they require a Drive search first.',
+      },
+      {
+        key: 'range',
+        label: 'Range',
+        placeholder: 'Sheet1!A:Z',
+        defaultValue: 'Sheet1!A:Z',
+        required: true,
+      },
+      {
+        key: 'topic',
+        label: 'Memory topic',
+        placeholder: 'customers, leads, roadmap, finance...',
+        defaultValue: 'sheet findings',
+        help: 'Used for recall and the feed slug so this sheet compares against the right memory.',
+      },
+      {
+        key: 'keyColumn',
+        label: 'Stable key column (optional)',
+        placeholder: 'email, company, id',
+        help: 'If present in the header row, use this column as the stable row id; otherwise use row number plus row hash.',
+      },
+      {
+        key: 'limit',
+        label: 'Max rows per run',
+        placeholder: '500',
+        defaultValue: '500',
+      },
+    ],
+    defaultSchedule: '0 8 * * *',
+    tier: 2,
+    slugFromValues: (v) => `gsheet-${slugify(v.topic || v.spreadsheet || 'range')}`,
+    buildPrompt: (v, ctx) => `You are running the Composio Google Sheets feed for topic "${v.topic || 'sheet findings'}".
+
+Inputs:
+- Spreadsheet: "${v.spreadsheet}"
+- Range: "${v.range || 'Sheet1!A:Z'}"
+- Stable key column: "${v.keyColumn || '(none)'}"
+- Max rows: ${v.limit || '500'}
+
+Goal: read this Google Sheet through the authenticated Composio Google Sheets tools (\`mcp__googlesheets__*\`), compare the sheet data with existing memory for slug "${ctx.slug}", and ingest only rows/findings that are new or materially changed.
+
+Steps:
+1. Resolve the spreadsheet id. If the input is a Google Sheets URL, extract the id from \`/d/<id>/\`; otherwise treat the input as the id. If it is only a title/name, use available Google Drive/Sheets search tools to resolve it, but do not guess if multiple sheets match.
+2. Call the most specific Google Sheets read/get-values tool exposed in this session to fetch range "${v.range || 'Sheet1!A:Z'}". Limit to ${v.limit || '500'} data rows when the tool supports a limit.
+3. Treat the first row as headers. Normalize each following row into an object keyed by those headers. Skip blank rows.
+4. ${MEMORY_DELTA_INSTRUCTIONS}
+   Use this recall query: \`source:${ctx.slug} ${v.topic || 'sheet findings'} Google Sheet ${v.range || 'Sheet1!A:Z'}\`.
+5. For each kept row, build one record:
+   - \`title\`: "${v.topic || 'Sheet finding'} — " plus the stable key value or row number.
+   - \`externalId\`: \`gsheet:<spreadsheetId>:${v.range || 'Sheet1!A:Z'}:<stableKeyOrRowHash>\`.
+   - \`content\`: a concise markdown summary of the row's current facts and the new/changed finding. Include the source row fields under a "Row data" section.
+   - \`metadata\`: \`{provider:"google_sheets", toolSource:"composio", spreadsheetId, range, topic, keyColumn, rowNumber}\`.
+6. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
 `,
   },
 
