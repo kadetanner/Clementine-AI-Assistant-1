@@ -24,10 +24,12 @@ const LEGACY_SECTIONS = [
   { route: 'advisor', tag: 'lexi-advisor-view' },
   { route: 'budget', tag: 'lexi-budget-view' },
   { route: 'heartbeat', tag: 'lexi-heartbeat-view' },
+  // Phase 24 — brain pillar shipped view
+  { route: 'brain', tag: 'lexi-brain-view' },
 ] as const;
 
 const PENDING_SECTIONS = [
-  'routines', 'brain', 'skills', 'approvals',
+  'routines', 'skills', 'approvals',
   'build',
   'team', 'projects', 'plans', 'claims',
 ] as const;
@@ -263,6 +265,20 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Heartbeat/);
     await expect(view).toContainText(/Global/);
     await expect(view).toContainText(/Per-agent/);
+  });
+
+  test('brain — five tab pills render and connectors list shows', async ({ page }) => {
+    await gotoRoute(page, 'brain', 'lexi-brain-view');
+    const view = page.locator('lexi-brain-view');
+    await expect(view).toContainText(/Brain/);
+    await expect(view).toContainText(/Sources/);
+    await expect(view).toContainText(/Feeds/);
+    await expect(view).toContainText(/Connectors/);
+    await expect(view).toContainText(/Library/);
+    await expect(view).toContainText(/Runs/);
+    // The connectors registry is static — at least one always shows
+    await view.locator('.lx-tab-pill', { hasText: 'Connectors' }).click();
+    await expect(view).toContainText(/Web Search|GitHub|Slack|Google Drive/);
   });
 });
 

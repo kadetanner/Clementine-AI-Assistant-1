@@ -29,6 +29,7 @@ import '../views/lexi-logs-view.js';
 import '../views/lexi-advisor-view.js';
 import '../views/lexi-budget-view.js';
 import '../views/lexi-heartbeat-view.js';
+import '../views/lexi-brain-view.js';
 
 // Existing views — kept and wired into the new shell.
 import './lexi-agents-view.js';
@@ -43,7 +44,7 @@ import './workflows/lexi-workflows-view.js';
 import './workflows/lexi-workflow-detail.js';
 
 const PHASE_PENDING_SECTIONS = new Set([
-  'routines', 'brain', 'skills', 'approvals',
+  'routines', 'skills', 'approvals',
   'build',
   'team', 'projects', 'plans', 'claims',
 ]);
@@ -143,6 +144,7 @@ export class LexiApp extends LitElement {
     if (r === 'advisor') return html`<lexi-advisor-view></lexi-advisor-view>`;
     if (r === 'budget') return html`<lexi-budget-view></lexi-budget-view>`;
     if (r === 'heartbeat') return html`<lexi-heartbeat-view></lexi-heartbeat-view>`;
+    if (r === 'brain') return html`<lexi-brain-view></lexi-brain-view>`;
     if (PHASE_PENDING_SECTIONS.has(r))
       return html`<lexi-phase-pending-view section=${r}></lexi-phase-pending-view>`;
     return html`<div class="lx-view-head"><h1>${r}</h1><p class="subtitle">Unknown section</p></div>`;
