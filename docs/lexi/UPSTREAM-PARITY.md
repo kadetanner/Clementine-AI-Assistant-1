@@ -1,6 +1,6 @@
 # Upstream -> Lexi Feature Parity
 
-Generated: 2026-05-06T03:51:09.609Z
+Generated: 2026-05-06T04:12:21.080Z
 
 Compares upstream `src/cli/dashboard.ts` route + nav surface against
 Lexi's implementation under `src/lexi-dashboard/`. Documented omissions
@@ -9,9 +9,9 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 
 ## Summary
 
-- Upstream features audited: **264**
+- Upstream features audited: **265**
 - Implemented in Lexi: **3**
-- Documented omissions: **261**
+- Documented omissions: **262**
 - MISSING: **0**
 
 ## Comparison
@@ -251,6 +251,7 @@ are declared via `LEXI-OMIT: <feature>` comments in Lexi source
 | route | `POST /api/routines/:id/run` | documented omission |
 | route | `POST /api/routines/:id/test` | documented omission |
 | route | `POST /api/routines/:id/toggle` | documented omission |
+| route | `POST /api/runagent/test` | documented omission |
 | route | `POST /api/self-improve/apply/:id` | documented omission |
 | route | `POST /api/self-improve/deny/:id` | documented omission |
 | route | `POST /api/self-improve/run` | documented omission |

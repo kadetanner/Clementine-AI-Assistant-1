@@ -20,6 +20,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "dod": "node scripts/run-dod.mjs",
+    "dod:report": "node scripts/generate-dod-report.mjs",
     "postinstall": "node scripts/postinstall.js 2>/dev/null || true"
   },
   "dependencies": {

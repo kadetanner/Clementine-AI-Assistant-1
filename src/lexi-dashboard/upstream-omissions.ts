@@ -240,6 +240,7 @@
  * LEXI-OMIT: POST /api/routines/:id/run
  * LEXI-OMIT: POST /api/routines/:id/test
  * LEXI-OMIT: POST /api/routines/:id/toggle
+ * LEXI-OMIT: POST /api/runagent/test
  * LEXI-OMIT: POST /api/self-improve/apply/:id
  * LEXI-OMIT: POST /api/self-improve/deny/:id
  * LEXI-OMIT: POST /api/self-improve/run
