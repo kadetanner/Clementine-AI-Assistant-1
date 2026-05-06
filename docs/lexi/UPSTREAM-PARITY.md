@@ -1,6 +1,6 @@
 # Upstream -> Lexi Feature Parity
 
-Generated: 2026-05-06T04:12:21.080Z
+Generated: 2026-05-06T04:14:05.101Z
 
 Compares upstream `src/cli/dashboard.ts` route + nav surface against
 Lexi's implementation under `src/lexi-dashboard/`. Documented omissions
