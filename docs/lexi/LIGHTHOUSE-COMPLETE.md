@@ -10,11 +10,13 @@
 |---|---|---|
 | Upstream route coverage | 12/265 (4.5%) | **265/265 (100.0%)** |
 | Lexi-only routes added | 10 | **23** |
-| Unit tests | 263 | **335** |
-| E2E tests | 24 | **30** |
-| Source LOC under `src/lexi-dashboard/` | 5,601 | **~11,000** |
+| Unit tests | 263 | **360** |
+| E2E tests | 24 | **43** |
+| Source LOC under `src/lexi-dashboard/` | 5,601 | **~13,000** |
 | Design system | mixed inline styles | tokens + 18 primitives |
 | Sections in nav | 8 | **17** + footer |
+| Sections with dedicated views | 8 | **17** (all) |
+| Phase-pending placeholders | n/a | **0** |
 
 ## Phases
 
@@ -33,6 +35,10 @@
 | 20 | Cross-surface search | shipped |
 | 21 | Final hardening + this report | shipped |
 | 22 | Live trace pillar — session-log tailer + trace view + SSE | shipped |
+| 23 | Observe pillar views — logs, advisor, budget, heartbeat | shipped |
+| 24 | Brain pillar view — sources, feeds, connectors, library, runs | shipped |
+| 25 | Operate pillar follow-on — routines, skills, approvals | shipped |
+| 26 | Long-tail views — build, team, projects, plans, claims (zero phase-pending) | shipped |
 
 ## Hard constraints honored
 
@@ -71,18 +77,15 @@
   `tests/lexi/dod/browsers.md`.
 - **Onboarding tour** — Today view's quick-links + nav-rail tooltips
   accomplish first-run navigation. A formal step-by-step tour was not built.
-- **Phase-pending sections (`brain`, `routines`, `skills`, `approvals`,
-  `budget`, `logs`, `advisor`, `heartbeat`, `build`, `team`, `projects`,
-  `plans`, `claims`)** — backend routes are wired (read paths return real
-  data, mutating paths honestly 501). Dedicated views for each are still
-  placeholders that name the implementing phase. The Today view + the command
-  palette + cross-surface search already surface these surfaces' data;
-  dedicated views are progressive enhancement.
 - **Agent registry filter** — `/api/agents` discovery in `agents/vault-store`
   filters Lexi herself out, so the registry currently returns only Jonah.
   Phase 22 trace view derives agent slugs from session-key prefixes (`cron:`,
   `team-task:->`, `unleashed:`, `discord:`) which surfaces every active agent
   even when the registry is incomplete.
+
+Every Lighthouse-spec section now has a real, tested view. Mutations that
+require daemon-side credentials remain honest 501s; the views surface that
+contract explicitly rather than hiding it.
 
 ## Files of interest
 

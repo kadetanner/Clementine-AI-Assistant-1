@@ -33,6 +33,11 @@ import '../views/lexi-brain-view.js';
 import '../views/lexi-routines-view.js';
 import '../views/lexi-skills-view.js';
 import '../views/lexi-approvals-view.js';
+import '../views/lexi-build-view.js';
+import '../views/lexi-team-view.js';
+import '../views/lexi-projects-view.js';
+import '../views/lexi-plans-view.js';
+import '../views/lexi-claims-view.js';
 
 // Existing views — kept and wired into the new shell.
 import './lexi-agents-view.js';
@@ -46,10 +51,9 @@ import './lexi-command-palette.js';
 import './workflows/lexi-workflows-view.js';
 import './workflows/lexi-workflow-detail.js';
 
-const PHASE_PENDING_SECTIONS = new Set([
-  'build',
-  'team', 'projects', 'plans', 'claims',
-]);
+// All Lighthouse sections now have a real view. The set stays in place
+// so a future pending section can be added without restructuring the shell.
+const PHASE_PENDING_SECTIONS = new Set<string>([]);
 
 export class LexiApp extends LitElement {
   static properties = {
@@ -150,6 +154,11 @@ export class LexiApp extends LitElement {
     if (r === 'routines') return html`<lexi-routines-view></lexi-routines-view>`;
     if (r === 'skills') return html`<lexi-skills-view></lexi-skills-view>`;
     if (r === 'approvals') return html`<lexi-approvals-view></lexi-approvals-view>`;
+    if (r === 'build') return html`<lexi-build-view></lexi-build-view>`;
+    if (r === 'team') return html`<lexi-team-view></lexi-team-view>`;
+    if (r === 'projects') return html`<lexi-projects-view></lexi-projects-view>`;
+    if (r === 'plans') return html`<lexi-plans-view></lexi-plans-view>`;
+    if (r === 'claims') return html`<lexi-claims-view></lexi-claims-view>`;
     if (PHASE_PENDING_SECTIONS.has(r))
       return html`<lexi-phase-pending-view section=${r}></lexi-phase-pending-view>`;
     return html`<div class="lx-view-head"><h1>${r}</h1><p class="subtitle">Unknown section</p></div>`;

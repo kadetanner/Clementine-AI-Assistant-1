@@ -30,12 +30,19 @@ const LEGACY_SECTIONS = [
   { route: 'routines',  tag: 'lexi-routines-view' },
   { route: 'skills',    tag: 'lexi-skills-view' },
   { route: 'approvals', tag: 'lexi-approvals-view' },
+  // Phase 26 — long-tail views (build, team, projects, plans, claims).
+  // Closes the last phase-pending placeholders. All 17 nav sections now
+  // mount real views.
+  { route: 'build',    tag: 'lexi-build-view' },
+  { route: 'team',     tag: 'lexi-team-view' },
+  { route: 'projects', tag: 'lexi-projects-view' },
+  { route: 'plans',    tag: 'lexi-plans-view' },
+  { route: 'claims',   tag: 'lexi-claims-view' },
 ] as const;
 
-const PENDING_SECTIONS = [
-  'build',
-  'team', 'projects', 'plans', 'claims',
-] as const;
+// All Lighthouse sections now have a dedicated view. The pending list
+// stays in place for forward compatibility but is empty.
+const PENDING_SECTIONS = [] as const;
 
 test.beforeAll(async ({ request }) => {
   try {
@@ -306,6 +313,46 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Approvals/);
     await expect(view).toContainText(/Pending \(/);
     await expect(view).toContainText(/Decided \(/);
+  });
+
+  test('build — usage and operations panes render', async ({ page }) => {
+    await gotoRoute(page, 'build', 'lexi-build-view');
+    const view = page.locator('lexi-build-view');
+    await expect(view).toContainText(/Build/);
+    await expect(view).toContainText(/Usage/);
+    await expect(view).toContainText(/Recent operations/);
+  });
+
+  test('team — status, members, leaderboard panes render', async ({ page }) => {
+    await gotoRoute(page, 'team', 'lexi-team-view');
+    const view = page.locator('lexi-team-view');
+    await expect(view).toContainText(/Team/);
+    await expect(view).toContainText(/Status/);
+    await expect(view).toContainText(/Members/);
+    await expect(view).toContainText(/Leaderboard/);
+  });
+
+  test('projects — list + detail panes render', async ({ page }) => {
+    await gotoRoute(page, 'projects', 'lexi-projects-view');
+    const view = page.locator('lexi-projects-view');
+    await expect(view).toContainText(/Projects/);
+    await expect(view).toContainText(/Detail/);
+    await expect(view).toContainText(/Pick a project|No projects/);
+  });
+
+  test('plans — today + diff + list panes render', async ({ page }) => {
+    await gotoRoute(page, 'plans', 'lexi-plans-view');
+    const view = page.locator('lexi-plans-view');
+    await expect(view).toContainText(/Plans/);
+    await expect(view).toContainText(/Today/);
+    await expect(view).toContainText(/Pending diff/);
+  });
+
+  test('claims — list with verify/fail/dismiss buttons render', async ({ page }) => {
+    await gotoRoute(page, 'claims', 'lexi-claims-view');
+    const view = page.locator('lexi-claims-view');
+    await expect(view).toContainText(/Claims/);
+    await expect(view).toContainText(/No claims|Verify|Fail|Dismiss/);
   });
 });
 
