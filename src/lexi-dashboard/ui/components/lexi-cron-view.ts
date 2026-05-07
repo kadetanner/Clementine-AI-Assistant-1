@@ -108,7 +108,9 @@ function statusPillStyle(s?: string): { bg: string; fg: string; dot: string; lab
   if (s === 'success') return { bg: 'color-mix(in srgb, var(--success) 12%, transparent)', fg: 'var(--success)', dot: 'var(--success)', label: 'Success' };
   if (s === 'failed') return { bg: 'color-mix(in srgb, var(--danger) 12%, transparent)', fg: 'var(--danger)', dot: 'var(--danger)', label: 'Failed' };
   if (s === 'running') return { bg: 'color-mix(in srgb, var(--accent) 12%, transparent)', fg: 'var(--accent)', dot: 'var(--accent)', label: 'Running' };
-  return { bg: 'var(--bg-elevated)', fg: 'var(--text-tertiary)', dot: 'var(--text-tertiary)', label: 'Idle' };
+  // Idle uses --text-secondary (not --text-tertiary) so 11px text on the card-elevated
+  // background clears WCAG AA — same pattern as the broken-banner override.
+  return { bg: 'var(--bg-canvas)', fg: 'var(--text-secondary)', dot: 'var(--text-secondary)', label: 'Idle' };
 }
 
 export class LexiCronView extends LitElement {
@@ -238,6 +240,8 @@ export class LexiCronView extends LitElement {
         }
         lexi-cron-view .summary-strip .stat { display: flex; align-items: baseline; gap: 6px; }
         lexi-cron-view .summary-strip .stat-num { font-size: 18px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+        /* Use --text-secondary (not --text-tertiary) so 12px small caps on
+         * --bg-elevated clears WCAG AA contrast. */
         lexi-cron-view .summary-strip .stat-label { color: var(--text-secondary); font-size: 12px; }
         lexi-cron-view .summary-strip .stat.broken .stat-num { color: var(--danger); }
         lexi-cron-view .summary-strip .divider { width: 1px; height: 22px; background: var(--border-subtle); }
@@ -268,7 +272,8 @@ export class LexiCronView extends LitElement {
         lexi-cron-view .job-ident { min-width: 0; flex: 1; }
         lexi-cron-view .job-name { font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
         lexi-cron-view .job-schedule { font-size: 13px; color: var(--text-primary); margin-bottom: 2px; }
-        lexi-cron-view .job-cron { font-size: 11px; color: var(--text-tertiary); }
+        /* --text-secondary (not -tertiary) for 11px mono on --bg-elevated to clear WCAG AA. */
+        lexi-cron-view .job-cron { font-size: 11px; color: var(--text-secondary); }
 
         lexi-cron-view .job-controls { display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
         lexi-cron-view .status-pill {
@@ -278,14 +283,17 @@ export class LexiCronView extends LitElement {
           letter-spacing: 0.2px;
         }
         lexi-cron-view .status-dot { width: 6px; height: 6px; border-radius: 50%; }
+        /* Use --accent-strong (not --accent) so 12px outlined-button text on
+         * --bg-elevated card surface clears WCAG AA. --accent has a contrast
+         * ratio of 4.14:1 here; --accent-strong is ~6.4:1. */
         lexi-cron-view .run-btn {
-          background: transparent; color: var(--accent);
-          border: 1px solid var(--accent);
+          background: transparent; color: var(--accent-strong);
+          border: 1px solid var(--accent-strong);
           padding: 5px 14px; border-radius: 6px;
-          font: inherit; font-size: 12px; font-weight: 500;
+          font: inherit; font-size: 12px; font-weight: 600;
           cursor: pointer; transition: background 120ms ease;
         }
-        lexi-cron-view .run-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+        lexi-cron-view .run-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-strong) 12%, transparent); }
         lexi-cron-view .run-btn:disabled { opacity: 0.6; cursor: wait; }
 
         lexi-cron-view .job-meta {
@@ -294,19 +302,22 @@ export class LexiCronView extends LitElement {
           border-top: 1px solid var(--border-subtle);
           font-size: 12px; color: var(--text-secondary);
         }
+        /* All small/muted text on --bg-elevated card surface uses --text-secondary
+         * (not --text-tertiary) to clear WCAG AA contrast. */
         lexi-cron-view .job-meta .meta-label {
-          color: var(--text-tertiary);
+          color: var(--text-secondary);
           font-size: 11px;
           text-transform: uppercase;
           letter-spacing: 0.4px;
           margin-right: 4px;
+          opacity: 0.85;
         }
-        lexi-cron-view .job-meta .awaiting { color: var(--text-tertiary); font-style: italic; }
+        lexi-cron-view .job-meta .awaiting { color: var(--text-secondary); font-style: italic; }
         lexi-cron-view .mono { font-family: 'JetBrains Mono', monospace; }
 
         lexi-cron-view .empty-state {
           padding: 32px 16px; text-align: center;
-          color: var(--text-tertiary); font-size: 13px;
+          color: var(--text-secondary); font-size: 13px;
           background: var(--bg-elevated); border: 1px dashed var(--border-subtle); border-radius: 8px;
         }
       </style>
