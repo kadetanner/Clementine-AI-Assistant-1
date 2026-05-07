@@ -115,6 +115,7 @@ export class LexiAgentsView extends LitElement {
     if (!this.agents.length) return html`<div class="placeholder" style="padding:16px">No agents found.</div>`;
     return this.agents.map((a) => html`
       <div class="agent-row" data-agent-slug="${a.slug}"
+        role="option"
         aria-selected=${this.selected?.slug === a.slug}
         @click=${() => this.select(a.slug)}>
         <span class="dot" data-status=${a.last_active_at ? 'running' : 'idle'}></span>
@@ -130,7 +131,7 @@ export class LexiAgentsView extends LitElement {
     if (!this.selected) return html`<div class="placeholder">Select an agent to inspect.</div>`;
     const s = this.selected;
     const tabBtn = (id: Tab, label: string) => html`
-      <div class="tab" aria-selected=${this.tab === id} @click=${() => (this.tab = id)}>${label}</div>`;
+      <div class="tab" role="tab" aria-selected=${this.tab === id} @click=${() => (this.tab = id)}>${label}</div>`;
     const allTools = [...new Set([...s.allowedTools, ...s.disabledTools])].sort();
     return html`
       <div data-detail-slug="${s.slug}">
@@ -301,8 +302,8 @@ export class LexiAgentsView extends LitElement {
           margin-right: var(--sp-2);
         }
       </style>
-      <aside>${this.renderList()}</aside>
-      <section>${this.error ? html`<div class="placeholder">Error: ${this.error}</div>` : this.renderDetail()}</section>
+      <aside role="listbox" aria-label="Agents">${this.renderList()}</aside>
+      <section role="tabpanel">${this.error ? html`<div class="placeholder">Error: ${this.error}</div>` : this.renderDetail()}</section>
     `;
   }
 }

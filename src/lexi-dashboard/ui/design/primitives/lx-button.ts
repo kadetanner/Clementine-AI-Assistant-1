@@ -50,10 +50,22 @@ export class LxButton extends LitElement {
     }
   }
 
+  /** Compute an accessible name. Light-DOM <slot> doesn't project, so axe
+   * sees an empty button. Prefer explicit aria-label on the host, otherwise
+   * fall back to the host's text content (which is the slotted label). */
+  private accessibleName(): string {
+    const explicit = this.getAttribute('aria-label');
+    if (explicit && explicit.trim()) return explicit.trim();
+    const text = (this.textContent ?? '').trim();
+    return text;
+  }
+
   render(): TemplateResult {
+    const label = this.accessibleName();
     return html`<button
       class="lx-button"
       type=${this.type}
+      aria-label=${label || (this.icon || 'button')}
       data-variant=${this.variant === 'default' ? '' : this.variant}
       data-size=${this.size}
       data-loading=${this.loading ? 'true' : 'false'}

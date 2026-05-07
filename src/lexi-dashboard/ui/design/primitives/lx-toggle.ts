@@ -36,10 +36,15 @@ export class LxToggle extends LitElement {
   }
 
   render(): TemplateResult {
+    // Accessible name: prefer host's aria-label, fall back to "Toggle".
+    // The button has no inner text (it's a styled switch), so without an
+    // explicit name screen readers + axe see it as nameless.
+    const label = (this.getAttribute('aria-label') ?? '').trim() || 'Toggle';
     return html`<button
       type="button"
       class="lx-toggle"
       role="switch"
+      aria-label=${label}
       aria-checked=${this.checked ? 'true' : 'false'}
       aria-disabled=${this.disabled ? 'true' : 'false'}
       tabindex=${this.disabled ? -1 : 0}

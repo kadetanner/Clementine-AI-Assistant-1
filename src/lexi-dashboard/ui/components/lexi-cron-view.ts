@@ -144,8 +144,12 @@ export class LexiCronView extends LitElement {
     return html`
       <style>
         lexi-cron-view { display: block; }
-        lexi-cron-view .broken-banner { border: 1px solid var(--danger); background: rgba(239,68,68,0.08); border-radius: 8px; padding: 12px; margin-bottom: 16px; }
-        lexi-cron-view .broken-banner > .head { font-weight: 600; color: var(--danger); margin-bottom: 6px; }
+        /* 2026-05 polish: bumped surface to 12% so the danger-red text and
+         * --text-tertiary meta clear WCAG AA on the soft pink background. */
+        lexi-cron-view .broken-banner { border: 1px solid var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--bg-canvas)); border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+        lexi-cron-view .broken-banner > .head { font-weight: 700; color: #b91c1c; margin-bottom: 6px; }
+        lexi-cron-view .broken-banner span,
+        lexi-cron-view .broken-banner div[style*="text-tertiary"] { color: var(--text-secondary) !important; }
         lexi-cron-view .msg { padding: 8px 12px; background: var(--bg-elevated); border-radius: 6px; font-size: 12px; margin-bottom: 12px; }
         lexi-cron-view table { width: 100%; border-collapse: collapse; font-size: 13px; }
         lexi-cron-view th { padding: 8px 6px; text-align: left; color: var(--text-tertiary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 500; }
