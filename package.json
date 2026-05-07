@@ -28,6 +28,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test --config=tests/lexi/e2e/playwright.config.ts",
+    "audit:inventory": "tsx scripts/audit/inventory-interactions.ts",
     "dod": "node scripts/run-dod.mjs",
     "dod:report": "node scripts/generate-dod-report.mjs",
     "parity": "node scripts/lexi-parity-audit.mjs",
