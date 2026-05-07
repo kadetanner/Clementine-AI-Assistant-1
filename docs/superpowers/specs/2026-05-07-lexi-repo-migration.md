@@ -115,6 +115,20 @@ Cutting seams *before* moving paths means tests keep passing throughout. Moving 
 - `lexi/web/upstream-omissions.ts`
 - `lexi/web/workflows/`
 
+**Dragged-along Clementine modules** (Option C, decided 2026-05-07 after seam audit revealed mcp-bridge's dependency cascade):
+
+The connections view depends on `agent/mcp-bridge.ts` for real MCP server discovery. Inlining its 661 lines + transitive deps would be a refactor disguised as a seam-cut, and stubbing it would regress the Track 1 freeze contract for `#/connections`. Instead, the migration scope is widened to drag mcp-bridge and its closure into `lexi/web/`. The cascade was audited and confirmed bounded:
+
+- `src/agent/mcp-bridge.ts` (661 LOC) → `lexi/web/agents/mcp-bridge.ts`
+- `src/types.ts` (1201 LOC, leaf — no non-builtin imports) → `lexi/web/types.ts`
+- `src/config.ts` (848 LOC) → `lexi/web/config.ts`
+- `src/config/env-parser.ts` (46 LOC, leaf) → `lexi/web/config/env-parser.ts`
+- `src/config/clementine-json.ts` (190 LOC, leaf — only `pino`, `zod`) → `lexi/web/config/clementine-json.ts`
+
+Total ~2946 LOC across 5 files. Their internal `'../config.js'`, `'../types.js'`, `'./config/env-parser.js'`, `'./config/clementine-json.js'` import paths all preserve correctness under the rename pattern (depth-1 → depth-1, depth-0 → depth-0). No additional cascade outside this set.
+
+The two callsites in `services/` and the three test mocks in `tests/lexi/connections/` reference the original Clementine paths; `git filter-repo --replace-text` rewrites them atomically with the rename. See §4 for the exact rules.
+
 **Tests:** `tests/lexi/` → `lexi/web/tests/`
 - All 50 top-level test files + `e2e/`, `agents/`, `connections/`, `components/`, `components-debug/`, `dod/`, `fixes/`, `workflows/` subdirectories.
 - 83 spec/test files total.
@@ -125,11 +139,10 @@ Cutting seams *before* moving paths means tests keep passing throughout. Moving 
 
 ### Shimmed or inlined (from Clementine into `lexi/web/`)
 
-The 2026-05-07 seam audit confirmed **two** outside-tree imports (the `events/bus` import this spec originally listed turned out to be a depth-2 import that resolves *in-tree* — `src/lexi-dashboard/data/lexi-native/session-log-tailer.ts` → `../../events/bus.js` lands at `src/lexi-dashboard/events/bus.ts`, which travels with the migration as part of the moved tree):
+The 2026-05-07 seam audit confirmed only **one** seam requires a shim (`composio` is dropped because it's out of Lexi's scope; `events/bus` was a path-resolution false alarm — depth-2 import that lands in-tree; `mcp-bridge` is now dragged along, see "Dragged-along Clementine modules" above):
 
 | Import | Decision | Rationale |
 |---|---|---|
-| `../../agent/mcp-bridge.js` | **Inline** copy of the file into `lexi/web/agents/mcp-bridge.ts`. Drop unused exports. | Two use sites in `services/`. Lexi shouldn't depend on Clementine's agent abstraction. |
 | `../../integrations/composio/client.js` | **Drop**, replace with a thin stub that returns "not configured" if Composio isn't wired. | Composio isn't a Lexi-track feature. Two use sites in `services/`. If the connections view needs to talk to Composio, that's a Track 2C decision. |
 
 Decisions confirmed during the §2 step 1 seam audit (`docs/migration/2026-05-lexi-seam-audit.md`). If audit surfaces additional imports not listed above, the same inline / shared / shim / drop framework applies and the migration log records each.

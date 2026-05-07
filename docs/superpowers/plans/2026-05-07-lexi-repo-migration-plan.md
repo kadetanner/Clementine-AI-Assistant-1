@@ -188,55 +188,75 @@ git commit -m "docs(migration): seam audit for Lexi repo extraction"
 
 ---
 
-### Task 2: Inline `agent/mcp-bridge` into `lexi/web/agents/`
+### Task 2: ~~Inline mcp-bridge~~ → Drag mcp-bridge cascade via filter-repo (Option C)
 
-**Files:**
-- Read: `src/agent/mcp-bridge.ts`
-- Create: `src/lexi-dashboard/agents/mcp-bridge.ts`
-- Modify: every file in `src/lexi-dashboard/` that imports `'../../agent/mcp-bridge.js'`
+**Status:** Reframed 2026-05-07 after cascade audit revealed inlining `agent/mcp-bridge.ts` (661 LOC) would require pulling in transitive deps — `config.ts` (848 LOC), `types.ts` (1201 LOC), `config/env-parser.ts` (46 LOC), `config/clementine-json.ts` (190 LOC). Total cascade: 5 files, ~2946 LOC. The relative-path layout under the rename pattern preserves all internal imports.
 
-- [ ] **Step 1: List the call sites**
+Decision: drag the cascade into `lexi/web/` via `filter-repo --path` + `--path-rename` rules, and rewrite the 2 callsite paths + 3 test mock paths via `--replace-text` at filter-repo time. No source changes in Phase A; the heavy lifting moves to Phase B Task 6/7.
 
-Run: `grep -rln "from ['\"]\.\./\.\./agent/mcp-bridge" src/lexi-dashboard --include="*.ts"`
-Note the list — these get rewritten in Step 4.
+**Files this task touches:** none (verification only).
 
-- [ ] **Step 2: Identify what's actually used**
-
-Run: `grep -rh "mcpBridge\.[a-zA-Z]*\|mcp_bridge\." src/lexi-dashboard --include="*.ts" | sort -u`
-Note the symbols actually consumed. Inline only those.
-
-- [ ] **Step 3: Create the inlined module**
-
-Copy `src/agent/mcp-bridge.ts` → `src/lexi-dashboard/agents/mcp-bridge.ts`. Drop unused exports. Adjust internal imports to relative paths within `src/lexi-dashboard/`. If `mcp-bridge.ts` imports from elsewhere in `src/agent/`, recurse: inline those too. Stop when no `../../` remains.
-
-- [ ] **Step 4: Rewrite call sites**
-
-For each file from Step 1, use sed to rewrite the path (the relative depth depends on the caller's location):
+- [ ] **Step 1: Re-confirm cascade is bounded**
 
 ```bash
-# Example for files at src/lexi-dashboard/ui/components/foo.ts:
-#   '../../agent/mcp-bridge.js' becomes '../../agents/mcp-bridge.js'
-# Manually verify each rewrite is correct depth (count ../ segments).
-sed -i '' "s|from '\.\./\.\./agent/mcp-bridge\.js'|from '<correct-relative-path>/agents/mcp-bridge.js'|g" <file>
+cd ~/projects/clementine-fork/.worktrees/lexi-migration
+echo "mcp-bridge.ts non-builtin imports:"
+grep -E "from '\\.\\.?/" src/agent/mcp-bridge.ts
+echo "config.ts non-builtin imports:"
+grep -E "from '\\.\\.?/" src/config.ts
+echo "types.ts non-builtin imports:"
+grep -E "from '\\.\\.?/" src/types.ts
+echo "config/env-parser.ts non-builtin imports:"
+grep -E "from '\\.\\.?/" src/config/env-parser.ts || echo "(leaf)"
+echo "config/clementine-json.ts non-builtin imports:"
+grep -E "from '\\.\\.?/" src/config/clementine-json.ts || echo "(leaf — only npm pkgs)"
 ```
 
-- [ ] **Step 5: Run typecheck and tests**
+Expected: every non-builtin import resolves inside the 5-file set. If any new external dep is found, STOP and update this plan.
 
-Run: `npm run typecheck && npm test -- --run`
-Expected: 0 errors; same test count green.
-Run: `grep -rn "from ['\"]\.\./\.\./agent/mcp-bridge" src/lexi-dashboard --include="*.ts"`
-Expected: no output.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 2: Re-confirm no in-tree files reach past mcp-bridge to types/config directly**
 
 ```bash
-git add src/lexi-dashboard/agents/mcp-bridge.ts \
-  $(grep -rln "from '\./agents/mcp-bridge\|from '\.\./agents/mcp-bridge" src/lexi-dashboard --include="*.ts")
-git commit -m "refactor(lexi): inline agent/mcp-bridge into lexi-dashboard
-
-Pre-migration seam-cut: removes outside-tree dependency so
-src/lexi-dashboard/ can move cleanly to lexi/web/."
+grep -rln "from '\\.\\./\\.\\./types\\.js\\|from '\\.\\./\\.\\./config\\.js\\|from '\\.\\./\\.\\./config/" src/lexi-dashboard --include="*.ts"
 ```
+
+Expected: no output. (If any lexi-dashboard file imports types.js/config.js directly, that callsite also needs a path rewrite; add it to Phase B's `--replace-text` rules.)
+
+- [ ] **Step 3: Document the filter-repo arguments needed for Task 6**
+
+The cascade is dragged via additional `--path` and `--path-rename` arguments (added in Phase B Task 6 Step 2). The 2 callsites and 3 test mocks are rewritten via `--replace-text`. No commit in Phase A for mcp-bridge — the migration handles it atomically.
+
+The arguments to add in Phase B Task 6 Step 2:
+
+```
+--path src/agent/mcp-bridge.ts
+--path src/types.ts
+--path src/config.ts
+--path src/config/env-parser.ts
+--path src/config/clementine-json.ts
+--path-rename src/agent/:lexi/web/agents/
+--path-rename src/types.ts:lexi/web/types.ts
+--path-rename src/config.ts:lexi/web/config.ts
+--path-rename src/config/:lexi/web/config/
+```
+
+The `--replace-text` rules (write to a file passed via `--replace-text rules.txt`):
+
+```
+literal:'../../agent/mcp-bridge.js'==>'../agents/mcp-bridge.js'
+literal:'../../../src/agent/mcp-bridge.js'==>'../../agents/mcp-bridge.js'
+```
+
+(`literal:` prefix prevents regex interpretation; `==>` is the separator filter-repo uses.)
+
+The first rule rewrites the 2 callsites in `src/lexi-dashboard/services/{probe,connection-registry}.ts`. The second rewrites the 3 test mocks in `tests/lexi/connections/{probe,routes,registry}.test.ts`.
+
+- [ ] **Step 4: No commit, mark task done**
+
+This task is verification-only. No file changes, no commit. Update the migration log (created in Task 15) to record:
+- Cascade audit re-confirmed (5 files, no further deps)
+- Filter-repo arguments captured for Task 6
+- Reason for Option C: inlining 2946 LOC across 5 files is brittler than letting filter-repo carry them along with full git history.
 
 ---
 
@@ -327,7 +347,7 @@ when Composio is unavailable."
 grep -rho "from ['\"]\.\.[^'\"]*" src/lexi-dashboard --include="*.ts" | sort -u
 ```
 
-For each line, mentally resolve the relative path. Anything resolving outside `src/lexi-dashboard/` is a remaining seam — return to the inline / shared / shim / drop framework.
+For each line, mentally resolve the relative path. After Phase A's seam work, the only remaining outside-tree imports should be `'../../agent/mcp-bridge.js'` (Option C — handled by filter-repo's `--replace-text` in Task 6) — composio is fully stubbed and events/bus was a false alarm. Any other escaping import is a remaining seam that needs resolution before Phase B.
 
 - [ ] **Step 2: Confirm all tests still green**
 
@@ -367,12 +387,32 @@ git clone --no-local clementine-fork lexi-dryrun
 cd lexi-dryrun
 ```
 
-- [ ] **Step 2: Run filter-repo with the candidate paths**
+- [ ] **Step 2: Write the `--replace-text` rules file**
+
+```bash
+cat > /tmp/lexi-replace-rules.txt <<'RULES'
+literal:'../../agent/mcp-bridge.js'==>'../agents/mcp-bridge.js'
+literal:'../../../src/agent/mcp-bridge.js'==>'../../agents/mcp-bridge.js'
+RULES
+```
+
+These rules rewrite import strings atomically with the rename:
+- Rule 1: callsites in `src/lexi-dashboard/services/{probe,connection-registry}.ts`
+- Rule 2: vitest mocks in `tests/lexi/connections/{probe,routes,registry}.test.ts`
+
+If the seam audit surfaced additional callsites/mocks during Phase A, add a rule per pattern. (`literal:` prefix prevents regex interpretation; `==>` is filter-repo's separator.)
+
+- [ ] **Step 3: Run filter-repo with the candidate paths**
 
 ```bash
 git filter-repo \
   --path src/lexi-dashboard/ \
   --path tests/lexi/ \
+  --path src/agent/mcp-bridge.ts \
+  --path src/types.ts \
+  --path src/config.ts \
+  --path src/config/env-parser.ts \
+  --path src/config/clementine-json.ts \
   --path docs/audit/2026-05-web-polish-audit.md \
   --path docs/audit/2026-05-web-polish-ui-review.md \
   --path docs/superpowers/specs/2026-05-06-lexi-vision-roadmap.md \
@@ -382,22 +422,43 @@ git filter-repo \
   --path docs/migration/2026-05-lexi-seam-audit.md \
   --path-rename src/lexi-dashboard/:lexi/web/ \
   --path-rename tests/lexi/:lexi/web/tests/ \
+  --path-rename src/agent/:lexi/web/agents/ \
+  --path-rename src/types.ts:lexi/web/types.ts \
+  --path-rename src/config.ts:lexi/web/config.ts \
+  --path-rename src/config/:lexi/web/config/ \
+  --replace-text /tmp/lexi-replace-rules.txt \
   --refs refs/heads/lexi-dashboard refs/heads/main refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
 ```
 
 Expected: filter-repo reports rewriting commits and creating refs. No errors.
 
-- [ ] **Step 3: Verify the resulting tree**
+**Note on path-rename ordering:** filter-repo applies path-renames in declaration order. The `src/lexi-dashboard/`→`lexi/web/` rename runs first; the dragged-along Clementine files (`src/agent/`, `src/types.ts`, `src/config.ts`, `src/config/`) get their own renames after, landing alongside under `lexi/web/`. The `agents/` rename merges Clementine's `src/agent/` into the same `lexi/web/agents/` namespace as lexi-dashboard's existing `agents/` subdirectory — the only file there is `mcp-bridge.ts` which doesn't collide with lexi-dashboard's `agents/{activity-log,restart,vault-store}.ts`.
+
+- [ ] **Step 4: Verify the resulting tree**
 
 ```bash
-ls lexi/web/                   # expect: agents/, data/, events/, fixes/, launch/, proxy/, routes/, server.ts, services/, ui/, workflows/, upstream-omissions.ts, routes.ts
+ls lexi/web/                   # expect: agents/ (now contains mcp-bridge.ts + lexi's activity-log/restart/vault-store), data/, events/, fixes/, launch/, proxy/, routes/, server.ts, services/, ui/, workflows/, upstream-omissions.ts, routes.ts, types.ts, config.ts, config/
+ls lexi/web/agents/            # expect: mcp-bridge.ts (from Clementine), activity-log.ts, restart.ts, vault-store.ts (from lexi-dashboard)
+ls lexi/web/config/            # expect: env-parser.ts, clementine-json.ts
 ls lexi/web/tests/             # expect: e2e/, agents/, components/, etc. (50+ entries)
 ls docs/audit/                 # expect: 2 files
 ls docs/superpowers/specs/     # expect: 3 files
 git tag --list                 # expect: web-frozen-2026-05-07, lexi-seam-cut-2026-05-07
 ```
 
-- [ ] **Step 4: Verify history preserved**
+- [ ] **Step 4.5: Verify --replace-text rewrites landed**
+
+```bash
+# These two files should now import from '../agents/mcp-bridge.js' (not '../../agent/...')
+grep "mcp-bridge" lexi/web/services/probe.ts lexi/web/services/connection-registry.ts
+# Expected: both show "from '../agents/mcp-bridge.js'"
+
+# These three test files should now mock '../../agents/mcp-bridge.js' (not '../../../src/agent/...')
+grep "mcp-bridge" lexi/web/tests/connections/probe.test.ts lexi/web/tests/connections/routes.test.ts lexi/web/tests/connections/registry.test.ts
+# Expected: all show "vi.mock('../../agents/mcp-bridge.js'"
+```
+
+- [ ] **Step 5: Verify history preserved**
 
 ```bash
 # A canonical Track 1 file — should show f70a293 (cron modernization commit)
@@ -407,20 +468,20 @@ git log --oneline lexi/web/ui/components/ | wc -l
 # Expected: > 100 commits (Track 1 dense polish history)
 ```
 
-- [ ] **Step 5: Verify nothing unwanted dragged along**
+- [ ] **Step 6: Verify nothing unwanted dragged along**
 
 ```bash
-ls -la                              # expect: NO node_modules, dist, vault, package.json, electron-builder.yml at root
+ls -la                              # expect: NO node_modules, dist, vault, electron-builder.yml at root
 find . -name "node_modules" -type d # expect: empty
 find . -name "vault" -type d        # expect: empty
 du -sh .                            # expect: < 100MB
 ```
 
-- [ ] **Step 6: If anything is wrong, iterate**
+- [ ] **Step 7: If anything is wrong, iterate**
 
 If files missing → add to `--path` list. If extra files present → exclude (positive list approach: only listed paths survive). Re-run on a fresh dry-run clone.
 
-- [ ] **Step 7: Save the working command**
+- [ ] **Step 8: Save the working command**
 
 Once dry-run is clean, save the exact filter-repo command to a script:
 
@@ -432,9 +493,21 @@ cat > scripts/migration/filter-repo-lexi.sh <<'SCRIPT'
 set -euo pipefail
 # This script must run in a fresh clone — git filter-repo refuses to run
 # on a repo with a remote unless --force is passed.
+
+# Write the --replace-text rules file (idempotent; rewritten each run).
+cat > /tmp/lexi-replace-rules.txt <<'RULES'
+literal:'../../agent/mcp-bridge.js'==>'../agents/mcp-bridge.js'
+literal:'../../../src/agent/mcp-bridge.js'==>'../../agents/mcp-bridge.js'
+RULES
+
 git filter-repo \
   --path src/lexi-dashboard/ \
   --path tests/lexi/ \
+  --path src/agent/mcp-bridge.ts \
+  --path src/types.ts \
+  --path src/config.ts \
+  --path src/config/env-parser.ts \
+  --path src/config/clementine-json.ts \
   --path docs/audit/2026-05-web-polish-audit.md \
   --path docs/audit/2026-05-web-polish-ui-review.md \
   --path docs/superpowers/specs/2026-05-06-lexi-vision-roadmap.md \
@@ -444,18 +517,23 @@ git filter-repo \
   --path docs/migration/2026-05-lexi-seam-audit.md \
   --path-rename src/lexi-dashboard/:lexi/web/ \
   --path-rename tests/lexi/:lexi/web/tests/ \
+  --path-rename src/agent/:lexi/web/agents/ \
+  --path-rename src/types.ts:lexi/web/types.ts \
+  --path-rename src/config.ts:lexi/web/config.ts \
+  --path-rename src/config/:lexi/web/config/ \
+  --replace-text /tmp/lexi-replace-rules.txt \
   --refs refs/heads/lexi-dashboard refs/heads/main refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
 SCRIPT
 chmod +x scripts/migration/filter-repo-lexi.sh
 ```
 
-- [ ] **Step 8: Clean up dry run**
+- [ ] **Step 9: Clean up dry run**
 
 ```bash
 rm -rf ~/projects/lexi-dryrun
 ```
 
-- [ ] **Step 9: Commit the migration script**
+- [ ] **Step 10: Commit the migration script**
 
 ```bash
 cd ~/projects/clementine-fork
@@ -464,7 +542,9 @@ git commit -m "build(migration): add filter-repo script for Lexi extraction
 
 Validated via dry-run clone. Produces lexi/web/ tree with full
 git history including Track 1 polish commits and the
-web-frozen-2026-05-07 tag."
+web-frozen-2026-05-07 tag. Drags mcp-bridge cascade (5 files,
+~2946 LOC) and rewrites callsite + test mock paths via
+--replace-text."
 ```
 
 ---
