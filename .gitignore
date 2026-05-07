@@ -60,3 +60,6 @@ test-results/
 __pycache__/
 *.pyc
 .superpowers/
+
+# Worktree isolation directory (superpowers convention)
+.worktrees/
