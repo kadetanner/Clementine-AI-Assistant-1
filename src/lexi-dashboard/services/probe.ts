@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { discoverMcpServers } from '../../agent/mcp-bridge.js';
-import * as composio from '../../integrations/composio/client.js';
+import * as composio from './composio-stub.js';
 import { recordCheck, type Connection, type ConnectionStatus } from './connection-registry.js';
 
 // Use execFile (no shell). We never use child_process with a shell here.

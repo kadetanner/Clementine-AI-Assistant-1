@@ -4,7 +4,7 @@ vi.mock('../../../src/agent/mcp-bridge.js', () => ({
   discoverMcpServers: () => [{ name: 'neon', type: 'stdio', command: 'echo', enabled: true }],
   getClaudeIntegrations: () => [],
 }));
-vi.mock('../../../src/integrations/composio/client.js', () => ({
+vi.mock('../../../src/lexi-dashboard/services/composio-stub.js', () => ({
   isComposioEnabled: () => false,
   listConnectedToolkits: async () => [],
 }));

@@ -1,5 +1,5 @@
 import { discoverMcpServers, getClaudeIntegrations } from '../../agent/mcp-bridge.js';
-import * as composio from '../../integrations/composio/client.js';
+import * as composio from './composio-stub.js';
 
 export type ConnectionKind = 'mcp' | 'composio' | 'oauth';
 export type ConnectionStatus = 'connected' | 'degraded' | 'disconnected';

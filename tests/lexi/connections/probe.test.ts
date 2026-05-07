@@ -9,7 +9,7 @@ vi.mock('../../../src/agent/mcp-bridge.js', () => ({
   getClaudeIntegrations: () => [],
 }));
 
-vi.mock('../../../src/integrations/composio/client.js', () => ({
+vi.mock('../../../src/lexi-dashboard/services/composio-stub.js', () => ({
   isComposioEnabled: () => true,
   listConnectedToolkits: async () => [{ slug: 'gmail', status: 'ACTIVE', connectionId: 'c1', userId: 'u' }],
 }));
