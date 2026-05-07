@@ -125,15 +125,14 @@ Cutting seams *before* moving paths means tests keep passing throughout. Moving 
 
 ### Shimmed or inlined (from Clementine into `lexi/web/`)
 
-These are the three confirmed outside-tree imports as of 2026-05-07:
+The 2026-05-07 seam audit confirmed **two** outside-tree imports (the `events/bus` import this spec originally listed turned out to be a depth-2 import that resolves *in-tree* — `src/lexi-dashboard/data/lexi-native/session-log-tailer.ts` → `../../events/bus.js` lands at `src/lexi-dashboard/events/bus.ts`, which travels with the migration as part of the moved tree):
 
 | Import | Decision | Rationale |
 |---|---|---|
-| `../../agent/mcp-bridge.js` | **Inline** copy of the file into `lexi/web/agents/mcp-bridge.ts`. Drop unused exports. | Single use site (mcp-bridge for the connections view). Lexi shouldn't depend on Clementine's agent abstraction. |
-| `../../events/bus.js` | **Inline** copy into `lexi/web/events/bus.ts`. | Same — Lexi has its own event surface; sharing Clementine's bus was incidental. |
-| `../../integrations/composio/client.js` | **Drop**, replace with a thin stub that returns "not configured" if Composio isn't wired. | Composio isn't a Lexi-track feature. If the connections view needs to talk to Composio, that's a Track 2C decision. |
+| `../../agent/mcp-bridge.js` | **Inline** copy of the file into `lexi/web/agents/mcp-bridge.ts`. Drop unused exports. | Two use sites in `services/`. Lexi shouldn't depend on Clementine's agent abstraction. |
+| `../../integrations/composio/client.js` | **Drop**, replace with a thin stub that returns "not configured" if Composio isn't wired. | Composio isn't a Lexi-track feature. Two use sites in `services/`. If the connections view needs to talk to Composio, that's a Track 2C decision. |
 
-Decisions confirmed during the §2 step 1 seam audit. If audit surfaces additional imports not listed above, the same inline / shared / shim / drop framework applies and the migration log records each.
+Decisions confirmed during the §2 step 1 seam audit (`docs/migration/2026-05-lexi-seam-audit.md`). If audit surfaces additional imports not listed above, the same inline / shared / shim / drop framework applies and the migration log records each.
 
 ### Lives in `lexi/shared/` (new)
 

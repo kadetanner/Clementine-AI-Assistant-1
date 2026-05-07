@@ -240,49 +240,15 @@ src/lexi-dashboard/ can move cleanly to lexi/web/."
 
 ---
 
-### Task 3: Inline `events/bus` into `lexi/web/events/`
+### Task 3: ~~Inline `events/bus`~~ — SUPERSEDED (no seam exists)
 
-**Files:**
-- Read: `src/events/bus.ts`
-- Create or modify: `src/lexi-dashboard/events/bus.ts` (verify no collision before overwriting)
-- Modify: every file in `src/lexi-dashboard/` that imports `'../../events/bus.js'`
+**Status:** Cancelled by Task 1 audit (2026-05-07).
 
-- [ ] **Step 1: Confirm no existing collision**
+The seam audit revealed this "outside-tree import" is a depth-2 import that resolves *in-tree*: `src/lexi-dashboard/data/lexi-native/session-log-tailer.ts` imports `'../../events/bus.js'`, which resolves to `src/lexi-dashboard/events/bus.ts` — already inside the tree, will travel with the migration unchanged. There is no `src/events/bus.ts` at the Clementine root for this depth-2 path to escape to.
 
-Run: `ls src/lexi-dashboard/events/`
-If `bus.ts` already exists in lexi-dashboard:
-Run: `diff src/events/bus.ts src/lexi-dashboard/events/bus.ts || echo "DIFFERENT"`
-- If files match: imports are already redundant; just rewrite call sites.
-- If different: inline at a different name (`bus-clementine.ts`) or merge carefully. Document the choice in the migration log.
+The original spec listed this seam in error (assumed all `../../` paths escape, which is only true for depth-1 files). Spec §3 shim table updated to reflect the corrected two-seam reality.
 
-- [ ] **Step 2: List call sites**
-
-Run: `grep -rln "from ['\"]\.\./\.\./events/bus" src/lexi-dashboard --include="*.ts"`
-
-- [ ] **Step 3: Inline the file**
-
-Copy or merge `src/events/bus.ts` into `src/lexi-dashboard/events/bus.ts`. Preserve all symbols used by either tree.
-
-- [ ] **Step 4: Rewrite call sites**
-
-For each file from Step 2, replace `'../../events/bus.js'` with the correct relative path inside the tree.
-
-- [ ] **Step 5: Verify**
-
-Run: `npm run typecheck && npm test -- --run`
-Expected: 0 errors; all tests pass.
-Run: `grep -rn "from ['\"]\.\./\.\./events/bus" src/lexi-dashboard --include="*.ts"`
-Expected: no output.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/lexi-dashboard/events/bus.ts \
-  $(grep -rln "from '\./events/bus\|from '\.\./events/bus" src/lexi-dashboard --include="*.ts")
-git commit -m "refactor(lexi): inline events/bus into lexi-dashboard
-
-Pre-migration seam-cut: outside-tree dependency removed."
-```
+**No work to do.** Skip directly to Task 4.
 
 ---
 
