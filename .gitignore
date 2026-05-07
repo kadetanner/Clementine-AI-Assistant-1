@@ -53,6 +53,9 @@ test-results/
 !build/icons/*.png
 !build/icons/*.icns
 
+# Playwright visual baselines are committed (D3 audit evidence).
+!tests/lexi/e2e/visual/**/*.png
+
 # Python bytecode (browser-harness MCP wrapper)
 __pycache__/
 *.pyc

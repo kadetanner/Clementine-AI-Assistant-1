@@ -20,7 +20,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:** _populated by Task B1_
 - **Expected behavior:** _populated by Task B1_
 - **Current status:** unknown
-- **Evidence:** _Playwright screenshot path_
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/agents-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:** _populated if status != works_
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -30,7 +30,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/connections-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -40,7 +40,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/cron-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -50,7 +50,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/memory-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -60,7 +60,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/settings-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -70,7 +70,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/vault-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -80,7 +80,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/workflows-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -90,7 +90,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/advisor-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -100,7 +100,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/approvals-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -110,7 +110,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/brain-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -120,7 +120,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/budget-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -130,7 +130,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/build-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -140,7 +140,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/chat-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -150,7 +150,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/claims-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -160,7 +160,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/heartbeat-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -170,7 +170,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/logs-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -180,7 +180,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/plans-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -190,7 +190,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/projects-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -200,7 +200,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/routines-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -210,7 +210,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/search-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -220,7 +220,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/skills-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -230,7 +230,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/team-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -240,7 +240,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/today-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
@@ -250,7 +250,7 @@ This is the source of truth for the Track 1 web polish audit. Every mounted rout
 - **Interactions:**
 - **Expected behavior:**
 - **Current status:** unknown
-- **Evidence:**
+- **Evidence:** tests/lexi/e2e/visual/all-routes.spec.ts-snapshots/trace-1440-chromium-darwin.png (also -1280) — captured 2026-05-07 (D3)
 - **Fix required:**
 - **e2e coverage:** none
 - **a11y status:** unknown
