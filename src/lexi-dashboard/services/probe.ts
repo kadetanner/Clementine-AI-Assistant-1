@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { discoverMcpServers } from '../agents/mcp-bridge.js';
+import { discoverMcpServers } from '../../agent/mcp-bridge.js';
 import * as composio from '../../integrations/composio/client.js';
 import { recordCheck, type Connection, type ConnectionStatus } from './connection-registry.js';
 
