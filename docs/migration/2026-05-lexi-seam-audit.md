@@ -2,27 +2,31 @@
 
 **Source repo:** clementine-fork @ lexi-migration branch
 **Target:** clean cut of `src/lexi-dashboard/` for migration to `kadetanner/lexi`
+**Spec:** `docs/superpowers/specs/2026-05-07-lexi-repo-migration.md` §2 + §3
+**Plan:** `docs/superpowers/plans/2026-05-07-lexi-repo-migration-plan.md` Phase A Task 1
 
 ## §A — Imports leaving `src/lexi-dashboard/`
 
-All out-of-tree imports use `../../` (two levels up = escaping `src/lexi-dashboard/`).
-All single-level `../` imports were verified to resolve within the tree by tracing
-source file location + relative path.
+Out-of-tree imports were identified by tracing each `../../` path *relative to the importing
+file's location*. Depth-1 files (e.g. `services/probe.ts`) reach `src/` with `../../`;
+depth-2 files (e.g. `data/lexi-native/session-log-tailer.ts`) reach `src/lexi-dashboard/`
+with `../../`. Each candidate was traced individually before being marked a seam.
+
+> **Correction (audit revision 2026-05-07):** An earlier version of this document listed
+> `../../events/bus.js` (imported from `data/lexi-native/session-log-tailer.ts`) as an
+> out-of-tree seam. That was wrong. From `data/lexi-native/`, `../../` resolves to
+> `src/lexi-dashboard/`, so the import lands at `src/lexi-dashboard/events/bus.ts` —
+> in-tree. There is no `src/events/bus.ts` at the Clementine root. The spec and plan were
+> corrected in commit aa9421a.
 
 | Import | Call sites | Decision | Notes |
 |---|---|---|---|
-| `../../agent/mcp-bridge.js` | 2 | inline → `lexi/web/services/mcp-bridge.ts` | `services/probe.ts` + `services/connection-registry.ts`; drop unused exports |
-| `../../events/bus.js` | 1 | inline → `lexi/web/events/bus.ts` | `data/lexi-native/session-log-tailer.ts`; Lexi has its own event surface in `lexi-dashboard/events/bus.ts` — merge or alias |
+| `../../agent/mcp-bridge.js` | 2 | inline → `lexi/web/agents/mcp-bridge.ts` | `services/probe.ts` + `services/connection-registry.ts`; drop unused exports |
 | `../../integrations/composio/client.js` | 2 | drop + stub | `services/probe.ts` + `services/connection-registry.ts`; Composio not on Lexi roadmap |
 
 **Call site files:**
 - `src/lexi-dashboard/services/probe.ts` — imports `mcp-bridge.js` + `composio/client.js`
 - `src/lexi-dashboard/services/connection-registry.ts` — imports `mcp-bridge.js` + `composio/client.js`
-- `src/lexi-dashboard/data/lexi-native/session-log-tailer.ts` — imports `../../events/bus.js`
-
-Note: `../../events/bus.js` (escaping tree) is distinct from `../events/bus.js` used inside
-`src/lexi-dashboard/fixes/register.ts` and `src/lexi-dashboard/routes/trace-v2.ts`, which
-resolve to `src/lexi-dashboard/events/bus.ts` (in-tree, no seam).
 
 ## §B — Imports entering `src/lexi-dashboard/` from outside
 
@@ -62,11 +66,11 @@ Additional lexi-related scripts not caught by the path grep:
 | `build` (full tsc + assets + lexi) | Rewrite — Clementine-specific tsc steps drop |
 | `dev` (`tsx src/index.ts`) | Drop — Clementine entrypoint |
 | `dashboard` | Drop |
-| `desktop:*` | Drop |
+| `desktop`, `desktop:debug`, `desktop:prepare`, `desktop:pack`, `desktop:dist`, `desktop:dist:unnotarized` | Drop |
 | `test:e2e` | Carry forward; update `playwright.config.ts` path |
 | `audit:inventory` | Carry forward; update path |
 | `parity`, `parity:strict`, `parity:update-baseline` | Drop — Clementine-specific parity audit |
-| `bin.lexi` (`bin/lexi`) | Carry forward as the new repo's primary binary entry |
+| `bin.lexi` (`bin/lexi`) — binary entrypoint (`bin["lexi"]`), not a script | Carry forward as the new repo's primary binary entry |
 
 ## §D — Runtime deps actually imported by lexi-dashboard
 
@@ -113,5 +117,6 @@ does NOT carry over unless lexi-specific tests require it.
 
 ## §E — Surprises / unknowns
 
-(empty — all three known seams confirmed, no additional out-of-tree imports found.
-`src/lexi-dashboard/` is otherwise a self-contained tree. Phase A seam-cuts may proceed.)
+(empty — both real seams confirmed (`agent/mcp-bridge` and `integrations/composio/client`),
+no additional out-of-tree imports found. `src/lexi-dashboard/` is otherwise a self-contained
+tree. Phase A seam-cuts may proceed.)
