@@ -239,10 +239,12 @@ export class LexiTraceView extends LitElement {
       </div>
     </div>
     ${this.error ? html`<lx-card><div data-error="1">${this.error}</div></lx-card>` : html``}
-    <div class="lx-trace-grid">
-      <lx-card><h3 class="lx-card-title">Runs</h3>${this.renderRunList()}</lx-card>
-      <lx-card><h3 class="lx-card-title">Timeline</h3>${this.renderTimeline()}</lx-card>
-    </div>`;
+    ${!this.loading && this.runs.length === 0 && !this.selectedId
+      ? html`<lx-card><h3 class="lx-card-title">Runs</h3>${this.renderRunList()}</lx-card>`
+      : html`<div class="lx-trace-grid">
+          <lx-card><h3 class="lx-card-title">Runs</h3>${this.renderRunList()}</lx-card>
+          <lx-card><h3 class="lx-card-title">Timeline</h3>${this.renderTimeline()}</lx-card>
+        </div>`}`;
   }
 }
 

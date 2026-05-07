@@ -89,8 +89,8 @@ export class LexiPlansView extends LitElement {
             : html`<p class="subtitle">No pending diff. Apply requires daemon (501).</p>`}
         </lx-card>
       </div>
-      <div class="lx-trace-grid" style="margin-top: var(--sp-3);">
-        <lx-card>
+      ${(() => {
+        const allPlansCard = html`<lx-card>
           <h3 class="lx-card-title">All plans (${this.items.length})</h3>
           ${this.items.length === 0
             ? html`<lx-empty-state icon="plans" title="No plans" description="Saved plans will appear here."></lx-empty-state>`
@@ -108,16 +108,23 @@ export class LexiPlansView extends LitElement {
                   </button>`;
                 })}
               </div>`}
-        </lx-card>
-        <lx-card>
-          <h3 class="lx-card-title">Detail</h3>
-          ${this.selected
-            ? this.detail
-              ? html`<pre class="lx-codeblock">${safeJson(this.detail)}</pre>`
-              : html`<p class="subtitle">Loading ${this.selected}…</p>`
-            : html`<p class="subtitle">Pick a plan on the left.</p>`}
-        </lx-card>
-      </div>
+        </lx-card>`;
+        const collapseDetail = this.items.length === 0 && !this.selected;
+        if (collapseDetail) {
+          return html`<div style="margin-top: var(--sp-3);">${allPlansCard}</div>`;
+        }
+        return html`<div class="lx-trace-grid" style="margin-top: var(--sp-3);">
+          ${allPlansCard}
+          <lx-card>
+            <h3 class="lx-card-title">Detail</h3>
+            ${this.selected
+              ? this.detail
+                ? html`<pre class="lx-codeblock">${safeJson(this.detail)}</pre>`
+                : html`<p class="subtitle">Loading ${this.selected}…</p>`
+              : html`<p class="subtitle">Pick a plan on the left.</p>`}
+          </lx-card>
+        </div>`;
+      })()}
     `}`;
   }
 }

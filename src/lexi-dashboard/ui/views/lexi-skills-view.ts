@@ -141,8 +141,8 @@ export class LexiSkillsView extends LitElement {
       </div>
     </div>
     ${this.flash ? html`<lx-card><p class="subtitle">${this.flash}</p></lx-card>` : html``}
-    <div class="lx-trace-grid">
-      <lx-card>
+    ${(() => {
+      const listCard = html`<lx-card>
         <h3 class="lx-card-title">Skills (${this.skills.length})</h3>
         <div class="lx-row" style="margin-bottom: var(--sp-2);">
           <lx-input
@@ -167,24 +167,29 @@ export class LexiSkillsView extends LitElement {
                   </div>
                 </button>`)}
               </div>`}
-      </lx-card>
-      <lx-card>
-        <h3 class="lx-card-title">Editor ${this.selected ? html`<span class="lx-time">· ${this.selected}</span>` : html``}</h3>
-        ${this.selected
-          ? html`<div class="lx-stack" data-gap="2">
-              <lx-textarea
-                .value=${this.content}
-                rows="20"
-                @input=${(e: CustomEvent<string>) => { this.content = e.detail; this.dirty = true; }}
-              ></lx-textarea>
-              <div class="lx-row">
-                <lx-button @click=${() => void this.save()} ?disabled=${!this.dirty}>${this.dirty ? 'Save' : 'Saved'}</lx-button>
-                <lx-button @click=${() => void this.remove()}>Delete</lx-button>
-              </div>
-            </div>`
-          : html`<lx-empty-state icon="skills" title="Pick a skill" description="Select a skill on the left to view or edit."></lx-empty-state>`}
-      </lx-card>
-    </div>`;
+      </lx-card>`;
+      const collapseDetail = !this.loading && this.skills.length === 0 && !this.selected;
+      if (collapseDetail) return listCard;
+      return html`<div class="lx-trace-grid">
+        ${listCard}
+        <lx-card>
+          <h3 class="lx-card-title">Editor ${this.selected ? html`<span class="lx-time">· ${this.selected}</span>` : html``}</h3>
+          ${this.selected
+            ? html`<div class="lx-stack" data-gap="2">
+                <lx-textarea
+                  .value=${this.content}
+                  rows="20"
+                  @input=${(e: CustomEvent<string>) => { this.content = e.detail; this.dirty = true; }}
+                ></lx-textarea>
+                <div class="lx-row">
+                  <lx-button @click=${() => void this.save()} ?disabled=${!this.dirty}>${this.dirty ? 'Save' : 'Saved'}</lx-button>
+                  <lx-button @click=${() => void this.remove()}>Delete</lx-button>
+                </div>
+              </div>`
+            : html`<lx-empty-state icon="skills" title="Pick a skill" description="Select a skill on the left to view or edit."></lx-empty-state>`}
+        </lx-card>
+      </div>`;
+    })()}`;
   }
 }
 

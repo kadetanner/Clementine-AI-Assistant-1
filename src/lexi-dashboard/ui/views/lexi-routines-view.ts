@@ -153,10 +153,12 @@ export class LexiRoutinesView extends LitElement {
       </div>
     </div>
     ${this.flash ? html`<lx-card><p class="subtitle">${this.flash}</p></lx-card>` : html``}
-    <div class="lx-trace-grid">
-      <lx-card><h3 class="lx-card-title">Routines (${this.routines.length})</h3>${this.renderList()}</lx-card>
-      <lx-card><h3 class="lx-card-title">Run history</h3>${this.renderHistory()}</lx-card>
-    </div>`;
+    ${!this.loading && this.routines.length === 0 && !this.selectedId
+      ? html`<lx-card><h3 class="lx-card-title">Routines (0)</h3>${this.renderList()}</lx-card>`
+      : html`<div class="lx-trace-grid">
+          <lx-card><h3 class="lx-card-title">Routines (${this.routines.length})</h3>${this.renderList()}</lx-card>
+          <lx-card><h3 class="lx-card-title">Run history</h3>${this.renderHistory()}</lx-card>
+        </div>`}`;
   }
 }
 

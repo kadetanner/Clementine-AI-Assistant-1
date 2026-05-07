@@ -57,8 +57,8 @@ export class LexiProjectsView extends LitElement {
         <p class="subtitle">Project index. Read-only — link/unlink writes belong to the daemon.</p>
       </div>
     </div>
-    <div class="lx-trace-grid">
-      <lx-card>
+    ${(() => {
+      const listCard = html`<lx-card>
         <h3 class="lx-card-title">Projects (${this.items.length})</h3>
         ${this.loading
           ? html`<p class="subtitle">Loading…</p>`
@@ -78,16 +78,21 @@ export class LexiProjectsView extends LitElement {
                   </button>`;
                 })}
               </div>`}
-      </lx-card>
-      <lx-card>
-        <h3 class="lx-card-title">Detail</h3>
-        ${this.selected
-          ? this.detail
-            ? html`<pre class="lx-codeblock">${safeJson(this.detail)}</pre>`
-            : html`<p class="subtitle">Loading ${this.selected}…</p>`
-          : html`<lx-empty-state icon="projects" title="Pick a project" description="Select a project on the left to inspect it."></lx-empty-state>`}
-      </lx-card>
-    </div>`;
+      </lx-card>`;
+      const collapseDetail = !this.loading && this.items.length === 0 && !this.selected;
+      if (collapseDetail) return listCard;
+      return html`<div class="lx-trace-grid">
+        ${listCard}
+        <lx-card>
+          <h3 class="lx-card-title">Detail</h3>
+          ${this.selected
+            ? this.detail
+              ? html`<pre class="lx-codeblock">${safeJson(this.detail)}</pre>`
+              : html`<p class="subtitle">Loading ${this.selected}…</p>`
+            : html`<lx-empty-state icon="projects" title="Pick a project" description="Select a project on the left to inspect it."></lx-empty-state>`}
+        </lx-card>
+      </div>`;
+    })()}`;
   }
 }
 

@@ -244,13 +244,14 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Auth/);
   });
 
-  test('trace — Runs + Timeline panes render', async ({ page }) => {
+  test('trace — Runs pane renders, Timeline pane shows when there are runs', async ({ page }) => {
     await gotoRoute(page, 'trace', 'lexi-trace-view');
     const view = page.locator('lexi-trace-view');
     await expect(view).toContainText(/Trace/);
     await expect(view).toContainText(/Runs/);
-    await expect(view).toContainText(/Timeline/);
-    // /api/runs returns valid JSON; the view either lists runs or shows empty state
+    // When runs.length === 0, the right Timeline pane collapses to a single
+    // full-width empty state (audit fix #3). When runs exist, both panes show.
+    await expect(view).toContainText(/No runs yet|Timeline/);
     await expect(view).toContainText(/Pick a run|No runs yet|cron:|team-task:|unleashed:|discord:/);
   });
 
@@ -301,20 +302,23 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Web Search|GitHub|Slack|Google Drive/);
   });
 
-  test('routines — list pane + run-history pane render', async ({ page }) => {
+  test('routines — list pane renders, run-history collapses when empty', async ({ page }) => {
     await gotoRoute(page, 'routines', 'lexi-routines-view');
     const view = page.locator('lexi-routines-view');
     await expect(view).toContainText(/Routines/);
-    await expect(view).toContainText(/Run history/);
+    // Run history pane only renders when there are routines OR something is
+    // selected — see audit fix #3 in lexi-routines-view.ts.
+    await expect(view).toContainText(/No routines configured|Run history/);
     await expect(view).toContainText(/No routines configured|Pick a routine|enabled|disabled/);
   });
 
-  test('skills — list pane + editor pane render', async ({ page }) => {
+  test('skills — list pane renders, editor pane collapses when empty', async ({ page }) => {
     await gotoRoute(page, 'skills', 'lexi-skills-view');
     const view = page.locator('lexi-skills-view');
     await expect(view).toContainText(/Skills/);
-    await expect(view).toContainText(/Editor/);
     await expect(view).toContainText(/Create/);
+    // Editor pane only renders when skills exist OR something is selected.
+    await expect(view).toContainText(/No skills yet|Editor/);
   });
 
   test('approvals — pending + decided buckets render', async ({ page }) => {
@@ -342,11 +346,12 @@ test.describe('Section content', () => {
     await expect(view).toContainText(/Leaderboard/);
   });
 
-  test('projects — list + detail panes render', async ({ page }) => {
+  test('projects — list pane renders, detail collapses when empty', async ({ page }) => {
     await gotoRoute(page, 'projects', 'lexi-projects-view');
     const view = page.locator('lexi-projects-view');
     await expect(view).toContainText(/Projects/);
-    await expect(view).toContainText(/Detail/);
+    // Detail pane only renders when projects exist OR something is selected.
+    await expect(view).toContainText(/No projects|Detail/);
     await expect(view).toContainText(/Pick a project|No projects/);
   });
 
