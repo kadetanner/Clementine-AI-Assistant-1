@@ -56,10 +56,15 @@ export class LexiVaultView extends LitElement {
     if (this.query) params.set('q', this.query);
     try {
       const res = await fetch(`/api/vault-files?${params.toString()}`);
-      const body = await res.json() as { files: VaultFile[] };
-      this.files = body.files;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json().catch(() => ({})) as Partial<{ files: VaultFile[] }>;
+      // Defensive: API may return {}, null, or a malformed shape under
+      // upstream errors; default to empty list rather than crashing the
+      // view with "this.files is not iterable" downstream.
+      this.files = Array.isArray(body?.files) ? body.files : [];
       this.status = 'idle';
     } catch {
+      this.files = [];
       this.status = 'error';
     }
   }
