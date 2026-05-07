@@ -206,3 +206,23 @@ lexi-phase-pending-view {
 /* Re-assert the agents view grid since the rule above would otherwise
  * downgrade it to block. */
 lexi-agents-view { display: grid; }
+
+/* ─── 2026-05 polish audit additions ───────────────────────────────────
+ * Visible focus indication for keyboard users only (mouse clicks still
+ * trigger :focus but not :focus-visible, so this stays out of the way of
+ * pointer interaction). Required by the audit's a11y baseline. */
+:where(button, a, [role="button"], input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent, #2563eb);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* WCAG AA contrast bump for muted/tertiary text. The previous values
+ * (#6b7280 on #ffffff = 4.48:1; #6b7280 on #f9fafb = 4.31:1) failed AA
+ * for body text size by a hair. New values clear AA on both surfaces. */
+:root {
+  --text-muted: #4b5563; /* 7.56:1 on #ffffff, 7.27:1 on #f9fafb */
+}
+:root[data-theme="dark"] {
+  --text-muted: #9ca3af; /* AA on #0f172a / #1f2937 */
+}
