@@ -291,8 +291,9 @@ These are exercised on every view; track separately.
 - **Status:** unknown
 
 ### `lexi-prompt-editor.ts` — system prompt editor
-- **Status:** broken (KNOWN — see Task C0 of plan; user's 2026-05-06 screenshot)
-- **Fix required:** Add inline `<style>` block; matches the agents/cron component pattern.
+- **Status:** works (FIXED — see commit for Task C0)
+- **Fix applied:** Added inline `<style>` block matching agents/cron pattern: 280px min-height textarea, monospace font, styled toolbar with primary-styled Save and disabled-when-clean buttons. ARIA label on textarea. Visual verification via 3 Playwright assertions.
+- **e2e coverage:** full (`tests/lexi/e2e/views/prompt-editor.spec.ts`)
 
 ## Known fixes pre-loaded
 
