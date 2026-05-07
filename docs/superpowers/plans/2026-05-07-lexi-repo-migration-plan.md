@@ -393,14 +393,16 @@ cd lexi-dryrun
 cat > /tmp/lexi-replace-rules.txt <<'RULES'
 literal:'../../agent/mcp-bridge.js'==>'../agents/mcp-bridge.js'
 literal:'../../../src/agent/mcp-bridge.js'==>'../../agents/mcp-bridge.js'
+literal:'../../../src/lexi-dashboard/services/composio-stub.js'==>'../../services/composio-stub.js'
 RULES
 ```
 
 These rules rewrite import strings atomically with the rename:
-- Rule 1: callsites in `src/lexi-dashboard/services/{probe,connection-registry}.ts`
-- Rule 2: vitest mocks in `tests/lexi/connections/{probe,routes,registry}.test.ts`
+- Rule 1: mcp-bridge callsites in `src/lexi-dashboard/services/{probe,connection-registry}.ts`
+- Rule 2: mcp-bridge vitest mocks in `tests/lexi/connections/{probe,routes,registry}.test.ts`
+- Rule 3: composio-stub vitest mocks in `tests/lexi/connections/{probe,routes,registry}.test.ts` (the Phase A Task 4 stub got mocked at its original full path; after `tests/lexi/` → `lexi/web/tests/` and `src/lexi-dashboard/` → `lexi/web/` renames, the literal mock string has to be rewritten to the new relative path).
 
-If the seam audit surfaced additional callsites/mocks during Phase A, add a rule per pattern. (`literal:` prefix prevents regex interpretation; `==>` is filter-repo's separator.)
+(`literal:` prefix prevents regex interpretation; `==>` is filter-repo's separator. If Phase A surfaced additional callsites/mocks not listed here, add a rule per pattern.)
 
 - [ ] **Step 3: Run filter-repo with the candidate paths**
 
@@ -498,6 +500,7 @@ set -euo pipefail
 cat > /tmp/lexi-replace-rules.txt <<'RULES'
 literal:'../../agent/mcp-bridge.js'==>'../agents/mcp-bridge.js'
 literal:'../../../src/agent/mcp-bridge.js'==>'../../agents/mcp-bridge.js'
+literal:'../../../src/lexi-dashboard/services/composio-stub.js'==>'../../services/composio-stub.js'
 RULES
 
 git filter-repo \
