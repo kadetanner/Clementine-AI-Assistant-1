@@ -14,8 +14,8 @@ vi.mock('../../../src/agent/mcp-bridge.js', () => ({
 vi.mock('../../../src/lexi-dashboard/services/composio-stub.js', () => ({
   isComposioEnabled: () => true,
   listConnectedToolkits: async () => [
-    { slug: 'gmail', status: 'ACTIVE', connectionId: 'c_gmail_1', userId: 'u' },
-    { slug: 'notion', status: 'INITIATED', connectionId: 'c_notion_1', userId: 'u' },
+    { slug: 'gmail', status: 'ACTIVE' },
+    { slug: 'notion', status: 'INITIATED' },
   ],
 }));
 

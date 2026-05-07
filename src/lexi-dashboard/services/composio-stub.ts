@@ -11,14 +11,7 @@
 
 export interface ConnectedToolkit {
   slug: string;
-  connectionId: string;
   status: string;
-  alias?: string;
-  accountLabel?: string;
-  accountEmail?: string;
-  accountName?: string;
-  accountAvatarUrl?: string;
-  createdAt?: string;
 }
 
 export function isComposioEnabled(): boolean {

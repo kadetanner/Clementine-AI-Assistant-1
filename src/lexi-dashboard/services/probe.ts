@@ -69,6 +69,7 @@ async function probeComposio(slug: string): Promise<ProbeResult> {
   if (!composio.isComposioEnabled()) {
     return { status: 'disconnected', last_check_at: at, error_message: 'composio disabled (no COMPOSIO_API_KEY)' };
   }
+  // Below is unreachable while Composio is stubbed (Phase A Task 4 / Track 2C will revisit).
   try {
     const toolkits = await withTimeout(composio.listConnectedToolkits(), PROBE_TIMEOUT_MS, 'composio.list');
     const tk = toolkits.find((t) => t.slug === slug);

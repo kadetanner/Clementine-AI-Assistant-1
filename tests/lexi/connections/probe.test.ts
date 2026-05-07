@@ -11,7 +11,7 @@ vi.mock('../../../src/agent/mcp-bridge.js', () => ({
 
 vi.mock('../../../src/lexi-dashboard/services/composio-stub.js', () => ({
   isComposioEnabled: () => true,
-  listConnectedToolkits: async () => [{ slug: 'gmail', status: 'ACTIVE', connectionId: 'c1', userId: 'u' }],
+  listConnectedToolkits: async () => [{ slug: 'gmail', status: 'ACTIVE' }],
 }));
 
 import { probeConnection } from '../../../src/lexi-dashboard/services/probe.js';
