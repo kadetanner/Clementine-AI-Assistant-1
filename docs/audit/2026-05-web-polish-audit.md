@@ -299,6 +299,6 @@ These are exercised on every view; track separately.
 
 These three are entered now so they're not lost during the audit churn. See plan Tasks C0, C1, C2.
 
-1. **`lexi-prompt-editor.ts`** — unstyled. Fix: add inline `<style>` block. (Plan Task C0)
-2. **`lexi-home-view.ts`** — dead code (registered as custom element, never mounted by router). Fix: delete. (Plan Task C1)
-3. **`lexi-connections-view.ts`** — uses inline `style=""` attributes instead of an inline `<style>` block. Fix: convert. (Plan Task C2)
+1. **`lexi-prompt-editor.ts`** — ✓ FIXED (Task C0). Inline `<style>` block added. E2E coverage in place.
+2. **`lexi-home-view.ts`** — ✓ FIXED (Task C1). File deleted. Router resolves both `#/home` and `#/today` to `lexi-today-view`; the unmounted `lexi-home-view` was dead code with zero callers.
+3. **`lexi-connections-view.ts`** — pending. Uses inline `style=""` attributes instead of an inline `<style>` block. Fix: convert. (Plan Task C2)
