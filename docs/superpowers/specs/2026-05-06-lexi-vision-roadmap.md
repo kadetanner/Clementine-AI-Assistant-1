@@ -45,15 +45,18 @@ pipelinepulse iOS app    (frozen, Live-Activities-only; no net-new features)
 
 ## Tracks
 
-### Track 1 — Web dashboard polish (Heavy bar)
-**Duration:** ~3 weeks
+### Track 1 — Web dashboard polish (Heavy bar) — ✅ Complete (2026-05-07)
+**Duration:** ~3 weeks (actual: ~2 days of focused work after D-suite scaffold landed)
 **Spec:** [`2026-05-06-lexi-web-polish-heavy-design.md`](./2026-05-06-lexi-web-polish-heavy-design.md)
 **Goal:** Bring the existing web dashboard to "good fallback" quality across all routes, then freeze. Heavy bar = full functional audit, full visual audit, ~120 Playwright E2E tests, accessibility/keyboard pass, explicit empty/error/loading states everywhere.
+**Outcome:** 265/265 D-tests green across 24 routes (D1 mount, D2 axe, D3 visual baselines, D4 state coverage). gsd-ui-auditor 6-pillar review identified 3 cross-cutting BLOCKs; all resolved (lx-button + lx-card shadow DOM migration, dual-empty-pane collapse). Final score ~21-22/24 — at the freeze bar.
+**Audit:** [`docs/audit/2026-05-web-polish-audit.md`](../../audit/2026-05-web-polish-audit.md), [`docs/audit/2026-05-web-polish-ui-review.md`](../../audit/2026-05-web-polish-ui-review.md)
+**Freeze tag:** `web-frozen-2026-05-07`
 **Then:** No net-new features on the web dashboard.
 
-### Track 2A — Repo migration
+### Track 2A — Repo migration — Ready to design
 **Duration:** ~1 week
-**Spec:** TBD, written after Track 1 lands.
+**Spec:** TBD — write Spec 2A now that Track 1 has frozen.
 **Goal:** Move the existing Clementine fork into a `lexi/` monorepo. Existing source becomes `lexi/web/`. New `lexi/mac/` Xcode project skeleton initialized. Branch + history preservation strategy decided when Spec 2A is written, with everything Track 1 taught us in hand.
 
 ### Track 2B — All-view scaffold
