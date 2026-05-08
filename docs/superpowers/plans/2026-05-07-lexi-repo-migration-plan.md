@@ -429,10 +429,12 @@ git filter-repo \
   --path-rename src/config.ts:lexi/web/config.ts \
   --path-rename src/config/:lexi/web/config/ \
   --replace-text /tmp/lexi-replace-rules.txt \
-  --refs refs/heads/lexi-dashboard refs/heads/main refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
+  --refs refs/heads/lexi-migration refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
 ```
 
 Expected: filter-repo reports rewriting commits and creating refs. No errors.
+
+**Note on `--refs`:** Phase A's seam-cut work landed on `lexi-migration` (branched from `lexi-dashboard` at e5f2c0f). `web-frozen-2026-05-07` is reachable from `lexi-migration`'s history (the freeze tag is an ancestor of the seam-cut commits). `lexi-dashboard` and `main` aren't included because their histories don't contain the seam-cut commits and they're not the working migration source.
 
 **Note on path-rename ordering:** filter-repo applies path-renames in declaration order. The `src/lexi-dashboard/`→`lexi/web/` rename runs first; the dragged-along Clementine files (`src/agent/`, `src/types.ts`, `src/config.ts`, `src/config/`) get their own renames after, landing alongside under `lexi/web/`. The `agents/` rename merges Clementine's `src/agent/` into the same `lexi/web/agents/` namespace as lexi-dashboard's existing `agents/` subdirectory — the only file there is `mcp-bridge.ts` which doesn't collide with lexi-dashboard's `agents/{activity-log,restart,vault-store}.ts`.
 
@@ -525,7 +527,7 @@ git filter-repo \
   --path-rename src/config.ts:lexi/web/config.ts \
   --path-rename src/config/:lexi/web/config/ \
   --replace-text /tmp/lexi-replace-rules.txt \
-  --refs refs/heads/lexi-dashboard refs/heads/main refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
+  --refs refs/heads/lexi-migration refs/tags/web-frozen-2026-05-07 refs/tags/lexi-seam-cut-2026-05-07
 SCRIPT
 chmod +x scripts/migration/filter-repo-lexi.sh
 ```
@@ -592,7 +594,7 @@ cd lexi
 - [ ] **Step 5: Set the default branch to `main`**
 
 ```bash
-git branch -m lexi-dashboard main
+git branch -m lexi-migration main
 git branch                          # expect: * main
 ```
 
